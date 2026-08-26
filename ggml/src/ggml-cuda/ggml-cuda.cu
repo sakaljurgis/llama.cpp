@@ -704,6 +704,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    q8_1_cache_free();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -2979,8 +2981,12 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     };
 
     bool is_ok = true;
-    // exception for topk-moe, as each row is read entirely before writing
-    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
+    // exception for topk-moe, as each row is read entirely before writing.
+    // topk_moe_cuda maps rows_per_block (4) rows onto one block and now
+    // carries a __syncthreads() between its read and write phases, so the exception is safe for
+    // every row a single block owns -- not just one.  This is what lets the speculative-decoding
+    // verify batch (n_rows = n_draft + 1) use the fused kernel instead of the argsort chain.
+    if (ggml_nrows(cgraph->nodes[node_idx]) <= GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK && is_topk_moe) {
         return true;
     }
 
@@ -3273,8 +3279,286 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Sibling fusion: merge a run of identically shaped nodes to cut the number of launches.
+// Unlike topk-moe or rope+set_rows this removes no intermediate node -- every node is still
+// computed -- so the only requirement is that reordering them cannot change the result: the
+// destinations must not overlap each other, nor any other node's source.  That is checked here as
+// byte ranges.
+static bool ggml_cuda_fuse_nodes_disjoint(ggml_tensor ** nodes, int n, int dst_src_idx) {
+    auto range_of = [](const ggml_tensor * t, const char *& beg, const char *& end) {
+        beg = (const char *) t->data;
+        end = beg + ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
+    };
+    auto overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        if (!a || !b || !a->data || !b->data || !a->buffer || !b->buffer) {
+            return true; // anything we cannot decide counts as overlapping, i.e. do not fuse
+        }
+        const char * as; const char * ae; const char * bs; const char * be;
+        range_of(a, as, ae);
+        range_of(b, bs, be);
+        return as < be && bs < ae;
+    };
+
+    for (int a = 0; a < n; ++a) {
+        // dst_src_idx >= 0 means src[dst_src_idx] is the destination (CPY); otherwise the node
+        // itself is the destination (L2_NORM)
+        const ggml_tensor * dst_a = dst_src_idx >= 0 ? nodes[a]->src[dst_src_idx] : nodes[a];
+        if (!dst_a) {
+            return false;
+        }
+        for (int b = 0; b < n; ++b) {
+            if (a == b) {
+                continue;
+            }
+            const ggml_tensor * dst_b = dst_src_idx >= 0 ? nodes[b]->src[dst_src_idx] : nodes[b];
+            if (overlap(dst_a, dst_b)) {
+                return false;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src_b = nodes[b]->src[s];
+                if (!src_b) {
+                    continue;
+                }
+                if (dst_src_idx >= 0 && s == dst_src_idx) {
+                    continue; // destination-vs-destination was handled above
+                }
+                if (overlap(dst_a, src_b)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+// Recover the index of the last accepted node after nodes[] has been compacted
+static int ggml_cuda_node_index_of(const ggml_cgraph * cgraph, int from, const ggml_tensor * t) {
+    for (int j = from; j < cgraph->n_nodes; ++j) {
+        if (cgraph->nodes[j] == t) {
+            return j;
+        }
+    }
+    return from;
+}
+
+// Diagnostics for when fusion does not fire.  GGML_CUDA_FUSE_LOG=2 dumps the neighbourhood of the
+// candidate nodes and the outcome of each test.  The assumption "nodes with the same op are
+// adjacent" is easily broken by no-ops and by allocation order, and without this a failure costs a
+// full build-and-trace cycle to diagnose.
+static void ggml_cuda_fuse_diag(const ggml_cgraph * cgraph, int i, int collected, int disjoint, int launched) {
+    static int level   = getenv("GGML_CUDA_FUSE_LOG") ? std::atoi(getenv("GGML_CUDA_FUSE_LOG")) : 0;
+    static int printed = 0;
+    if (level < 2 || printed++ >= 12) {
+        return;
+    }
+    char   buf[512];
+    size_t p = 0;
+    for (int j = i; j < cgraph->n_nodes && j < i + 8 && p + 64 < sizeof(buf); ++j) {
+        p += snprintf(buf + p, sizeof(buf) - p, "%s%s[f%x]", j == i ? "" : " -> ",
+                      ggml_op_name(cgraph->nodes[j]->op), (unsigned) cgraph->nodes[j]->flags);
+    }
+    GGML_LOG_INFO("ggml_cuda_fuse_diag: i=%d collected=%d disjoint=%d launched=%d | %s\n",
+                  i, collected, disjoint, launched, buf);
+}
+
+// Fire confirmation: with GGML_CUDA_FUSE_LOG=1, print the first few firings (budget shared across
+// rules), so that "did it fire at all"
+// can be answered without running a profiler.
+static void ggml_cuda_fuse_log(const char * rule, int n) {
+    static bool enabled = getenv("GGML_CUDA_FUSE_LOG") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_LOG"));
+    if (!enabled) {
+        return;
+    }
+    static int printed = 0;
+    if (printed++ < 8) {
+        GGML_LOG_INFO("ggml_cuda_fuse: %s x%d\n", rule, n);
+    }
+}
+
+// Collect a run of up to max_n consecutive nodes with the same op and return the index of the last
+// one in *last_idx.  No-ops (view / reshape / permute) are skipped by the main loop, so they are
+// ignored here too.  Missing that makes fusion never fire on any graph that routes through
+// ggml_view_* -- which is exactly what Qwen3.5's conv state and q/k l2_norm do.
+static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, int max_n,
+                                     ggml_tensor ** out, int * last_idx) {
+    int n = 0;
+    *last_idx = i;
+    for (int j = i; j < cgraph->n_nodes && n < max_n; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        // Nodes the main loop skips (no-ops, non-COMPUTE) are not fusion candidates either
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (node->op != op) {
+            break;
+        }
+        out[n++]  = node;
+        *last_idx = j;
+    }
+    return n;
+}
+
+// If ops[0..n) appear in this order (skipping no-ops), record their positions in idxs and return true
+static bool ggml_cuda_collect_ops(ggml_cgraph * cgraph, int i, const ggml_op * ops, int n, int * idxs) {
+    int k = 0;
+    for (int j = i; j < cgraph->n_nodes && k < n; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (node->op != ops[k]) {
+            return false;
+        }
+        idxs[k++] = j;
+    }
+    return k == n;
+}
+
+// Can the residual add be folded into rms_norm's prologue?
+// The kernel maps one row to one block and consumes the sum within that block, so the only
+// requirements are: rms_norm's input is exactly the preceding ADD, there is no broadcasting,
+// and all three tensors are contiguous.  The ADD's output is still written because the next
+// layer reads it as its residual (the caller lists it in outputs).
+static bool ggml_cuda_should_fuse_pre_add_rms_norm(const ggml_tensor * add, const ggml_tensor * rms_norm) {
+    if (add->op != GGML_OP_ADD || rms_norm->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+    if (rms_norm->src[0] != add) {
+        return false;
+    }
+    if (add->type != GGML_TYPE_F32 || !add->src[0] || !add->src[1] ||
+        add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(add, add->src[0]) || !ggml_are_same_shape(add, add->src[1])) {
+        return false;
+    }
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1])) {
+        return false;
+    }
+    return true;
+}
+
+// The same conditions upstream's {RMS_NORM, MUL} fusion checks inside ggml_cuda_can_fuse,
+// factored out so they also work when the node indices are not consecutive
+static bool ggml_cuda_should_fuse_rms_norm_mul(const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mul->src[0] != rms_norm && mul->src[1] != rms_norm) {
+        return false;
+    }
+    if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // Broadcasting is not handled when rms_norm is the B operand (same as upstream)
+    if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+        return false;
+    }
+    return true;
+}
+
+// Return value meaning "this node will be executed folded into a later node; do nothing here"
+#define GGML_CUDA_FUSE_DEFERRED (-1)
+
+// Walk view / reshape down to the underlying node.  Gives up on offset or non-contiguous views.
+static const ggml_tensor * ggml_cuda_view_root_contig(const ggml_tensor * t) {
+    while (t != nullptr && t->view_src != nullptr) {
+        if (t->view_offs != 0 || !ggml_is_contiguous(t)) {
+            return nullptr;
+        }
+        t = t->view_src;
+    }
+    return t;
+}
+
+// Does node n read tensor t, including through views?
+static bool ggml_cuda_node_reads(const ggml_tensor * n, const ggml_tensor * t) {
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        for (const ggml_tensor * s = n->src[k]; s != nullptr; s = s->view_src) {
+            if (s == t) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Does node n write into the same underlying tensor (view root) as t?
+// GGML_OP_CPY and the *_inplace ops make the node itself a view of the destination tensor, so
+// following it down to the root answers the question.
+static bool ggml_cuda_node_writes_into(const ggml_tensor * n, const ggml_tensor * t) {
+    if (n == nullptr || t == nullptr) {
+        return false;
+    }
+    const ggml_tensor * a = n;
+    while (a->view_src != nullptr) {
+        a = a->view_src;
+    }
+    const ggml_tensor * b = t;
+    while (b->view_src != nullptr) {
+        b = b->view_src;
+    }
+    return a == b;
+}
+
+// Snapshot the row indices at the position the GET_ROWS occupied and record the deferral.
+// Reading src[1] at the deferred position instead would see corrupted values, because galloc may
+// have reused those addresses for another tensor in the meantime (which really happens with the
+// small per-slot compute buffers).
+static bool ggml_cuda_defer_gather(ggml_backend_cuda_context * cuda_ctx, ggml_tensor * node,
+                                   const ggml_tensor * owner) {
+    const size_t n_idx = (size_t) ggml_nelements(node->src[1]);
+    if (n_idx == 0 || n_idx > 4096) {
+        return false;
+    }
+    if (cuda_ctx->gdn_rows_scratch_n < n_idx) {
+        if (cuda_ctx->gdn_rows_scratch != nullptr) {
+            CUDA_CHECK(cudaFree(cuda_ctx->gdn_rows_scratch));
+        }
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaMalloc((void **) &cuda_ctx->gdn_rows_scratch, 4096 * sizeof(int32_t)));
+        cuda_ctx->gdn_rows_scratch_n = 4096;
+    }
+    // Reuse the existing snapshot when the index tensor is the same.  Every SSM layer uses the
+    // same tensor, so one copy per graph suffices; doing it per layer stacks up a 1.8 us
+    // device-to-device copy for every layer.
+    if (cuda_ctx->gdn_rows_src != node->src[1]) {
+        CUDA_CHECK(cudaMemcpyAsync(cuda_ctx->gdn_rows_scratch, node->src[1]->data,
+                                   n_idx * sizeof(int32_t), cudaMemcpyDeviceToDevice,
+                                   cuda_ctx->stream()));
+        cuda_ctx->gdn_rows_src = node->src[1];
+    }
+    cuda_ctx->gdn_gather_node  = node;
+    cuda_ctx->gdn_gather_owner = owner;
+    return true;
+}
+// If the deferred GET_ROWS belongs to this gdn, build the fold description for it
+static bool ggml_cuda_take_deferred_gather(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * gdn,
+                                           ggml_cuda_gated_delta_net_fused_gather & out) {
+    if (cuda_ctx->gdn_gather_owner != gdn || cuda_ctx->gdn_gather_node == nullptr) {
+        return false;
+    }
+    const ggml_tensor * gr = cuda_ctx->gdn_gather_node;
+    out.base       = (const float *) gr->src[0]->data;
+    out.rows       = cuda_ctx->gdn_rows_scratch;   // row indices saved at the GET_ROWS position
+    out.row_stride = (int64_t) (gr->src[0]->nb[1] / sizeof(float));
+    out.gather_dst = (float *) gr->data;    // node-preserving: the folded node's dst is written too
+    cuda_ctx->gdn_gather_clear();
+    return out.base != nullptr && out.rows != nullptr && out.gather_dst != nullptr && out.row_stride > 0;
+}
+
 // try and fuse nodes and return the number of nodes to skip
-static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
+                              bool allow_defer) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -3283,17 +3567,235 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Fold the SSM state GET_ROWS into the following GATED_DELTA_NET.
+    // Measured, `k_get_rows_float_vec` fires as often as gdn itself (3984 launches) for 1.396% of
+    // decode GPU time, and all it does is copy 2 MB out of the cache and hand it to gdn.  gdn
+    // already writes the new state straight into the cache (cache fusion), so read the input
+    // directly too.
+    // Keeping it node-preserving -- gdn also writes the GET_ROWS dst -- reduces the safety check to
+    // "no node between the GET_ROWS and gdn reads its output".  Later nodes read after gdn has
+    // written, so they are unaffected, and a bounded scan suffices.
+    if (allow_defer && node->op == GGML_OP_GET_ROWS && cuda_ctx->gdn_gather_node == nullptr) {
+        static bool disable_gdn_gather = getenv("GGML_CUDA_DISABLE_FUSE_GDN_GATHER") != nullptr &&
+                                         std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_GDN_GATHER"));
+        if (!disable_gdn_gather && node->type == GGML_TYPE_F32 && node->src[0] != nullptr &&
+            node->src[1] != nullptr && node->src[0]->type == GGML_TYPE_F32 &&
+            node->src[1]->type == GGML_TYPE_I32 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_is_contiguous(node) && ggml_is_contiguous_rows(node->src[0]) &&
+            node->src[0]->nb[0] == sizeof(float) && node->ne[2] == 1 && node->ne[3] == 1) {
+
+            const ggml_tensor * gdn = nullptr;
+            const int           win = std::min(cgraph->n_nodes, i + 64);   // keep the scan bounded
+            for (int j = i + 1; j < win; ++j) {
+                ggml_tensor * n = cgraph->nodes[j];
+                if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] != nullptr &&
+                    ggml_cuda_view_root_contig(n->src[5]) == node &&
+                    ggml_nelements(n->src[5]) == ggml_nelements(node) &&
+                    (n->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && !ggml_cuda_is_view_or_noop(n)) {
+                    gdn = n;
+                    break;
+                }
+                // Views and reshapes are never executed, so exclude them from the scan.  Otherwise
+                // the reshape that hands the state to gdn (its src[0] is this GET_ROWS) always
+                // matches and breaks the loop immediately.  Real nodes that read through a view are
+                // still caught, because ggml_cuda_node_reads follows view_src.
+                if (ggml_cuda_is_view_or_noop(n)) {
+                    continue;
+                }
+                if (ggml_cuda_node_reads(n, node)) {
+                    break;      // something reads it before gdn does, so it cannot be deferred
+                }
+            }
+            if (gdn != nullptr && ggml_cuda_defer_gather(cuda_ctx, node, gdn)) {
+                return GGML_CUDA_FUSE_DEFERRED;
+            }
+        }
+    }
+
+    // Fold the conv-state GET_ROWS into the CONCAT that immediately follows it.
+    // build_conv_state does a round trip that just pulls 96 KB out of the cache and hands it to
+    // CONCAT; letting CONCAT read the cache directly removes a whole launch (4.55 us x 3984
+    // launches = 0.556% of decode GPU time).
+    // Whether folding is possible is decided on the concat side (ggml_cuda_concat_can_fuse_gather).
+    // Deferring without CONCAT then taking the per-row path would corrupt the result, so that
+    // decision lives in exactly one place.
+    if (allow_defer && node->op == GGML_OP_GET_ROWS && cuda_ctx->gdn_gather_node == nullptr) {
+        const ggml_tensor * cc  = nullptr;
+        const int           win = std::min(cgraph->n_nodes, i + 16);
+        for (int j = i + 1; j < win; ++j) {
+            ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_CONCAT && n->src[0] != nullptr &&
+                ggml_cuda_view_root_contig(n->src[0]) == node &&
+                ggml_nelements(n->src[0]) == ggml_nelements(node) &&
+                (n->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                ggml_cuda_concat_can_fuse_gather(n, node)) {
+                cc = n;
+                break;
+            }
+            // Views and reshapes are never executed, so exclude them from the scan (same trap as
+            // for the gdn gather: the reshape feeding CONCAT would always match and break the loop)
+            if (ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            if (ggml_cuda_node_reads(n, node)) {
+                break;      // something reads it before CONCAT does, so it cannot be deferred
+            }
+            // Folding also moves the point at which the cache is READ forward to the CONCAT.  If a
+            // node in between writes the cache, the folded read would see the updated values.
+            // build_rs assembles "copy the remaining rows" against the same state buffer, so this
+            // is a real possibility rather than a theoretical one.
+            if (ggml_cuda_node_writes_into(n, node->src[0])) {
+                break;
+            }
+        }
+        if (cc != nullptr && ggml_cuda_defer_gather(cuda_ctx, node, cc)) {
+            return GGML_CUDA_FUSE_DEFERRED;
+        }
+    }
+    // SIGMOID -> (view) -> GATED_DELTA_NET
+    // Fold beta = sigmoid(x) into the gdn prologue.  gdn also writes the folded SIGMOID's dst, so
+    // no use-count analysis is needed and the output is bit-identical.  Composes with cache fusion.
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+        static bool disable_gdn_beta = getenv("GGML_CUDA_DISABLE_FUSE_GDN_BETA") != nullptr &&
+                                       std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_GDN_BETA"));
+        if (!disable_gdn_beta && node->type == GGML_TYPE_F32 && node->src[0] != nullptr &&
+            node->src[0]->type == GGML_TYPE_F32 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_is_contiguous(node) && ggml_is_contiguous(node->src[0]) &&
+            ggml_are_same_shape(node, node->src[0]) && ggml_are_same_stride(node, node->src[0])) {
+
+            // Find the next node with actual work (views / no-ops in between are allowed)
+            int j = i + 1;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                ++j;
+            }
+            ggml_tensor * gdn = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+            if (gdn != nullptr && gdn->op == GGML_OP_GATED_DELTA_NET && gdn->src[4] == node) {
+                ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
+                const int cache_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, j, fused_state_cpy);
+                ggml_cuda_gated_delta_net_fused_gather gather;
+                const bool has_gather = ggml_cuda_take_deferred_gather(cuda_ctx, gdn, gather);
+#ifdef GGML_CUDA_DEBUG
+                GGML_LOG_INFO("%s: fused sigmoid into gated_delta_net beta for %s (cache_skip %d, gather %d)\n",
+                              __func__, gdn->name, cache_skip, (int) has_gather);
+#endif
+                ggml_cuda_op_gated_delta_net_fused(*cuda_ctx, gdn,
+                        cache_skip > 0 ? &fused_state_cpy : nullptr, /*fuse_beta_sigmoid =*/ true,
+                        has_gather ? &gather : nullptr);
+                return (j - i) + cache_skip;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
-        if (nodes_to_skip > 0) {
+        ggml_cuda_gated_delta_net_fused_gather gather;
+        const bool has_gather = ggml_cuda_take_deferred_gather(cuda_ctx, node, gather);
+        if (nodes_to_skip > 0 || has_gather) {
 #ifdef GGML_CUDA_DEBUG
-            GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
-                          __func__, node->name, nodes_to_skip);
+            GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes, gather %d)\n",
+                          __func__, node->name, nodes_to_skip, (int) has_gather);
 #endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
-            return nodes_to_skip;
+            ggml_cuda_op_gated_delta_net_fused(*cuda_ctx, node,
+                    nodes_to_skip > 0 ? &fused_state_cpy : nullptr, /*fuse_beta_sigmoid =*/ false,
+                    has_gather ? &gather : nullptr);
+            // With only the gather folded in there are no extra nodes to skip, but this node has
+            // been executed, so the caller still has to be told it was fused -- 0 already means
+            // "not fused".
+            return nodes_to_skip > 0 ? nodes_to_skip : GGML_CUDA_FUSE_DEFERRED;
+        }
+    }
+
+    // Merge runs of identically shaped CPY / L2_NORM nodes into one launch each
+    if (node->op == GGML_OP_CPY) {
+        static bool disable_cpy = getenv("GGML_CUDA_DISABLE_FUSE_CPY") != nullptr &&
+                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_CPY"));
+        if (!disable_cpy) {
+            ggml_tensor * nodes[CUDA_CPY_FUSE_MAX];
+            int last_idx = i;
+            int n = ggml_cuda_collect_same_op(cgraph, i, GGML_OP_CPY, CUDA_CPY_FUSE_MAX, nodes, &last_idx);
+            const int collected = n;
+            while (n >= 2 && !ggml_cuda_fuse_nodes_disjoint(nodes, n, /*dst_src_idx =*/ 1)) {
+                --n;
+                last_idx = ggml_cuda_node_index_of(cgraph, i, nodes[n - 1]);
+            }
+            const bool launched = n >= 2 && ggml_cuda_cpy_fused(*cuda_ctx, nodes, n);
+            ggml_cuda_fuse_diag(cgraph, i, collected, n, launched);
+            if (launched) {
+                ggml_cuda_fuse_log("cpy", n);
+                return last_idx - i;
+            }
+        }
+    }
+
+    // Fuse the residual add into RMS_NORM: ADD -> RMS_NORM -> MUL in one launch.  The
+    // `k_bin_bcast(add) -> rms_norm` pair is 3.11% of decode GPU time.  Upstream only fuses what
+    // comes AFTER rms_norm (mul / add); the preceding residual add passed through untouched.
+    if (node->op == GGML_OP_ADD) {
+        static bool disable_pre_add = getenv("GGML_CUDA_DISABLE_FUSE_PRE_ADD") != nullptr &&
+                                      std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_PRE_ADD"));
+        if (!disable_pre_add) {
+            static const ggml_op pre_add_ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            int idxs[3];
+            if (ggml_cuda_collect_ops(cgraph, i, pre_add_ops, 3, idxs)) {
+                ggml_tensor * add = cgraph->nodes[idxs[0]];
+                ggml_tensor * rms = cgraph->nodes[idxs[1]];
+                ggml_tensor * mul = cgraph->nodes[idxs[2]];
+                // The ADD output is the next layer's residual and the MUL output is the final
+                // result; neither is eliminated, so both are listed in outputs
+                const int outs[2] = { idxs[0], idxs[2] };
+                if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, pre_add_ops, outs, 2) &&
+                    ggml_cuda_should_fuse_pre_add_rms_norm(add, rms) &&
+                    ggml_cuda_should_fuse_rms_norm_mul(rms, mul)) {
+                    ggml_cuda_op_rms_norm_fused_pre_add(*cuda_ctx, add, rms, mul);
+                    ggml_cuda_fuse_log("pre_add_rms_norm", 3);
+                    return idxs[2] - i;
+                }
+            }
+        }
+    }
+
+    // Fuse ADD -> UNARY -> MUL into one launch (Qwen3.5's gate preprocessing).  These three
+    // launches are 0.65% of decode GPU time, dominated by launch overhead rather than work.
+    if (node->op == GGML_OP_ADD) {
+        static bool disable_aum = getenv("GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL") != nullptr &&
+                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL"));
+        if (!disable_aum) {
+            static const ggml_op aum_ops[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+            int idxs[3];
+            if (ggml_cuda_collect_ops(cgraph, i, aum_ops, 3, idxs)) {
+                // All three destinations are written, so nothing is eliminated: list them all
+                // in outputs
+                const int outs[3] = { idxs[0], idxs[1], idxs[2] };
+                if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, aum_ops, outs, 3) &&
+                    ggml_cuda_op_fused_add_unary_mul(*cuda_ctx, cgraph->nodes[idxs[0]],
+                                                     cgraph->nodes[idxs[1]], cgraph->nodes[idxs[2]])) {
+                    ggml_cuda_fuse_log("add_unary_mul", 3);
+                    return idxs[2] - i;
+                }
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_L2_NORM) {
+        static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
+                                 std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
+        if (!disable_l2) {
+            ggml_tensor * nodes[CUDA_L2_NORM_FUSE_MAX];
+            int last_idx = i;
+            int n = ggml_cuda_collect_same_op(cgraph, i, GGML_OP_L2_NORM, CUDA_L2_NORM_FUSE_MAX, nodes, &last_idx);
+            const int collected = n;
+            while (n >= 2 && !ggml_cuda_fuse_nodes_disjoint(nodes, n, /*dst_src_idx =*/ -1)) {
+                --n;
+                last_idx = ggml_cuda_node_index_of(cgraph, i, nodes[n - 1]);
+            }
+            const bool launched = n >= 2 && ggml_cuda_l2_norm_fused(*cuda_ctx, nodes, n);
+            ggml_cuda_fuse_diag(cgraph, i, collected, n, launched);
+            if (launched) {
+                ggml_cuda_fuse_log("l2_norm", n);
+                return last_idx - i;
+            }
         }
     }
 
@@ -4016,6 +4518,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
+    // Only defer node execution when concurrent streams are not in use: reordering across streams
+    // is unsafe.  The record is cleared per graph computation.
+    const bool                   allow_defer = stream_ctx.concurrent_events.empty();
+    cuda_ctx->gdn_gather_reset_graph();
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
@@ -4149,7 +4655,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, allow_defer);
+
+                if (nodes_to_skip == GGML_CUDA_FUSE_DEFERRED) {
+                    // This node is executed folded into a later node (or has been already)
+                    continue;
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4248,6 +4759,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // The q8_1 activation cache keys on a tensor pointer, which a later graph may
+    // reuse for a different tensor, so it must not outlive the graph that filled it
+    cuda_ctx->q8_1_cache_clear();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
