@@ -65,6 +65,10 @@ models listed above; inert patches are kept to stay close to the upstream patch 
 "clean" = applied by `git rebase` without conflict. That is not the same as compiled or
 measured; see the test checklist.
 
+The Qwen3.8-27B GGUF ships the MTP head; it is loaded and unused without speculative
+decoding. 14, 15 and 22 go live the moment MTP speculative decoding is switched on, so
+re-measure then (and revisit 22).
+
 ### 09 mmvq-nwarps-small-k-sm60
 
 Conflicts with upstream #26843 (`25ae3a9b3`, "MMVQ nwarps=8 for bs=1 on DGX Spark"), which
@@ -103,6 +107,25 @@ that runs the graph, plus identity-validated scratch pools for graph-external `s
 Fixes `GGML_ASSERT(bcj.nodes[i]) failed` in `ggml_backend_meta_graph_compute` after a graph
 rebuild. Applied as commit `p100: meta backend graph reuse fix`.
 
+Crash signature on stock upstream (b10133 through b10615, `ggml-backend-meta.cpp:1836`):
+fires on the first decode of a request with a near-exact prefix cache hit (`sim_best`
+0.997-1.000) over a large context, before any prompt-processing line is logged. Not a size
+threshold: crashed at 48.9k / 63.2k / 65.6k tokens while 42k, 43k and 62k went through, and
+high similarity alone is not sufficient either. The child aborts, the router respawns it and
+the next request reprocesses the whole conversation (minutes at ~280 t/s pp) - that
+reprocessing is the visible symptom. Noise in the same log, not causes:
+`llama_params_fit is not implemented for SPLIT_MODE_TENSOR`, the NCCL `libnccl-*.so`
+plugin-not-found lines, the Qwen-VL image-token warning.
+
+With the gist the equivalent assert is the `GGML_ASSERT(bcj.nodes[i])` right after
+`ggml_backend_meta_simple_tensor_ensure(backend_ctx->stc_compute[...], node, j)`. If it ever
+fires again, `LLAMA_GRAPH_REUSE_DISABLE=1` is the escape hatch (see knobs; -27% tg here).
+
+Validated 2026-08-26 on the same workload: single instance to 89,139 tokens,
+`graphs reused = 39203`, no assert; passed every old crash point and dozens of
+`f_sim_best = 1.000` / 0.998-0.999 requests at 65.8k-87.5k. Both cards at 15,472 MiB from
+one PID, nothing on CPU (no partial-offload regression).
+
 Adaptations made against b10630:
 
 - Upstream #27574 changed the PARTIAL-split branch of `ggml_backend_meta_buffer_set_tensor`
@@ -139,7 +162,19 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `LLAMA_DEC_SLOTS=N` (default 4, 0 = off), `LLAMA_DEC_MAX_TOK` (default 4) | 22 | decode slots (not on the branch) |
 | `LLAMA_MTP_DRAFT_VOCAB=<file>` | 15 | enable draft vocab subset |
 | `GGML_A16_*` | 12 | Q4_1 HFMA2 kernel tuning |
-| `LLAMA_GRAPH_REUSE_DISABLE=1` | upstream | disables graph reuse (costs ~15 ms/token here) |
+| `GGML_CUDA_DISABLE_FUSION=1` | upstream | disables all CUDA fusion, including the patched rules of 18, 19, 20, 23, 24, 27 |
+| `LLAMA_GRAPH_REUSE_DISABLE=1` | upstream | disables graph reuse (28.9 -> 18.1 t/s tg here, -27%; pp unchanged) |
+
+No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 03,
+06-08). To bisect one of those, build with the commit dropped (`git rebase -i` or
+`git revert`). 21 is a scheduler patch (`ggml-backend.cpp`, lazy `ggml_backend_sched_reset`)
+next to where the meta backend crash lived; it was on the branch for the 89k validation run
+above, so it is cleared for `-sm tensor`, but it is the first one to drop if scheduler-side
+symptoms come back.
+
+Graph reuse is a CPU-side optimization (skips graph rebuild and the meta backend's re-split
+across devices); it has nothing to do with KV/prompt caching, which is `cache_prompt` plus
+LCP slot matching in the server.
 
 ## Updating to a new upstream
 
@@ -183,15 +218,25 @@ cmake --build build -j
 `test-llama-archs` is the only test that exercises `ggml-backend-meta.cpp`; it skips the meta
 configuration on CPU-only machines, so it has to run on the server.
 
-Then the real workload: `llama-server` with the usual flags, a long generation, and the
-prompt that used to crash. Any change in output vs. stock is expected only from 03 (MoE,
-above one row) and 12 (Q4_1); everything else is bit-identical by design.
+If `test-backend-ops` reports a single MUL_MAT failure, rerun the full unfiltered suite two
+or three times rather than the filtered single case: the `-p` filter changes the random
+draw, so "passes alone" only says the case is data dependent, not that it is harmless.
+Reproducible in the full run but not alone = unlucky draw; intermittent in the full run =
+something real.
 
-To check that claim after a rebase, keep a stock build next to this one and run the same
-prompt through both with `--temp 0 --seed 1` (greedy, so any difference is real and not
-sampling noise). Identical text means the branch is clean; a divergence after N tokens
-points at a numeric change - bisect at runtime with the kill switches above before
-rebuilding anything.
+Then the real workload: `llama-server` with the usual flags. The shape that used to crash
+is a large context (50k+) followed by a request with a near-exact prefix cache hit
+(`sim_best` 0.997-1.000 in the log), i.e. a long chat that keeps going. Watch for the
+assert and for the router respawning the child; `GGML_META_DEBUG=1` logs the meta backend's
+rebuilds if that needs pinning down.
+
+Output vs. stock: the only patches that change numbers are 03 (MoE, above one row), 12
+(Q4_1 weights, n >= 2) and 15 (off unless `LLAMA_MTP_DRAFT_VOCAB` is set). None of them fire
+for Q4_K_M/Q6_K `qwen35` without speculative decoding, so a greedy run (`--temp 0 --seed 1`)
+of the same prompt through this build and a stock build of the same base commit is expected
+to be identical to the last token, not just similar. Any divergence is a bug; bisect at
+runtime with the kill switches above (start with `GGML_CUDA_DISABLE_FUSION=1`, then
+`LLAMA_SAMPLER_PREFILTER=0`) before rebuilding anything.
 
 ## Change log
 
@@ -209,3 +254,13 @@ rebuilding anything.
   n=1 path (12 needs n >= 2), so this is taken as the fp16 `m*s` term of upstream's Q4_1
   vec_dot on sm_60 going borderline for an unlucky random draw at one block of K. Not a real
   inference shape; treat a recurrence as known unless it becomes deterministic.
+- 2026-08-26: crash test on the server (Qwen3.8-27B Q4_K_M, `-sm tensor -fa on -c 200000
+  -b 2048 -ub 2048 -np 1`, router mode). Stock upstream crashed at 48.9k / 63.2k / 65.6k
+  tokens on prefix-cache-hit decodes; this branch ran one instance to 89,139 tokens with
+  39,203 graph reuses and no assert. pp 475 t/s at 3.7k -> ~270 t/s at 89k, tg 28.9 -> 22.8
+  t/s (normal attention scaling). `LLAMA_GRAPH_REUSE_DISABLE=1`: tg 18.1 t/s flat, pp
+  unchanged. VRAM is preallocated at load (~94% per card), no headroom for more context or a
+  second slot. Conclusion: the fault was upstream's meta backend, not the patch set; the
+  gist is what fixed it (a plain version bump would not have - the only meta-backend commits
+  between b10133 and b10615 are #26502 and its revert #27433, plus #27574 which is a
+  different mechanism).
