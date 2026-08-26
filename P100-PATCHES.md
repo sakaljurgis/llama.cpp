@@ -21,8 +21,8 @@ Every patch also carries its reasoning in the comments it adds to the source.
 - Base: upstream `master` at `5d5cb4c3a` (`b10630`).
 - One commit per patch, subject `p100: NN-name`, in the original numeric order.
   Order matters: several patches touch the same lines and later ones build on earlier ones.
-- Commits after the patch series: `22-decode-sched-slots` (needs a fix, see below),
-  the gist, and this document.
+- Commits after the patch series: the meta backend gist and this document. 09 and 22 are
+  not on the branch (deferred, see below).
 
 ## Status per patch (against b10630)
 
@@ -39,7 +39,7 @@ models listed above; inert patches are kept to stay close to the upstream patch 
 | 06 | mmq-mul-mat-id-sm60 | sm_60 | clean | MoE only |
 | 07 | mmvq-moe-rows-sm60 | all archs | clean | MoE only |
 | 08 | mmvq-mmid-batch-sm60 | pre-Volta | clean | MoE only |
-| 09 | mmvq-nwarps-small-k-sm60 | pre-Turing | **not applied** | MoE only |
+| 09 | mmvq-nwarps-small-k-sm60 | pre-Turing | **deferred** (see below) | MoE only |
 | 10 | mmvq-q8-1-activation-cache | CUDA | clean | yes |
 | 11 | penalties-direct | host | clean | yes (CPU sampling with penalties) |
 | 12 | mmvq-f16-sm60 | sm_60 | clean | Q4_1 only, inert for K-quants |
@@ -52,7 +52,7 @@ models listed above; inert patches are kept to stay close to the upstream patch 
 | 19 | fuse-pre-add-rms-norm | CUDA | clean | yes |
 | 20 | fuse-add-unary-mul | CUDA (delta-net) | clean | qwen35 |
 | 21 | sched-reset-lazy | host | clean | yes |
-| 22 | decode-sched-slots | host | **pending** (4-line conflict) | yes |
+| 22 | decode-sched-slots | host | **deferred** (see below) | speculative decoding only |
 | 23 | fuse-gdn-beta-sigmoid | CUDA (delta-net) | clean | qwen35 |
 | 24 | fuse-gdn-state-gather | CUDA (delta-net) | clean | qwen35 |
 | 25 | gdn-gather-single-snapshot | CUDA (delta-net) | clean | qwen35 |
@@ -71,7 +71,7 @@ Conflicts with upstream #26843 (`25ae3a9b3`, "MMVQ nwarps=8 for bs=1 on DGX Spar
 rewrote `calc_nwarps`, `calc_launch_params` and the `ncols_dst == 1` launch path that 09 edits.
 Re-implementing it means adding a warp-count override for `cc < VOLTA` on top of the new
 `launch(small_k_tag, halve_iters_tag)` structure. Measured +1.29% on MoE decode, +0.12% on
-dense, so it is left out until a MoE model is in use.
+dense. Deferred 2026-08-26: no MoE model in use, so nothing to gain. Revisit when one is.
 
 ### 13 sampler-prefilter
 
@@ -87,8 +87,13 @@ Upstream renamed the sampling copy helpers (`copy_tensor_async_ints/floats/candi
 `copy_tensor_async_rows`, #25532). The conflict is the 4 calls in `llama_context::decode`;
 resolution is `sched.get()` -> `sched_active()` on the new lines.
 
-Note: this patch gives every decode slot its own `ggml_backend_sched`. If a crash looks
-allocation related, `LLAMA_DEC_SLOTS=0` disables the slots but keeps upstream graph reuse.
+Deferred 2026-08-26. The patch only pays off when the decode graph shape changes every step
+(MTP speculative decoding: draft graph, then a verify batch of n_draft+1), where upstream's
+single cached graph is reused ~14% of the time. Without speculative decoding every decode
+step has the same shape and upstream reuse already hits, so the measured +0.97% (4 slots,
++72 MiB VRAM) does not apply. It also adds four `ggml_backend_sched` instances with their own
+compute buffers, which is more surface for `-sm tensor`. Revisit when MTP is switched on, and
+then measure `LLAMA_DEC_SLOTS=0` vs `4` on the real workload instead of trusting the number.
 
 ### Meta backend gist
 
@@ -131,7 +136,7 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_CONCAT_ROWS`, `GGML_CUDA_DISABLE_FUSE_CONCAT_GATHER` | 27 | kill switches |
 | `GGML_CUDA_DISABLE_TOP_K_PARTIAL` | 28 | kill switch |
 | `LLAMA_SAMPLER_PREFILTER=0` | 13 | kill switch |
-| `LLAMA_DEC_SLOTS=N` (default 4, 0 = off), `LLAMA_DEC_MAX_TOK` (default 4) | 22 | decode slots |
+| `LLAMA_DEC_SLOTS=N` (default 4, 0 = off), `LLAMA_DEC_MAX_TOK` (default 4) | 22 | decode slots (not on the branch) |
 | `LLAMA_MTP_DRAFT_VOCAB=<file>` | 15 | enable draft vocab subset |
 | `GGML_A16_*` | 12 | Q4_1 HFMA2 kernel tuning |
 | `LLAMA_GRAPH_REUSE_DISABLE=1` | upstream | disables graph reuse (costs ~15 ms/token here) |
