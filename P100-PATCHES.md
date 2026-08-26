@@ -195,7 +195,12 @@ LCP slot matching in the server.
   without MTP; prompt processing ~25% slower and ~1 s fixed cost per request. Untested
   fixes: `--draft-p-min 0` (constant width 5, reuse should recover), patch 22.
 - `ngram-mod` costs nothing when it does not draft; see the first note for the draft length
-  limit.
+  limit. Measured 2026-08-26 with `n-max 7 n-min 4` at 200k ctx: tg 27.1-27.4 t/s flat at
+  25-27k context (= no-speculation baseline), drafts fire on ~1% of reasoning tokens
+  (acceptance 0.64-1.0 when they do). Harmless; only pays on repetitive output.
+- A fixed ~1 s prompt phase per request shows up on short follow-ups (`929 ms / 55 tokens`)
+  with and without a draft model; cause not identified (not the meta-backend re-splits,
+  those are ~20 ms each).
 
 ## Updating to a new upstream
 
