@@ -1160,6 +1160,29 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
 #define VDR_IQ3_XXS_Q8_1_MMQ  2
 
+// The 32 lanes of a warp index iq3xxs_grid independently, so a global load of it
+// is split into as many sectors as there are distinct addresses and replayed
+// serially; staging the 1 KiB table in shared memory leaves only bank conflicts.
+// __constant__ is worse than global here, because the constant cache broadcasts
+// one address per cycle and a divergent index serialises 32 ways.
+//
+// Every kernel that reaches vec_dot_iq3_xxs_q8_1 must call iq3xxs_grid_smem_init()
+// first, before any early return, because it contains a __syncthreads().  The
+// dispatch goes through a function-pointer table, so a missing call is not a
+// compile error: it reads uninitialised shared memory and returns wrong values.
+static __device__ __forceinline__ uint32_t * iq3xxs_grid_smem() {
+    __shared__ uint32_t s_grid[256];
+    return s_grid;
+}
+
+static __device__ __forceinline__ void iq3xxs_grid_smem_init(const int tid, const int nthreads) {
+    uint32_t * s_grid = iq3xxs_grid_smem();
+    for (int i = tid; i < 256; i += nthreads) {
+        s_grid[i] = iq3xxs_grid[i];
+    }
+    __syncthreads();
+}
+
 static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1169,10 +1192,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     const uint8_t * q3 = (const uint8_t *) &q3_packed;
     const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
 
+    const uint32_t * s_grid = iq3xxs_grid_smem();
+
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(s_grid[q3[l0 + 0]], s_grid[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
