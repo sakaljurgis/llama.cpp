@@ -3492,6 +3492,55 @@ static bool ggml_cuda_node_reads(const ggml_tensor * n, const ggml_tensor * t) {
     return false;
 }
 
+// Does node n write into the same underlying tensor (view root) as t?
+// GGML_OP_CPY and the *_inplace ops make the node itself a view of the destination tensor, so
+// following it down to the root answers the question.
+static bool ggml_cuda_node_writes_into(const ggml_tensor * n, const ggml_tensor * t) {
+    if (n == nullptr || t == nullptr) {
+        return false;
+    }
+    const ggml_tensor * a = n;
+    while (a->view_src != nullptr) {
+        a = a->view_src;
+    }
+    const ggml_tensor * b = t;
+    while (b->view_src != nullptr) {
+        b = b->view_src;
+    }
+    return a == b;
+}
+
+// Snapshot the row indices at the position the GET_ROWS occupied and record the deferral.
+// Reading src[1] at the deferred position instead would see corrupted values, because galloc may
+// have reused those addresses for another tensor in the meantime (which really happens with the
+// small per-slot compute buffers).
+static bool ggml_cuda_defer_gather(ggml_backend_cuda_context * cuda_ctx, ggml_tensor * node,
+                                   const ggml_tensor * owner) {
+    const size_t n_idx = (size_t) ggml_nelements(node->src[1]);
+    if (n_idx == 0 || n_idx > 4096) {
+        return false;
+    }
+    if (cuda_ctx->gdn_rows_scratch_n < n_idx) {
+        if (cuda_ctx->gdn_rows_scratch != nullptr) {
+            CUDA_CHECK(cudaFree(cuda_ctx->gdn_rows_scratch));
+        }
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaMalloc((void **) &cuda_ctx->gdn_rows_scratch, 4096 * sizeof(int32_t)));
+        cuda_ctx->gdn_rows_scratch_n = 4096;
+    }
+    // Reuse the existing snapshot when the index tensor is the same.  Every SSM layer uses the
+    // same tensor, so one copy per graph suffices; doing it per layer stacks up a 1.8 us
+    // device-to-device copy for every layer.
+    if (cuda_ctx->gdn_rows_src != node->src[1]) {
+        CUDA_CHECK(cudaMemcpyAsync(cuda_ctx->gdn_rows_scratch, node->src[1]->data,
+                                   n_idx * sizeof(int32_t), cudaMemcpyDeviceToDevice,
+                                   cuda_ctx->stream()));
+        cuda_ctx->gdn_rows_src = node->src[1];
+    }
+    cuda_ctx->gdn_gather_node  = node;
+    cuda_ctx->gdn_gather_owner = owner;
+    return true;
+}
 // If the deferred GET_ROWS belongs to this gdn, build the fold description for it
 static bool ggml_cuda_take_deferred_gather(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * gdn,
                                            ggml_cuda_gated_delta_net_fused_gather & out) {
@@ -3557,38 +3606,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     break;      // something reads it before gdn does, so it cannot be deferred
                 }
             }
-            if (gdn != nullptr) {
-                // Save the row indices here, at the stream position where the GET_ROWS was.
-                // Deferring the read to gdn would let galloc reuse this input's addresses for
-                // another tensor in the meantime and read corrupted values.  This really happens
-                // with the small per-slot compute buffers; the main scheduler's 2 GB hides it.
-                const size_t n_idx = (size_t) ggml_nelements(node->src[1]);
-                if (n_idx > 0 && n_idx <= 4096) {
-                    if (cuda_ctx->gdn_rows_scratch_n < n_idx) {
-                        if (cuda_ctx->gdn_rows_scratch != nullptr) {
-                            CUDA_CHECK(cudaFree(cuda_ctx->gdn_rows_scratch));
-                        }
-                        ggml_cuda_set_device(cuda_ctx->device);
-                        CUDA_CHECK(cudaMalloc((void **) &cuda_ctx->gdn_rows_scratch, 4096 * sizeof(int32_t)));
-                        cuda_ctx->gdn_rows_scratch_n = 4096;
-                    }
-                    // Reuse the existing snapshot when the index tensor is the same.  Every SSM
-                    // layer uses the same tensor, so one copy per graph suffices; doing it per
-                    // layer stacks up a 1.8 us device-to-device copy for every layer.
-                    if (cuda_ctx->gdn_rows_src != node->src[1]) {
-                        CUDA_CHECK(cudaMemcpyAsync(cuda_ctx->gdn_rows_scratch, node->src[1]->data,
-                                                   n_idx * sizeof(int32_t), cudaMemcpyDeviceToDevice,
-                                                   cuda_ctx->stream()));
-                        cuda_ctx->gdn_rows_src = node->src[1];
-                    }
-                    cuda_ctx->gdn_gather_node  = node;
-                    cuda_ctx->gdn_gather_owner = gdn;
-                    return GGML_CUDA_FUSE_DEFERRED;
-                }
+            if (gdn != nullptr && ggml_cuda_defer_gather(cuda_ctx, node, gdn)) {
+                return GGML_CUDA_FUSE_DEFERRED;
             }
         }
     }
 
+    // Fold the conv-state GET_ROWS into the CONCAT that immediately follows it.
+    // build_conv_state does a round trip that just pulls 96 KB out of the cache and hands it to
+    // CONCAT; letting CONCAT read the cache directly removes a whole launch (4.55 us x 3984
+    // launches = 0.556% of decode GPU time).
+    // Whether folding is possible is decided on the concat side (ggml_cuda_concat_can_fuse_gather).
+    // Deferring without CONCAT then taking the per-row path would corrupt the result, so that
+    // decision lives in exactly one place.
+    if (allow_defer && node->op == GGML_OP_GET_ROWS && cuda_ctx->gdn_gather_node == nullptr) {
+        const ggml_tensor * cc  = nullptr;
+        const int           win = std::min(cgraph->n_nodes, i + 16);
+        for (int j = i + 1; j < win; ++j) {
+            ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_CONCAT && n->src[0] != nullptr &&
+                ggml_cuda_view_root_contig(n->src[0]) == node &&
+                ggml_nelements(n->src[0]) == ggml_nelements(node) &&
+                (n->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                ggml_cuda_concat_can_fuse_gather(n, node)) {
+                cc = n;
+                break;
+            }
+            // Views and reshapes are never executed, so exclude them from the scan (same trap as
+            // for the gdn gather: the reshape feeding CONCAT would always match and break the loop)
+            if (ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            if (ggml_cuda_node_reads(n, node)) {
+                break;      // something reads it before CONCAT does, so it cannot be deferred
+            }
+            // Folding also moves the point at which the cache is READ forward to the CONCAT.  If a
+            // node in between writes the cache, the folded read would see the updated values.
+            // build_rs assembles "copy the remaining rows" against the same state buffer, so this
+            // is a real possibility rather than a theoretical one.
+            if (ggml_cuda_node_writes_into(n, node->src[0])) {
+                break;
+            }
+        }
+        if (cc != nullptr && ggml_cuda_defer_gather(cuda_ctx, node, cc)) {
+            return GGML_CUDA_FUSE_DEFERRED;
+        }
+    }
     // SIGMOID -> (view) -> GATED_DELTA_NET
     // Fold beta = sigmoid(x) into the gdn prologue.  gdn also writes the folded SIGMOID's dst, so
     // no use-count analysis is needed and the output is bit-identical.  Composes with cache fusion.

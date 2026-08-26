@@ -211,8 +211,265 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// CONCAT along dim 0 recovers the indices per element, which becomes the bottleneck for shapes
+// with short rows and many of them -- delta-net's conv state is ne0 = 4..8 with ne1 = 8192, and
+// measures 51 GB/s on a P100, 8% of the 606 GB/s ceiling.
+// One thread per row reduces the indexing to a single multiply per row, and when the dst row is
+// exactly 16 B it can be written with one vector store.  Element order and the number of reads
+// and writes are unchanged, so the output is bit-identical.
+#define CUDA_CONCAT_ROWS_MAX_NE0 8
+
+// Where output element c is read from: src0's row when c < ne00, otherwise src1's row.
+// The address is selected first and read once, so the side not selected is never dereferenced.
+#define CUDA_CONCAT_ROWS_SRC(c) ((c) < ne00 ? (x + (int64_t) (c)*nb00) : (y + (int64_t) ((c) - ne00)*nb10))
+
+template <typename T, int NE0, bool VEC16>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_rows(const char * __restrict__ src0,
+                const char * __restrict__ src1,
+                      char * __restrict__ dst,
+                const int     ne00,
+                const int     nrows,
+                const int64_t nb00, const int64_t nb01,
+                const int64_t nb10, const int64_t nb11,
+                const int64_t nb0,  const int64_t nb1) {
+    ggml_cuda_pdl_lc();
+
+    const int row = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+
+    const char * x = src0 + (int64_t) row*nb01;
+    const char * y = src1 + (int64_t) row*nb11;
+    char *       d = dst  + (int64_t) row*nb1;
+
+    ggml_cuda_pdl_sync();
+
+    if constexpr (VEC16) {
+        // Only taken for NE0 == 4 with a 4-byte type: the dst row is exactly 16 B, one store
+        int4 v;
+        v.x = *(const int *) CUDA_CONCAT_ROWS_SRC(0);
+        v.y = *(const int *) CUDA_CONCAT_ROWS_SRC(1);
+        v.z = *(const int *) CUDA_CONCAT_ROWS_SRC(2);
+        v.w = *(const int *) CUDA_CONCAT_ROWS_SRC(3);
+        *(int4 *) d = v;
+    } else {
+        // Write as we read; staging into a temporary array risks spilling it to local memory
+        // (the destinations do not overlap, so the order does not affect the result)
+#pragma unroll
+        for (int c = 0; c < NE0; ++c) {
+            *(T *) (d + (int64_t) c*nb0) = *(const T *) CUDA_CONCAT_ROWS_SRC(c);
+        }
+    }
+}
+
+// The kernel above with src0 replaced by "row rows[0] of the cache", which folds away the
+// preceding GET_ROWS.  Node-preserving, so the folded GET_ROWS dst is written as well.
+template <typename T, int NE0, bool VEC16>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_rows_gather(const char    * __restrict__ cache,
+                       const int32_t * __restrict__ rows,
+                       const char    * __restrict__ src1,
+                             char    * __restrict__ dst,
+                             char    * __restrict__ gdst,
+                       const int     ne00,
+                       const int     nrows,
+                       const int64_t crow,
+                       const int64_t nb00, const int64_t nb01,
+                       const int64_t nb10, const int64_t nb11,
+                       const int64_t nb0,  const int64_t nb1) {
+    ggml_cuda_pdl_lc();
+
+    const int row = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+
+    // The folded GET_ROWS output is a contiguous copy from the start of the cache row, so offsets
+    // within the row carry over unchanged (shifted by the row index)
+    const char * x = cache + (int64_t) rows[0]*crow + (int64_t) row*nb01;
+    const char * y = src1  + (int64_t) row*nb11;
+    char *       d = dst   + (int64_t) row*nb1;
+    char *       g = gdst  + (int64_t) row*nb01;
+
+    ggml_cuda_pdl_sync();
+
+    if constexpr (VEC16) {
+        int4 v;
+        v.x = *(const int *) CUDA_CONCAT_ROWS_SRC(0);
+        v.y = *(const int *) CUDA_CONCAT_ROWS_SRC(1);
+        v.z = *(const int *) CUDA_CONCAT_ROWS_SRC(2);
+        v.w = *(const int *) CUDA_CONCAT_ROWS_SRC(3);
+        *(int4 *) d = v;
+        if (0 < ne00) { *(int *) (g              ) = v.x; }
+        if (1 < ne00) { *(int *) (g +   nb00) = v.y; }
+        if (2 < ne00) { *(int *) (g + 2*nb00) = v.z; }
+        if (3 < ne00) { *(int *) (g + 3*nb00) = v.w; }
+    } else {
+#pragma unroll
+        for (int c = 0; c < NE0; ++c) {
+            const T val = *(const T *) CUDA_CONCAT_ROWS_SRC(c);
+            *(T *) (d + (int64_t) c*nb0) = val;
+            if (c < ne00) {
+                *(T *) (g + (int64_t) c*nb00) = val;
+            }
+        }
+    }
+}
+
+// Decide whether the per-row path applies and, if so, launch it and return true.
+// Is the dst row exactly 16 B, i.e. can one thread write it with a single vector store?
+static bool concat_rows_vec16(const ggml_tensor * dst) {
+    const size_t ts = ggml_type_size(dst->type);
+    return dst->ne[0]*ts == 16 && (size_t) dst->nb[0] == ts &&
+           dst->nb[1] % 16 == 0 && ((uintptr_t) dst->data) % 16 == 0;
+}
+
+// The part of the test that does not depend on the template parameter T, shared with
+// ggml_cuda_concat_can_fuse_gather.
+// for_gather means "a preceding GET_ROWS is being folded in", i.e. a whole launch disappears.
+static bool concat_rows_eligible(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+                                 int dim, bool for_gather) {
+    static const bool disable = getenv("GGML_CUDA_DISABLE_CONCAT_ROWS") != nullptr &&
+                                std::atoi(getenv("GGML_CUDA_DISABLE_CONCAT_ROWS"));
+    if (disable || dim != 0 || ggml_is_quantized(src0->type) || ggml_type_size(dst->type) != 4) {
+        return false;
+    }
+
+    const int64_t ne0  = dst->ne[0];
+    const int64_t ne00 = src0->ne[0];
+    if (ne0 < 2 || ne0 > CUDA_CONCAT_ROWS_MAX_NE0 || ne00 < 1 || ne00 >= ne0) {
+        return false;
+    }
+
+    // One thread per row only wins on its own when the dst row is exactly 16 B, i.e. a single
+    // vector store.  For longer rows neighbouring threads write 20-32 B apart, coalescing breaks
+    // down, and it ties or slightly loses against the one-thread-per-element path whose dst is
+    // fully contiguous.  When a GET_ROWS is folded in, removing an entire launch dominates that,
+    // so the restriction is relaxed there.
+    if (!for_gather && !concat_rows_vec16(dst)) {
+        return false;
+    }
+
+    // (i1, i2, i3) must collapse to a row index in equal steps of nb1.  Length-1 dimensions are
+    // exempt from the stride test: ggml_transpose does not swap nb[2] / nb[3], so testing them
+    // strictly gives the wrong answer.
+    auto rowform = [](const ggml_tensor * t) {
+        return (t->ne[2] == 1 || (uint64_t) t->nb[2] == (uint64_t) t->ne[1]*t->nb[1]) &&
+               (t->ne[3] == 1 || (uint64_t) t->nb[3] == (uint64_t) t->ne[2]*t->nb[2]);
+    };
+    if (!rowform(src0) || !rowform(src1) || !rowform(dst)) {
+        return false;
+    }
+    if (src0->ne[1] != dst->ne[1] || src0->ne[2] != dst->ne[2] || src0->ne[3] != dst->ne[3] ||
+        src1->ne[1] != dst->ne[1] || src1->ne[2] != dst->ne[2] || src1->ne[3] != dst->ne[3]) {
+        return false;
+    }
+
+    const int64_t nrows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+    return nrows > 0 && nrows <= INT_MAX;
+}
+
 template <typename T>
-static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+static bool concat_rows_cuda(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+                             int dim, cudaStream_t stream, const ggml_cuda_concat_gather * gather) {
+    if constexpr (sizeof(T) != 4) {
+        // 4-byte types (f32 / i32) only; other widths do not occur here and are not worth the code
+        GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(dst); GGML_UNUSED(dim); GGML_UNUSED(stream);
+        GGML_ASSERT(gather == nullptr);
+        return false;
+    } else {
+        if (!concat_rows_eligible(src0, src1, dst, dim, gather != nullptr)) {
+            return false;
+        }
+
+        const int64_t ne0   = dst->ne[0];
+        const int64_t ne00  = src0->ne[0];
+        const int64_t nrows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+
+        const bool vec16 = concat_rows_vec16(dst);
+        // Microbenchmark optima: block 256 for the vector store, block 64 for per-element writes
+        // (the gather variant always uses 64)
+        // (the latter gives each thread little work, so smaller blocks spread better over the SMs)
+        const int block  = (vec16 && gather == nullptr) ? CUDA_CONCAT_BLOCK_SIZE : 64;
+        const int nblk   = (int) ((nrows + block - 1) / block);
+        const int ne00_i = (int) ne00;
+        const int nrow_i = (int) nrows;
+
+        const char * s0 = (const char *) src0->data;
+        const char * s1 = (const char *) src1->data;
+        char *       d  = (char *)       dst->data;
+
+#define CUDA_CONCAT_ROWS_LAUNCH(NE0, VEC)                                                        \
+        do {                                                                                     \
+            const ggml_cuda_kernel_launch_params lp =                                            \
+                ggml_cuda_kernel_launch_params(nblk, block, 0, stream);                          \
+            if (gather != nullptr) {                                                             \
+                ggml_cuda_kernel_launch(concat_rows_gather<T, NE0, VEC>, lp,                     \
+                                    gather->base, gather->rows, s1, d, gather->gdst,             \
+                                    ne00_i, nrow_i, gather->row_stride,                          \
+                                    (int64_t) src0->nb[0], (int64_t) src0->nb[1],                \
+                                    (int64_t) src1->nb[0], (int64_t) src1->nb[1],                \
+                                    (int64_t) dst->nb[0],  (int64_t) dst->nb[1]);                \
+            } else {                                                                             \
+                ggml_cuda_kernel_launch(concat_rows<T, NE0, VEC>, lp, s0, s1, d, ne00_i, nrow_i,  \
+                                    (int64_t) src0->nb[0], (int64_t) src0->nb[1],                \
+                                    (int64_t) src1->nb[0], (int64_t) src1->nb[1],                \
+                                    (int64_t) dst->nb[0],  (int64_t) dst->nb[1]);                \
+            }                                                                                    \
+        } while (0)
+
+        switch (ne0) {
+            case 2: CUDA_CONCAT_ROWS_LAUNCH(2, false); break;
+            case 3: CUDA_CONCAT_ROWS_LAUNCH(3, false); break;
+            case 4:
+                if (vec16) { CUDA_CONCAT_ROWS_LAUNCH(4, true); }
+                else       { CUDA_CONCAT_ROWS_LAUNCH(4, false); }
+                break;
+            case 5: CUDA_CONCAT_ROWS_LAUNCH(5, false); break;
+            case 6: CUDA_CONCAT_ROWS_LAUNCH(6, false); break;
+            case 7: CUDA_CONCAT_ROWS_LAUNCH(7, false); break;
+            case 8: CUDA_CONCAT_ROWS_LAUNCH(8, false); break;
+            default: return false;
+        }
+#undef CUDA_CONCAT_ROWS_LAUNCH
+        return true;
+    }
+}
+
+bool ggml_cuda_concat_can_fuse_gather(const ggml_tensor * concat, const ggml_tensor * gr) {
+    static const bool disable = getenv("GGML_CUDA_DISABLE_FUSE_CONCAT_GATHER") != nullptr &&
+                                std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_CONCAT_GATHER"));
+    if (disable || concat->op != GGML_OP_CONCAT || gr->op != GGML_OP_GET_ROWS) {
+        return false;
+    }
+    if (!concat_rows_eligible(concat->src[0], concat->src[1], concat,
+                              ((const int32_t *) concat->op_params)[0], /*for_gather =*/ true)) {
+        return false;
+    }
+    // The fold candidate: a contiguous f32 gather of exactly one row, from a contiguous cache row.
+    // With a single row, the position in the cache follows from the row index with no division.
+    return gr->type == GGML_TYPE_F32 && gr->src[0] != nullptr && gr->src[1] != nullptr &&
+           gr->src[0]->type == GGML_TYPE_F32 && gr->src[1]->type == GGML_TYPE_I32 &&
+           !(gr->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+           ggml_is_contiguous(gr) && gr->ne[2] == 1 && gr->ne[3] == 1 &&
+           ggml_nelements(gr->src[1]) == 1 &&
+           ggml_is_contiguous_rows(gr->src[0]) && gr->src[0]->nb[0] == sizeof(float) &&
+           (size_t) concat->src[0]->nb[0] == sizeof(float) && gr->data != nullptr;
+}
+
+template <typename T>
+static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream,
+                        const ggml_cuda_concat_gather * gather = nullptr) {
+    if (concat_rows_cuda<T>(src0, src1, dst, dim, stream, gather)) {
+        return;
+    }
+    // Having committed to folding, failing to take the per-row path would leave the GET_ROWS
+    // unexecuted and corrupt the result.  ggml_cuda_concat_can_fuse_gather already decided this,
+    // so reaching here is a bug.
+    GGML_ASSERT(gather == nullptr);
+
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
@@ -316,6 +573,21 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
+    // Collect the GET_ROWS that was deferred for this CONCAT, if any
+    ggml_cuda_concat_gather gather;
+    bool has_gather = false;
+    if (ctx.gdn_gather_owner == dst && ctx.gdn_gather_node != nullptr) {
+        const ggml_tensor * gr = ctx.gdn_gather_node;
+        gather.base       = (const char *) gr->src[0]->data;
+        gather.rows       = ctx.gdn_rows_scratch;
+        gather.row_stride = (int64_t) gr->src[0]->nb[1];
+        gather.gdst       = (char *) gr->data;
+        ctx.gdn_gather_clear();
+        has_gather = gather.base != nullptr && gather.rows != nullptr &&
+                     gather.gdst != nullptr && gather.row_stride > 0;
+        GGML_ASSERT(has_gather);
+    }
+
     GGML_ASSERT(src0->type == src1->type);
     GGML_ASSERT(dst->type  == src0->type);
 
@@ -331,6 +603,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
 
         // if first 3 dimensions are contiguous and ne[0] is multiple of the block size we can concat both tensors as byte tensors
+        GGML_ASSERT(!has_gather);
         concat_cuda<uint8_t>(src0, src1, dst, dim, stream);
     } else {
         GGML_ASSERT(ggml_blck_size(src0->type) == 1);
@@ -343,7 +616,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 concat_cuda<uint16_t>(src0, src1, dst, dim, stream);
                 break;
             case 4:
-                concat_cuda<uint32_t>(src0, src1, dst, dim, stream);
+                concat_cuda<uint32_t>(src0, src1, dst, dim, stream, has_gather ? &gather : nullptr);
                 break;
             case 8:
                 concat_cuda<uint64_t>(src0, src1, dst, dim, stream);
