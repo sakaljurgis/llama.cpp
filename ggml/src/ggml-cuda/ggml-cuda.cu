@@ -2979,8 +2979,12 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     };
 
     bool is_ok = true;
-    // exception for topk-moe, as each row is read entirely before writing
-    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
+    // exception for topk-moe, as each row is read entirely before writing.
+    // topk_moe_cuda maps rows_per_block (4) rows onto one block and now
+    // carries a __syncthreads() between its read and write phases, so the exception is safe for
+    // every row a single block owns -- not just one.  This is what lets the speculative-decoding
+    // verify batch (n_rows = n_draft + 1) use the fused kernel instead of the argsort chain.
+    if (ggml_nrows(cgraph->nodes[node_idx]) <= GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK && is_topk_moe) {
         return true;
     }
 
