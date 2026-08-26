@@ -1429,6 +1429,41 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Single-slot cache of a matvec's q8_1-quantized activation, so that the second
+    // matmul of a gate/up pair does not redo the identical quantization.  The key is cleared at
+    // the top of every graph compute because it holds a tensor pointer, which a later graph may
+    // reuse; the buffer itself is kept.
+    //
+    // The buffer is a plain device allocation, NOT a pool one.  The pool is a stack allocator that
+    // asserts every free is the top of the stack, so holding a pool allocation across calls breaks
+    // it whenever a caller allocates before mul_mat_vec_q and frees after -- which is exactly what
+    // ggml_cuda_mul_mat_id's sorted-gather path does.  It grows and is never shrunk, so after
+    // warmup there are no allocations at all.
+    char *              q8_1_cache_mem    = nullptr;
+    size_t              q8_1_cache_cap    = 0;
+    const ggml_tensor * q8_1_cache_src1   = nullptr;
+    const void *        q8_1_cache_data   = nullptr;
+    cudaStream_t        q8_1_cache_stream = nullptr;
+    size_t              q8_1_cache_size   = 0;
+    int64_t             q8_1_cache_s[4]   = { 0, 0, 0, 0 };
+
+    // Forget the key, keep the buffer.  Called at the top of every graph computation.
+    void q8_1_cache_clear() {
+        q8_1_cache_src1   = nullptr;
+        q8_1_cache_data   = nullptr;
+        q8_1_cache_stream = nullptr;
+        q8_1_cache_size   = 0;
+    }
+
+    void q8_1_cache_free() {
+        if (q8_1_cache_mem != nullptr) {
+            (void) cudaFree(q8_1_cache_mem);
+            q8_1_cache_mem = nullptr;
+            q8_1_cache_cap = 0;
+        }
+        q8_1_cache_clear();
+    }
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
