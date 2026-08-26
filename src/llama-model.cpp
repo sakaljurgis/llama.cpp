@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1795,7 +1796,162 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    build_draft_head();
+
     return true;
+}
+
+// Gather a reduced-vocabulary copy of the LM head, used only by the MTP/NextN draft pass.
+//
+// The draft head is by far the most expensive tensor in a draft forward (it is the single
+// largest weight in the model and a draft reads all of it to produce one token), yet the
+// draft only ever needs its argmax and that token's probability - and whatever it proposes
+// is verified against the target, so restricting the draft to a subset of the vocabulary
+// cannot change what the model emits. It only costs acceptance when the correct token is
+// outside the subset.
+//
+// The subset comes from LLAMA_MTP_DRAFT_VOCAB, a whitespace-separated list of token ids
+// (workload-derived: BPE id order is the training corpus' frequency order, which is a poor
+// match for any particular deployment). Rows are copied verbatim, so within the subset the
+// draft's numbers are bit-identical to the full head.
+void llama_model::build_draft_head() {
+    const char * path = getenv("LLAMA_MTP_DRAFT_VOCAB");
+    if (path == nullptr || *path == '\0') {
+        return;
+    }
+
+    if (output == nullptr || output->buffer == nullptr || hparams.n_layer_nextn == 0) {
+        return;
+    }
+
+    if (output_s != nullptr) {
+        LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB ignored (LM head has a per-tensor scale)\n", __func__);
+        return;
+    }
+
+    // the graph only takes the reduced path when the MTP block falls back to model.output; if the
+    // block ships its own head we would allocate the gather and never look at it
+    {
+        const int il = hparams.n_layer();
+        if (il < (int) layers.size() && layers[il].nextn.shared_head_head != nullptr) {
+            LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB ignored (MTP block has its own LM head)\n", __func__);
+            return;
+        }
+    }
+
+    if (!ggml_is_contiguous(output)) {
+        LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB ignored (LM head is not contiguous)\n", __func__);
+        return;
+    }
+
+    const int64_t n_embd_out = output->ne[0];
+    const int64_t n_vocab    = output->ne[1];
+
+    std::vector<int32_t> ids;
+    {
+        std::ifstream f(path);
+        if (!f) {
+            LLAMA_LOG_WARN("%s: cannot open LLAMA_MTP_DRAFT_VOCAB='%s' - draft head not reduced\n", __func__, path);
+            return;
+        }
+        int64_t id;
+        int64_t n_oor = 0;
+        while (f >> id) {
+            if (id >= 0 && id < n_vocab) {
+                ids.push_back((int32_t) id);
+            } else {
+                n_oor++;
+            }
+        }
+        // a truncated or mis-parsed list is not a correctness problem (drafts are verified) but it
+        // silently costs throughput - poor coverage is worse than not reducing the head at all
+        if (!f.eof()) {
+            LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB='%s' stopped parsing after %zu ids "
+                    "(non-numeric input?) - coverage may be too low\n", __func__, path, ids.size());
+        }
+        if (n_oor > 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB='%s' has %lld ids outside [0, %lld) "
+                    "- built for a different tokenizer?\n", __func__, path, (long long) n_oor, (long long) n_vocab);
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+    const int64_t n_sub = (int64_t) ids.size();
+    if (n_sub <= 0 || 2*n_sub >= n_vocab) {
+        LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB has %lld usable ids out of n_vocab=%lld"
+                " - not reducing the draft head\n", __func__, (long long) n_sub, (long long) n_vocab);
+        return;
+    }
+
+    ggml_init_params ip = {
+        /* .mem_size   = */ ggml_tensor_overhead()*8,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(ip) };
+    if (!ctx_ptr) {
+        LLAMA_LOG_WARN("%s: failed to create the draft head context - falling back to the full head\n", __func__);
+        return;
+    }
+    ggml_context * ctx = ctx_ptr.get();
+
+    // one trailing row's worth of -inf so the expansion below can send every token outside
+    // the subset to a slot that can never win an argmax
+    ggml_tensor * head = ggml_new_tensor_2d(ctx, output->type, n_embd_out, n_sub);
+    ggml_tensor * ninf = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * map  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_vocab);
+
+    ggml_set_name(head, "draft_head.weight");
+    ggml_set_name(ninf, "draft_head.ninf");
+    ggml_set_name(map,  "draft_head.map");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to allocate the reduced draft head - falling back to the full head\n", __func__);
+        return;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    {
+        // gather straight into the staging buffer: pulling the whole head down first would cost
+        // an extra full-size host allocation for a tensor that is the largest one in the model
+        const size_t nb_row = ggml_row_size(output->type, n_embd_out);
+
+        std::vector<uint8_t> dst((size_t) n_sub*nb_row);
+        for (int64_t i = 0; i < n_sub; ++i) {
+            ggml_backend_tensor_get(output, dst.data() + (size_t) i*nb_row, (size_t) ids[i]*nb_row, nb_row);
+        }
+        ggml_backend_tensor_set(head, dst.data(), 0, dst.size());
+    }
+
+    {
+        std::vector<int32_t> mp((size_t) n_vocab, (int32_t) n_sub); // default: the -inf slot
+        for (int64_t i = 0; i < n_sub; ++i) {
+            mp[ids[i]] = (int32_t) i;
+        }
+        ggml_backend_tensor_set(map, mp.data(), 0, mp.size()*sizeof(int32_t));
+    }
+
+    {
+        const float v = -INFINITY;
+        ggml_backend_tensor_set(ninf, &v, 0, sizeof(v));
+    }
+
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(buf);
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+
+    draft_head    = head;
+    draft_ninf    = ninf;
+    draft_map     = map;
+    n_draft_vocab = n_sub;
+
+    LLAMA_LOG_INFO("%s: MTP draft head reduced to %lld/%lld tokens (%.1f%%, %.1f MiB)\n",
+            __func__, (long long) n_sub, (long long) n_vocab, 100.0*n_sub/n_vocab,
+            (ggml_nbytes(head) + ggml_nbytes(map) + ggml_nbytes(ninf))/1024.0/1024.0);
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

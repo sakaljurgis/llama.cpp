@@ -734,7 +734,21 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+
+    // see the same block in qwen35.cpp: the draft is always verified against the target, so a
+    // reduced-vocabulary head trades acceptance for the largest single read in a draft forward
+    if (model.draft_head && head_w == model.output && head_s == nullptr && cur->ne[1] == 1 &&
+            (loras == nullptr || loras->empty())) {
+        const int64_t n_vocab = model.output->ne[1];
+
+        cur = ggml_mul_mat(ctx0, model.draft_head, cur);                            // [n_sub, 1]
+        cur = ggml_concat(ctx0, cur, model.draft_ninf, 0);                          // [n_sub + 1, 1]
+        cur = ggml_reshape_2d(ctx0, cur, 1, model.n_draft_vocab + 1);
+        cur = ggml_get_rows(ctx0, cur, model.draft_map);                            // [1, n_vocab]
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, 1);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
