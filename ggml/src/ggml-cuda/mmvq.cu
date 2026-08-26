@@ -609,6 +609,10 @@ static __global__ void mul_mat_vec_q(
     if constexpr (type == GGML_TYPE_IQ3_XXS) {
         iq3xxs_grid_smem_init(tid, blockDim.x*blockDim.y);
     }
+    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS ||
+                  type == GGML_TYPE_IQ2_XS) {
+        ksigns_smem_init(tid, blockDim.x*blockDim.y);
+    }
 
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
@@ -863,10 +867,13 @@ static __global__ void mul_mat_vec_q_moe(
 
     const uint32_t token_idx   = threadIdx.y;
 
-    // iq3xxs_grid_smem_init() has a __syncthreads(), so it must precede the early
-    // return below.
+    // Must precede the early return below (contains a __syncthreads()).
     if constexpr (type == GGML_TYPE_IQ3_XXS) {
         iq3xxs_grid_smem_init(warp_size*threadIdx.y + threadIdx.x, blockDim.x*blockDim.y);
+    }
+    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS ||
+                  type == GGML_TYPE_IQ2_XS) {
+        ksigns_smem_init(warp_size*threadIdx.y + threadIdx.x, blockDim.x*blockDim.y);
     }
 
     const int      row0        = c_rows_per_block*blockIdx.x;
