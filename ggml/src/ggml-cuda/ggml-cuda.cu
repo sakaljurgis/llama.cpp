@@ -3476,6 +3476,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // SIGMOID -> (view) -> GATED_DELTA_NET
+    // Fold beta = sigmoid(x) into the gdn prologue.  gdn also writes the folded SIGMOID's dst, so
+    // no use-count analysis is needed and the output is bit-identical.  Composes with cache fusion.
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+        static bool disable_gdn_beta = getenv("GGML_CUDA_DISABLE_FUSE_GDN_BETA") != nullptr &&
+                                       std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_GDN_BETA"));
+        if (!disable_gdn_beta && node->type == GGML_TYPE_F32 && node->src[0] != nullptr &&
+            node->src[0]->type == GGML_TYPE_F32 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_is_contiguous(node) && ggml_is_contiguous(node->src[0]) &&
+            ggml_are_same_shape(node, node->src[0]) && ggml_are_same_stride(node, node->src[0])) {
+
+            // Find the next node with actual work (views / no-ops in between are allowed)
+            int j = i + 1;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                ++j;
+            }
+            ggml_tensor * gdn = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+            if (gdn != nullptr && gdn->op == GGML_OP_GATED_DELTA_NET && gdn->src[4] == node) {
+                ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
+                const int cache_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, j, fused_state_cpy);
+#ifdef GGML_CUDA_DEBUG
+                GGML_LOG_INFO("%s: fused sigmoid into gated_delta_net beta for %s (cache_skip %d)\n",
+                              __func__, gdn->name, cache_skip);
+#endif
+                ggml_cuda_op_gated_delta_net_fused(*cuda_ctx, gdn,
+                        cache_skip > 0 ? &fused_state_cpy : nullptr, /*fuse_beta_sigmoid =*/ true);
+                return (j - i) + cache_skip;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;

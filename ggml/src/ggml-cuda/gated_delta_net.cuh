@@ -9,6 +9,13 @@ struct ggml_cuda_gated_delta_net_fused_cache {
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// Variant with beta = sigmoid(x) folded into the prologue.  cache behaves as before (nullptr
+// disables it).  With fuse_beta_sigmoid the kernel reads dst->src[4]->src[0], applies sigmoid,
+// and also writes the result to dst->src[4]->data, so the folded node is preserved.
+void ggml_cuda_op_gated_delta_net_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                        const ggml_cuda_gated_delta_net_fused_cache * cache,
+                                        bool fuse_beta_sigmoid);
+
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);
