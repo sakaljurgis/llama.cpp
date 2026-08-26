@@ -96,9 +96,27 @@ Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buf
 rotating `stc_compute[2]` shard containers with containers owned by the backend instance
 that runs the graph, plus identity-validated scratch pools for graph-external `set/get_tensor`.
 Fixes `GGML_ASSERT(bcj.nodes[i]) failed` in `ggml_backend_meta_graph_compute` after a graph
-rebuild. One conflict against b10630: upstream #27574 changed the PARTIAL-split branch of
-`ggml_backend_meta_buffer_set_tensor` (contributor mask); keep upstream's logic and only swap
-`ggml_backend_meta_buffer_simple_tensor(tensor, j)` for `scratch.get(tensor, j)`.
+rebuild. Applied as commit `p100: meta backend graph reuse fix`.
+
+Adaptations made against b10630:
+
+- Upstream #27574 changed the PARTIAL-split branch of `ggml_backend_meta_buffer_set_tensor`
+  (contributor mask). Upstream's logic is kept, only the shard lookup is swapped for
+  `scratch.get(tensor, j)`.
+- `ggml_backend_meta_buffer_memset_tensor` was added upstream after the gist and still used the
+  static-only lookup, which returns `nullptr` for compute tensors and views under the gist's
+  design. It now uses a scratch pool like set/get_tensor.
+- `ggml_backend_meta_buffer_init_tensor` is a no-op with the gist, but upstream #27586's
+  `ggml_backend_buffer_init_tensor(simple_buf, t_ij)` inside `init_tensor_impl` is kept, so
+  simple backends still see init for every shard that gets registered.
+- Dead code after the merge removed: `params_compute`/`compute_headroom` in
+  `ggml_backend_meta_alloc_ctx_tensors_from_buft`, `params` in `..._buffer_type_alloc_buffer`,
+  `#include <set>`.
+
+When rebasing, any new function in `ggml-backend-meta.cpp` that calls
+`ggml_backend_meta_buffer_simple_tensor()` on non-static tensors needs the same treatment.
+`grep -n "ggml_backend_meta_buffer_simple_tensor(" ggml/src/ggml-backend-meta.cpp` should
+list only its definition and the call inside `ggml_backend_meta_simple_tensor_ensure`.
 
 ## Runtime knobs added by the patches
 
@@ -153,8 +171,12 @@ git format-patch --no-numbered --zero-commit -o patches/ <base>..p100
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=60 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ./build/bin/test-backend-ops                       # patch repo reports 13327 tests, 0 failures
+./build/bin/test-llama-archs                       # runs every arch through -sm tensor on the GPUs (meta backend)
 ./build/bin/llama-bench -m <model> -ngl 99 -sm tensor -p 512 -n 64   # compare with stock master
 ```
+
+`test-llama-archs` is the only test that exercises `ggml-backend-meta.cpp`; it skips the meta
+configuration on CPU-only machines, so it has to run on the server.
 
 Then the real workload: `llama-server` with the usual flags, a long generation, and the
 prompt that used to crash. Any change in output vs. stock is expected only from 03 (MoE,
@@ -167,3 +189,5 @@ above one row) and 12 (Q4_1); everything else is bit-identical by design.
   conflict). 13 needed a source fix (`has_logit_bias` removed upstream). Host-side patches
   (11, 13, 15, 21) compile-checked with a CPU-only build and `test-sampling`; CUDA build not
   yet verified.
+- 2026-08-26: step 2, philpax meta backend gist applied (1 conflict hunk, memset_tensor
+  adapted, dead code removed). `ggml-base` compiles clean; not yet run on the GPUs.
