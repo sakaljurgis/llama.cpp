@@ -634,6 +634,15 @@ struct llama_model {
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
+    // reduced-vocabulary LM head for the MTP/NextN draft pass (see build_draft_head)
+    // draft_head holds a row-gather of `output` over the token ids in LLAMA_MTP_DRAFT_VOCAB;
+    // draft_map expands a [n_draft_vocab+1] logit vector back to [n_vocab], sending every
+    // token outside the subset to the trailing -inf slot supplied by draft_ninf.
+    struct ggml_tensor * draft_head = nullptr;
+    struct ggml_tensor * draft_map  = nullptr;
+    struct ggml_tensor * draft_ninf = nullptr;
+    int64_t              n_draft_vocab = 0;
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
@@ -757,6 +766,10 @@ struct llama_model {
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
     virtual bool load_tensors(llama_model_loader & ml) = 0; // returns false if cancelled by progress_callback
+
+    // gather a reduced-vocabulary copy of the LM head for the MTP draft pass (no-op unless
+    // LLAMA_MTP_DRAFT_VOCAB names a readable list of token ids)
+    void build_draft_head();
 
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
