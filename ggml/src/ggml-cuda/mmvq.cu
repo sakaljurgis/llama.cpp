@@ -1474,12 +1474,65 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1_scoped(ctx.pool());
+    char * src1_q8_1_d = nullptr;
     {
+        const size_t  q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+        // The key includes src1->data, not just the tensor pointer: ggml_cuda_mul_mat_id's
+        // sorted-gather path declares its ggml_tensor inside the per-expert loop, so every expert
+        // reuses the same stack address while data advances.  Without the data check, two experts
+        // with the same token count key-match and the second silently reuses the first one's
+        // activations.
+        //
+        // The gate and up matmuls of an FFN share src1, and quantize_row_q8_1_cuda
+        // ignores src0->type, so the second quantization is bit-for-bit the first one.  Reuse it
+        // when the stream matches too -- a buffer written on another stream would need an event.
+        // The cache buffer is shared, so it may only be written on the stream that owns it for
+        // this graph.  When a second stream runs concurrently, fall back to upstream's per-call
+        // pool allocation, which is scoped and therefore leaves the pool's LIFO order intact.
+        const bool cacheable = ctx.q8_1_cache_stream == nullptr || ctx.q8_1_cache_stream == stream;
+
+        const bool hit = cacheable &&
+                         ctx.q8_1_cache_mem != nullptr &&
+                         ctx.q8_1_cache_src1   == src1 &&
+                         ctx.q8_1_cache_data   == src1->data &&
+                         ctx.q8_1_cache_stream == stream &&
+                         ctx.q8_1_cache_size   == q8_1_size &&
+                         ctx.q8_1_cache_s[0]   == ne10_padded &&
+                         ctx.q8_1_cache_s[1]   == s11 &&
+                         ctx.q8_1_cache_s[2]   == s12 &&
+                         ctx.q8_1_cache_s[3]   == s13;
+
+        if (hit) {
+            src1_q8_1_d = ctx.q8_1_cache_mem;
+        } else if (!cacheable) {
+            src1_q8_1_d = src1_q8_1_scoped.alloc(q8_1_size);
+
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            if (q8_1_size > ctx.q8_1_cache_cap) {
+                ctx.q8_1_cache_free();
+                ggml_cuda_set_device(ctx.device);
+                CUDA_CHECK(cudaMalloc((void **) &ctx.q8_1_cache_mem, q8_1_size));
+                ctx.q8_1_cache_cap = q8_1_size;
+            }
+            src1_q8_1_d = ctx.q8_1_cache_mem;
+
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+            ctx.q8_1_cache_src1   = src1;
+            ctx.q8_1_cache_data   = src1->data;
+            ctx.q8_1_cache_stream = stream;
+            ctx.q8_1_cache_size   = q8_1_size;
+            ctx.q8_1_cache_s[0]   = ne10_padded;
+            ctx.q8_1_cache_s[1]   = s11;
+            ctx.q8_1_cache_s[2]   = s12;
+            ctx.q8_1_cache_s[3]   = s13;
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1505,7 +1558,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
