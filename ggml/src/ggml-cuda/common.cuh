@@ -1457,12 +1457,22 @@ struct ggml_backend_cuda_context {
     // The row indices are saved at the position the GET_ROWS occupied.  Deferring execution lets
     // galloc reuse the input tensor's addresses for something else in the meantime (which really
     // happens with the small per-slot compute buffers), so reading them at gdn would be corrupt.
-    int32_t * gdn_rows_scratch   = nullptr;
-    size_t    gdn_rows_scratch_n = 0;
+    int32_t *           gdn_rows_scratch   = nullptr;
+    size_t              gdn_rows_scratch_n = 0;
+    // The tensor the snapshot came from; an identical one is not saved again.  Every SSM layer uses
+    // the same index tensor, so once per graph is enough.  Cleared per graph computation.
+    const ggml_tensor * gdn_rows_src       = nullptr;
 
+    // Called on every consumption; does not forget gdn_rows_src
     void gdn_gather_clear() {
         gdn_gather_node  = nullptr;
         gdn_gather_owner = nullptr;
+    }
+
+    // Called once at the top of a graph computation
+    void gdn_gather_reset_graph() {
+        gdn_gather_clear();
+        gdn_rows_src = nullptr;
     }
 
     // Forget the key, keep the buffer.  Called at the top of every graph computation.

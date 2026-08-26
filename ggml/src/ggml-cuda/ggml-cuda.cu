@@ -3730,9 +3730,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         CUDA_CHECK(cudaMalloc((void **) &cuda_ctx->gdn_rows_scratch, 4096 * sizeof(int32_t)));
                         cuda_ctx->gdn_rows_scratch_n = 4096;
                     }
-                    CUDA_CHECK(cudaMemcpyAsync(cuda_ctx->gdn_rows_scratch, node->src[1]->data,
-                                               n_idx * sizeof(int32_t), cudaMemcpyDeviceToDevice,
-                                               cuda_ctx->stream()));
+                    // Reuse the existing snapshot when the index tensor is the same.  Every SSM
+                    // layer uses the same tensor, so one copy per graph suffices; doing it per
+                    // layer stacks up a 1.8 us device-to-device copy for every layer.
+                    if (cuda_ctx->gdn_rows_src != node->src[1]) {
+                        CUDA_CHECK(cudaMemcpyAsync(cuda_ctx->gdn_rows_scratch, node->src[1]->data,
+                                                   n_idx * sizeof(int32_t), cudaMemcpyDeviceToDevice,
+                                                   cuda_ctx->stream()));
+                        cuda_ctx->gdn_rows_src = node->src[1];
+                    }
                     cuda_ctx->gdn_gather_node  = node;
                     cuda_ctx->gdn_gather_owner = gdn;
                     return GGML_CUDA_FUSE_DEFERRED;
@@ -4616,7 +4622,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // Only defer node execution when concurrent streams are not in use: reordering across streams
     // is unsafe.  The record is cleared per graph computation.
     const bool                   allow_defer = stream_ctx.concurrent_events.empty();
-    cuda_ctx->gdn_gather_clear();
+    cuda_ctx->gdn_gather_reset_graph();
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
