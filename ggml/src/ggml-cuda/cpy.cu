@@ -78,6 +78,61 @@ static __global__ void cpy_scalar_fastdiv(const char * cx, char * cdst, const in
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+// Merge a run of identically shaped copies into a single kernel.
+// Qwen3.5's linear-attention layers snapshot the conv state into one slot per rollback slot
+// (K = n_rs_seq + 1 = 5), so five cpy_scalar_fastdiv launches sit back to back per layer per
+// decode step.  Measured on a P100 each costs 2.53 us plus 0.65 us of launch gap while moving only
+// 98 KB -- almost entirely fixed cost.  Once the host has verified that the destinations do not
+// overlap each other or any input, they become one launch that selects the copy by grid.y.
+// Per-element arithmetic is unchanged, so the output is bit-identical.
+struct cpy_fused_ptrs {
+    const char * cx  [CUDA_CPY_FUSE_MAX];
+    char *       cdst[CUDA_CPY_FUSE_MAX];
+};
+
+template <cpy_kernel_t cpy_1>
+static __global__ void cpy_scalar_fastdiv_fused(const cpy_fused_ptrs p, const int ne,
+                                  const uint3 fd_s0, const uint3 fd_s1, const uint3 fd_s2,
+                                  const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+                                  const uint3 fd_d0, const uint3 fd_d1, const uint3 fd_d2,
+                                  const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    uint32_t r = (uint32_t) i;
+    const uint32_t i03 = fastdiv(r, fd_s2); r -= i03*fd_s2.z;
+    const uint32_t i02 = fastdiv(r, fd_s1); r -= i02*fd_s1.z;
+    const uint32_t i01 = fastdiv(r, fd_s0);
+    const uint32_t i00 = r - i01*fd_s0.z;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+
+    uint32_t q = (uint32_t) i;
+    const uint32_t i13 = fastdiv(q, fd_d2); q -= i13*fd_d2.z;
+    const uint32_t i12 = fastdiv(q, fd_d1); q -= i12*fd_d1.z;
+    const uint32_t i11 = fastdiv(q, fd_d0);
+    const uint32_t i10 = q - i11*fd_d0.z;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+
+    // Indexing the parameter struct at runtime spills it to per-thread local memory (128 B stack
+    // frame): 38.7 us against 14.7 us for the unfused pair.  Unroll so every index is a constant,
+    // which gives 0 B of stack frame and 8.2 us.  blockIdx.y has to be taken
+    // into an int local before it is compared, or the spill comes back.
+    const char * cx   = p.cx[0];
+    char *       cdst = p.cdst[0];
+    const int    ky   = (int) blockIdx.y;
+#pragma unroll
+    for (int k = 1; k < CUDA_CPY_FUSE_MAX; ++k) {
+        if (ky == k) { cx = p.cx[k]; cdst = p.cdst[k]; }
+    }
+
+    ggml_cuda_pdl_sync();
+    cpy_1(cx + x_offset, cdst + dst_offset);
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -657,6 +712,88 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
     }
+}
+
+// Execute nodes[0..n) as a single CPY launch and return true, if that is possible.
+// Independence has already been checked on the graph side; this only decides whether one kernel
+// can express all of them.
+bool ggml_cuda_cpy_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n) {
+    if (n < 2 || n > CUDA_CPY_FUSE_MAX) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = nodes[0]->src[0];
+    const ggml_tensor * src1 = nodes[0]->src[1];
+
+    // Restrict to non-contiguous f32 -> f32 copies, i.e. the cpy_scalar_fastdiv path
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // Shape and strides must match exactly -- only the data pointers may differ
+    for (int k = 1; k < n; ++k) {
+        const ggml_tensor * s = nodes[k]->src[0];
+        const ggml_tensor * d = nodes[k]->src[1];
+        if (!s || !d || s->type != src0->type || d->type != src1->type) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (s->ne[i] != src0->ne[i] || s->nb[i] != src0->nb[i] ||
+                d->ne[i] != src1->ne[i] || d->nb[i] != src1->nb[i]) {
+                return false;
+            }
+        }
+    }
+
+    const int64_t ne = ggml_nelements(src0);
+    if (ne != ggml_nelements(src1)) {
+        return false;
+    }
+
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2];
+    const int64_t nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2];
+    const int64_t nb10 = src1->nb[0], nb11 = src1->nb[1], nb12 = src1->nb[2], nb13 = src1->nb[3];
+
+    // Contiguous copies, 2D memcpy and transposes each have their own fast path; leave them alone
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        return false;
+    }
+    size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
+    if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+        return false;
+    }
+    if (nb01 == (int64_t) ggml_element_size(src0) && src0->ne[3] == 1 &&
+        nb02 == ne00*ne01*(int64_t) ggml_element_size(src0)) {
+        return false;
+    }
+
+    // Precondition of the fastdiv path: the indices fit in 32 bits
+    const int64_t s2 = ne00*ne01*ne02;
+    const int64_t d2 = ne10*ne11*ne12;
+    if (ne > INT_MAX || s2 <= 0 || d2 <= 0 || s2 > UINT_MAX || d2 > UINT_MAX) {
+        return false;
+    }
+
+    cpy_fused_ptrs p = {};
+    for (int k = 0; k < n; ++k) {
+        p.cx[k]   = (const char *) nodes[k]->src[0]->data;
+        p.cdst[k] = (char *)       nodes[k]->src[1]->data;
+    }
+
+    const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    const dim3 grid((unsigned int) num_blocks, (unsigned int) n, 1);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(grid, CUDA_CPY_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(cpy_scalar_fastdiv_fused<cpy_1_scalar<float, float>>, launch_params,
+        p, (int) ne,
+        init_fastdiv_values(ne00), init_fastdiv_values(ne00*ne01), init_fastdiv_values(s2),
+        nb00, nb01, nb02, nb03,
+        init_fastdiv_values(ne10), init_fastdiv_values(ne10*ne11), init_fastdiv_values(d2),
+        nb10, nb11, nb12, nb13);
+
+    return true;
 }
 
 void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

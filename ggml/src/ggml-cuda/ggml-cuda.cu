@@ -3279,6 +3279,126 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Sibling fusion: merge a run of identically shaped nodes to cut the number of launches.
+// Unlike topk-moe or rope+set_rows this removes no intermediate node -- every node is still
+// computed -- so the only requirement is that reordering them cannot change the result: the
+// destinations must not overlap each other, nor any other node's source.  That is checked here as
+// byte ranges.
+static bool ggml_cuda_fuse_nodes_disjoint(ggml_tensor ** nodes, int n, int dst_src_idx) {
+    auto range_of = [](const ggml_tensor * t, const char *& beg, const char *& end) {
+        beg = (const char *) t->data;
+        end = beg + ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
+    };
+    auto overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        if (!a || !b || !a->data || !b->data || !a->buffer || !b->buffer) {
+            return true; // anything we cannot decide counts as overlapping, i.e. do not fuse
+        }
+        const char * as; const char * ae; const char * bs; const char * be;
+        range_of(a, as, ae);
+        range_of(b, bs, be);
+        return as < be && bs < ae;
+    };
+
+    for (int a = 0; a < n; ++a) {
+        // dst_src_idx >= 0 means src[dst_src_idx] is the destination (CPY); otherwise the node
+        // itself is the destination (L2_NORM)
+        const ggml_tensor * dst_a = dst_src_idx >= 0 ? nodes[a]->src[dst_src_idx] : nodes[a];
+        if (!dst_a) {
+            return false;
+        }
+        for (int b = 0; b < n; ++b) {
+            if (a == b) {
+                continue;
+            }
+            const ggml_tensor * dst_b = dst_src_idx >= 0 ? nodes[b]->src[dst_src_idx] : nodes[b];
+            if (overlap(dst_a, dst_b)) {
+                return false;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src_b = nodes[b]->src[s];
+                if (!src_b) {
+                    continue;
+                }
+                if (dst_src_idx >= 0 && s == dst_src_idx) {
+                    continue; // destination-vs-destination was handled above
+                }
+                if (overlap(dst_a, src_b)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+// Recover the index of the last accepted node after nodes[] has been compacted
+static int ggml_cuda_node_index_of(const ggml_cgraph * cgraph, int from, const ggml_tensor * t) {
+    for (int j = from; j < cgraph->n_nodes; ++j) {
+        if (cgraph->nodes[j] == t) {
+            return j;
+        }
+    }
+    return from;
+}
+
+// Diagnostics for when fusion does not fire.  GGML_CUDA_FUSE_LOG=2 dumps the neighbourhood of the
+// candidate nodes and the outcome of each test.  The assumption "nodes with the same op are
+// adjacent" is easily broken by no-ops and by allocation order, and without this a failure costs a
+// full build-and-trace cycle to diagnose.
+static void ggml_cuda_fuse_diag(const ggml_cgraph * cgraph, int i, int collected, int disjoint, int launched) {
+    static int level   = getenv("GGML_CUDA_FUSE_LOG") ? std::atoi(getenv("GGML_CUDA_FUSE_LOG")) : 0;
+    static int printed = 0;
+    if (level < 2 || printed++ >= 12) {
+        return;
+    }
+    char   buf[512];
+    size_t p = 0;
+    for (int j = i; j < cgraph->n_nodes && j < i + 8 && p + 64 < sizeof(buf); ++j) {
+        p += snprintf(buf + p, sizeof(buf) - p, "%s%s[f%x]", j == i ? "" : " -> ",
+                      ggml_op_name(cgraph->nodes[j]->op), (unsigned) cgraph->nodes[j]->flags);
+    }
+    GGML_LOG_INFO("ggml_cuda_fuse_diag: i=%d collected=%d disjoint=%d launched=%d | %s\n",
+                  i, collected, disjoint, launched, buf);
+}
+
+// Fire confirmation: with GGML_CUDA_FUSE_LOG=1, print the first few firings (budget shared across
+// rules), so that "did it fire at all"
+// can be answered without running a profiler.
+static void ggml_cuda_fuse_log(const char * rule, int n) {
+    static bool enabled = getenv("GGML_CUDA_FUSE_LOG") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_LOG"));
+    if (!enabled) {
+        return;
+    }
+    static int printed = 0;
+    if (printed++ < 8) {
+        GGML_LOG_INFO("ggml_cuda_fuse: %s x%d\n", rule, n);
+    }
+}
+
+// Collect a run of up to max_n consecutive nodes with the same op and return the index of the last
+// one in *last_idx.  No-ops (view / reshape / permute) are skipped by the main loop, so they are
+// ignored here too.  Missing that makes fusion never fire on any graph that routes through
+// ggml_view_* -- which is exactly what Qwen3.5's conv state and q/k l2_norm do.
+static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, int max_n,
+                                     ggml_tensor ** out, int * last_idx) {
+    int n = 0;
+    *last_idx = i;
+    for (int j = i; j < cgraph->n_nodes && n < max_n; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        // Nodes the main loop skips (no-ops, non-COMPUTE) are not fusion candidates either
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (node->op != op) {
+            break;
+        }
+        out[n++]  = node;
+        *last_idx = j;
+    }
+    return n;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3300,6 +3420,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+    }
+
+    // Merge runs of identically shaped CPY / L2_NORM nodes into one launch each
+    if (node->op == GGML_OP_CPY) {
+        static bool disable_cpy = getenv("GGML_CUDA_DISABLE_FUSE_CPY") != nullptr &&
+                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_CPY"));
+        if (!disable_cpy) {
+            ggml_tensor * nodes[CUDA_CPY_FUSE_MAX];
+            int last_idx = i;
+            int n = ggml_cuda_collect_same_op(cgraph, i, GGML_OP_CPY, CUDA_CPY_FUSE_MAX, nodes, &last_idx);
+            const int collected = n;
+            while (n >= 2 && !ggml_cuda_fuse_nodes_disjoint(nodes, n, /*dst_src_idx =*/ 1)) {
+                --n;
+                last_idx = ggml_cuda_node_index_of(cgraph, i, nodes[n - 1]);
+            }
+            const bool launched = n >= 2 && ggml_cuda_cpy_fused(*cuda_ctx, nodes, n);
+            ggml_cuda_fuse_diag(cgraph, i, collected, n, launched);
+            if (launched) {
+                ggml_cuda_fuse_log("cpy", n);
+                return last_idx - i;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_L2_NORM) {
+        static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
+                                 std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
+        if (!disable_l2) {
+            ggml_tensor * nodes[CUDA_L2_NORM_FUSE_MAX];
+            int last_idx = i;
+            int n = ggml_cuda_collect_same_op(cgraph, i, GGML_OP_L2_NORM, CUDA_L2_NORM_FUSE_MAX, nodes, &last_idx);
+            const int collected = n;
+            while (n >= 2 && !ggml_cuda_fuse_nodes_disjoint(nodes, n, /*dst_src_idx =*/ -1)) {
+                --n;
+                last_idx = ggml_cuda_node_index_of(cgraph, i, nodes[n - 1]);
+            }
+            const bool launched = n >= 2 && ggml_cuda_l2_norm_fused(*cuda_ctx, nodes, n);
+            ggml_cuda_fuse_diag(cgraph, i, collected, n, launched);
+            if (launched) {
+                ggml_cuda_fuse_log("l2_norm", n);
+                return last_idx - i;
+            }
         }
     }
 

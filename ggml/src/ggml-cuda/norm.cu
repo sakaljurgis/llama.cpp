@@ -340,6 +340,147 @@ static __global__ void l2_norm_f32(
     }
 }
 
+// Merge a run of identically shaped l2_norm calls into a single launch.
+// Qwen3.5's linear-attention layers call l2_norm back to back on two views of the same tensor
+// (q_conv / k_conv).  Measured on a P100 each call takes 2.26 us while doing only 16 blocks x 32
+// threads of work, so it is almost entirely launch overhead.  Extending grid.x to nrows*n merges
+// them.  The in-block reduction order is unchanged, so the output is bit-identical.
+struct l2_norm_fused_ptrs {
+    const float * x  [CUDA_L2_NORM_FUSE_MAX];
+    float *       dst[CUDA_L2_NORM_FUSE_MAX];
+};
+
+template <int block_size>
+static __global__ void l2_norm_f32_fused(
+        const l2_norm_fused_ptrs p, const int nrows, const int ncols, const int64_t stride_row,
+        const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+    const int nchannels = gridDim.y;
+
+    const int k         = blockIdx.x / nrows;
+    const int row       = blockIdx.x - k*nrows;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    // Constant indices, for the same reason as in cpy.cu: a runtime index spills the parameter
+    // struct to local memory.
+    const float * xb = p.x[0];
+    float *       db = p.dst[0];
+#pragma unroll
+    for (int j = 1; j < CUDA_L2_NORM_FUSE_MAX; ++j) {
+        if (k == j) { xb = p.x[j]; db = p.dst[j]; }
+    }
+
+    const float * x = xb + sample*stride_sample + channel*stride_channel + row*stride_row;
+    float *     dst = db + ((sample*nchannels + channel)*nrows + row)*(int64_t) ncols;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    // sum up partial sums
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    ggml_cuda_pdl_lc();
+
+    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * x[col];
+    }
+}
+
+// Execute nodes[0..n) as a single L2_NORM launch and return true, if that is possible.
+// Independence has already been checked on the graph side; this only decides whether one kernel
+// can express all of them.
+bool ggml_cuda_l2_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n) {
+    if (n < 2 || n > CUDA_L2_NORM_FUSE_MAX) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = nodes[0]->src[0];
+
+    if (src0->type != GGML_TYPE_F32 || nodes[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(nodes[0])) {
+        return false;
+    }
+
+    float eps;
+    memcpy(&eps, nodes[0]->op_params, sizeof(float));
+    if (!(eps >= 0.0f)) {
+        return false;
+    }
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    if (src0->nb[0] != ts0) {
+        return false;
+    }
+
+    // Shape, strides and eps must match exactly -- only the data pointers may differ
+    for (int k = 1; k < n; ++k) {
+        const ggml_tensor * s = nodes[k]->src[0];
+        if (!s || s->type != GGML_TYPE_F32 || nodes[k]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(nodes[k])) {
+            return false;
+        }
+        float eps_k;
+        memcpy(&eps_k, nodes[k]->op_params, sizeof(float));
+        if (memcmp(&eps_k, &eps, sizeof(float)) != 0) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (s->ne[i] != src0->ne[i] || s->nb[i] != src0->nb[i] ||
+                nodes[k]->ne[i] != nodes[0]->ne[i] || nodes[k]->nb[i] != nodes[0]->nb[i]) {
+                return false;
+            }
+        }
+    }
+
+    const int64_t ncols     = src0->ne[0];
+    const int64_t nrows     = src0->ne[1];
+    const int64_t nchannels = src0->ne[2];
+    const int64_t nsamples  = src0->ne[3];
+
+    if (nrows*n > INT_MAX) {
+        return false;
+    }
+
+    l2_norm_fused_ptrs p = {};
+    for (int k = 0; k < n; ++k) {
+        p.x[k]   = (const float *) nodes[k]->src[0]->data;
+        p.dst[k] = (float *)       nodes[k]->data;
+    }
+
+    const int64_t s01 = src0->nb[1] / ts0;
+    const int64_t s02 = src0->nb[2] / ts0;
+    const int64_t s03 = src0->nb[3] / ts0;
+
+    const dim3 blocks_num((unsigned int) (nrows*n), (unsigned int) nchannels, (unsigned int) nsamples);
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, ctx.stream()};
+        ggml_cuda_kernel_launch(l2_norm_f32_fused<WARP_SIZE>, launch_params,
+            p, (int) nrows, (int) ncols, s01, s02, s03, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32*sizeof(float), ctx.stream()};
+        ggml_cuda_kernel_launch(l2_norm_f32_fused<1024>, launch_params,
+            p, (int) nrows, (int) ncols, s01, s02, s03, eps);
+    }
+
+    return true;
+}
+
 static void norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
