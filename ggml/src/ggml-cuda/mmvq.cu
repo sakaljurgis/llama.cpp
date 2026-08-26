@@ -579,20 +579,6 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-// Low bit types load few weight bytes per thread, a second row per block shares the q8_1 loads and adds memory parallelism.
-static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_IQ1_S:
-        case GGML_TYPE_IQ1_M:
-            return true;
-        default:
-            return false;
-    }
-}
-
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -603,10 +589,27 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 if (table_id == MMVQ_PARAMETERS_GB10) {
                     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
                 }
-                return table_id == MMVQ_PARAMETERS_GENERIC && mmvq_two_rows_ncols1(type) ? 2 : 1;
+                // One output row per block re-reads the q8_1 activation row from L2 once per
+                // output row.  On pre-Turing NVIDIA (measured on GP100/sm_60) MMVQ is limited by
+                // those loads, not by DRAM bandwidth (32-34% of peak) or by instruction count,
+                // so several rows per block pay off.  Decode sweep (9B Q4_0, llama-bench tg32):
+                // 1 -> 46.9 / 2 -> 54.1 (+15.4%) / 4 -> 57.7 (+23.0%) / 8 -> 57.2 t/s.
+                // Turing+ / GCN are not measured here and keep the upstream value.  Upstream
+                // (#30517) uses 2 on this table for the low-bit types only (Q1_0, Q2_K, Q3_K, IQ1_S,
+                // IQ1_M, its mmvq_two_rows_ncols1, removed here because nothing else used it); 4
+                // here covers every type, those included.
+                return table_id == MMVQ_PARAMETERS_GENERIC ? 4 : 1;
             case 2:
             case 3:
             case 4:
+                // Same for the speculative-decoding verify batch (ncols_dst = n_draft + 1):
+                // +3.6% on top of the above.
+                return table_id == MMVQ_PARAMETERS_GENERIC ? 4 : 2;
+                // ncols_dst >= 5 keeps the upstream value of 2.  Raising it to 4 there measured
+                // -0.11% end to end: for the same 247 matmuls the per-launch cost steps
+                // 16.57 / 21.78 / 25.95 / 27.89 us across widths 2/3/4/5, so 4->5 (+1.94) is a
+                // smaller step than 3->4 (+4.17) even at half the row reuse -- two rows per block
+                // is already the right choice at that width.
             case 5:
             case 6:
             case 7:
