@@ -182,6 +182,12 @@ Then the real workload: `llama-server` with the usual flags, a long generation, 
 prompt that used to crash. Any change in output vs. stock is expected only from 03 (MoE,
 above one row) and 12 (Q4_1); everything else is bit-identical by design.
 
+To check that claim after a rebase, keep a stock build next to this one and run the same
+prompt through both with `--temp 0 --seed 1` (greedy, so any difference is real and not
+sampling noise). Identical text means the branch is clean; a divergence after N tokens
+points at a numeric change - bisect at runtime with the kill switches above before
+rebuilding anything.
+
 ## Change log
 
 - 2026-08-26: branch created on `b10630`. Patches 01-08, 10-21, 23-30 applied via rebase from
@@ -191,3 +197,10 @@ above one row) and 12 (Q4_1); everything else is bit-identical by design.
   yet verified.
 - 2026-08-26: step 2, philpax meta backend gist applied (1 conflict hunk, memset_tensor
   adapted, dead code removed). `ggml-base` compiles clean; not yet run on the GPUs.
+- 2026-08-26: first server run (2x P100, CUDA 12.6, NCCL): CUDA build OK, `test-llama-archs`
+  all OK including `qwen35` on Meta, `test-backend-ops` 13567/13568. The one failure,
+  `MUL_MAT(type_a=q4_1,type_b=f32,m=16,n=1,k=32,...)`, passes when rerun alone on either GPU
+  (`-o MUL_MAT -p 'type_a=q4_1,type_b=f32,m=16,n=1,k=32'`). No patch is Q4_1-specific on the
+  n=1 path (12 needs n >= 2), so this is taken as the fp16 `m*s` term of upstream's Q4_1
+  vec_dot on sm_60 going borderline for an unlucky random draw at one block of K. Not a real
+  inference shape; treat a recurrence as known unless it becomes deterministic.
