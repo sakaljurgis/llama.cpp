@@ -3545,6 +3545,73 @@ static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, in
     return n;
 }
 
+// If ops[0..n) appear in this order (skipping no-ops), record their positions in idxs and return true
+static bool ggml_cuda_collect_ops(ggml_cgraph * cgraph, int i, const ggml_op * ops, int n, int * idxs) {
+    int k = 0;
+    for (int j = i; j < cgraph->n_nodes && k < n; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (node->op != ops[k]) {
+            return false;
+        }
+        idxs[k++] = j;
+    }
+    return k == n;
+}
+
+// Can the residual add be folded into rms_norm's prologue?
+// The kernel maps one row to one block and consumes the sum within that block, so the only
+// requirements are: rms_norm's input is exactly the preceding ADD, there is no broadcasting,
+// and all three tensors are contiguous.  The ADD's output is still written because the next
+// layer reads it as its residual (the caller lists it in outputs).
+static bool ggml_cuda_should_fuse_pre_add_rms_norm(const ggml_tensor * add, const ggml_tensor * rms_norm) {
+    if (add->op != GGML_OP_ADD || rms_norm->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+    if (rms_norm->src[0] != add) {
+        return false;
+    }
+    if (add->type != GGML_TYPE_F32 || !add->src[0] || !add->src[1] ||
+        add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(add, add->src[0]) || !ggml_are_same_shape(add, add->src[1])) {
+        return false;
+    }
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1])) {
+        return false;
+    }
+    return true;
+}
+
+// The same conditions upstream's {RMS_NORM, MUL} fusion checks inside ggml_cuda_can_fuse,
+// factored out so they also work when the node indices are not consecutive
+static bool ggml_cuda_should_fuse_rms_norm_mul(const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mul->src[0] != rms_norm && mul->src[1] != rms_norm) {
+        return false;
+    }
+    if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // Broadcasting is not handled when rms_norm is the B operand (same as upstream)
+    if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+        return false;
+    }
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3599,6 +3666,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (launched) {
                 ggml_cuda_fuse_log("cpy", n);
                 return last_idx - i;
+            }
+        }
+    }
+
+    // Fuse the residual add into RMS_NORM: ADD -> RMS_NORM -> MUL in one launch.  The
+    // `k_bin_bcast(add) -> rms_norm` pair is 3.11% of decode GPU time.  Upstream only fuses what
+    // comes AFTER rms_norm (mul / add); the preceding residual add passed through untouched.
+    if (node->op == GGML_OP_ADD) {
+        static bool disable_pre_add = getenv("GGML_CUDA_DISABLE_FUSE_PRE_ADD") != nullptr &&
+                                      std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_PRE_ADD"));
+        if (!disable_pre_add) {
+            static const ggml_op pre_add_ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            int idxs[3];
+            if (ggml_cuda_collect_ops(cgraph, i, pre_add_ops, 3, idxs)) {
+                ggml_tensor * add = cgraph->nodes[idxs[0]];
+                ggml_tensor * rms = cgraph->nodes[idxs[1]];
+                ggml_tensor * mul = cgraph->nodes[idxs[2]];
+                // The ADD output is the next layer's residual and the MUL output is the final
+                // result; neither is eliminated, so both are listed in outputs
+                const int outs[2] = { idxs[0], idxs[2] };
+                if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, pre_add_ops, outs, 2) &&
+                    ggml_cuda_should_fuse_pre_add_rms_norm(add, rms) &&
+                    ggml_cuda_should_fuse_rms_norm_mul(rms, mul)) {
+                    ggml_cuda_op_rms_norm_fused_pre_add(*cuda_ctx, add, rms, mul);
+                    ggml_cuda_fuse_log("pre_add_rms_norm", 3);
+                    return idxs[2] - i;
+                }
             }
         }
     }
