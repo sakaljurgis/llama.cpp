@@ -176,6 +176,27 @@ Graph reuse is a CPU-side optimization (skips graph rebuild and the meta backend
 across devices); it has nothing to do with KV/prompt caching, which is `cache_prompt` plus
 LCP slot matching in the server.
 
+## Runtime notes (2x P100, `-sm tensor`)
+
+- Batches wider than 8 columns run quantized matmuls through dequantize-to-F16 + cuBLAS on
+  sm_60 (MMQ is excluded below DP4A, see the comment in `ggml_cuda_should_use_mmq`). The
+  F16 copy lives in the CUDA temp pool for the call. Prompt processing sizes the pool for
+  the layer matrices, but the LM head only ever runs at width 1 there (logits for the last
+  token), so the first time more than 8 positions need logits - a speculative verify batch
+  with a draft longer than 7 tokens - `output.weight` (~1.3B params on Qwen3.8-27B) gets a
+  ~2.5 GB F16 copy, ~1.3 GB per card. With the cards at ~94% that is
+  `CUDA error: out of memory` in `ggml_cuda_mul_mat_cublas_impl<F16>` on the first draft.
+  Either keep drafts <= 7 (`--spec-draft-n-max 7`, `--spec-ngram-mod-n-max 7`; MTP with
+  `n-max 4` is fine) or free ~1.3 GB per card by lowering `--ctx-size`.
+- `draft-mtp` on this model (head is in the main GGUF, no sidecar needed): acceptance
+  0.78-1.00, but with `--draft-p-min 0.75` the verify width changes every step, graph reuse
+  drops to ~10% and each miss is a meta-backend re-split (15-20 ms). Measured 2026-08-26:
+  short replies 30-38 t/s, long reasoning outputs 23-25 t/s at 15-38k context vs ~27
+  without MTP; prompt processing ~25% slower and ~1 s fixed cost per request. Untested
+  fixes: `--draft-p-min 0` (constant width 5, reuse should recover), patch 22.
+- `ngram-mod` costs nothing when it does not draft; see the first note for the draft length
+  limit.
+
 ## Updating to a new upstream
 
 The branch is a linear commit series, so updating is one rebase:
