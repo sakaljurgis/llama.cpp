@@ -3697,6 +3697,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Fuse ADD -> UNARY -> MUL into one launch (Qwen3.5's gate preprocessing).  These three
+    // launches are 0.65% of decode GPU time, dominated by launch overhead rather than work.
+    if (node->op == GGML_OP_ADD) {
+        static bool disable_aum = getenv("GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL") != nullptr &&
+                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL"));
+        if (!disable_aum) {
+            static const ggml_op aum_ops[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+            int idxs[3];
+            if (ggml_cuda_collect_ops(cgraph, i, aum_ops, 3, idxs)) {
+                // All three destinations are written, so nothing is eliminated: list them all
+                // in outputs
+                const int outs[3] = { idxs[0], idxs[1], idxs[2] };
+                if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, aum_ops, outs, 3) &&
+                    ggml_cuda_op_fused_add_unary_mul(*cuda_ctx, cgraph->nodes[idxs[0]],
+                                                     cgraph->nodes[idxs[1]], cgraph->nodes[idxs[2]])) {
+                    ggml_cuda_fuse_log("add_unary_mul", 3);
+                    return idxs[2] - i;
+                }
+            }
+        }
+    }
+
     if (node->op == GGML_OP_L2_NORM) {
         static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
