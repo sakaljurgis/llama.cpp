@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-f16-sm60.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1471,6 +1472,13 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(!src0->view_src);
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
         }
+    }
+
+    // sm_60 has no DP4A but full-rate HFMA2, so for Q4_1 a dedicated kernel that expands the
+    // nibbles to half2 with LOP3 magic constants beats the generic path.
+    if (ggml_cuda_mmvq_f16_sm60_supported(src0, src1, ids, dst, fusion)) {
+        ggml_cuda_mmvq_f16_sm60(ctx, src0, src1, dst);
+        return;
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
