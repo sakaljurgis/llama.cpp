@@ -1447,6 +1447,24 @@ struct ggml_backend_cuda_context {
     size_t              q8_1_cache_size   = 0;
     int64_t             q8_1_cache_s[4]   = { 0, 0, 0, 0 };
 
+    // A GET_ROWS whose execution was deferred so it can be folded into its consumer.  Set up here
+    // for gated_delta_net; the concat path reuses the same two fields.
+    // Cleared at the top of every graph computation, like the q8_1 cache, because it holds
+    // tensor pointers.
+    const ggml_tensor * gdn_gather_node  = nullptr;  // the deferred GET_ROWS node
+    const ggml_tensor * gdn_gather_owner = nullptr;  // the node consuming it (GATED_DELTA_NET or CONCAT)
+
+    // The row indices are saved at the position the GET_ROWS occupied.  Deferring execution lets
+    // galloc reuse the input tensor's addresses for something else in the meantime (which really
+    // happens with the small per-slot compute buffers), so reading them at gdn would be corrupt.
+    int32_t * gdn_rows_scratch   = nullptr;
+    size_t    gdn_rows_scratch_n = 0;
+
+    void gdn_gather_clear() {
+        gdn_gather_node  = nullptr;
+        gdn_gather_owner = nullptr;
+    }
+
     // Forget the key, keep the buffer.  Called at the top of every graph computation.
     void q8_1_cache_clear() {
         q8_1_cache_src1   = nullptr;
