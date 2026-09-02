@@ -23,7 +23,9 @@ Every patch also carries its reasoning in the comments it adds to the source.
   Order matters: several patches touch the same lines and later ones build on earlier ones.
 - Commits after the patch series: the meta backend gist and this document. 09, 22 and 28 are
   not on the branch (deferred, see below); 03 and 06 were dropped (superseded upstream, see below).
-- The tip before each rebase is kept as a branch named after the old base (`p100-b10630`).
+- One branch per upstream base, named `p100-b<build>` (`p100-b10133`, `p100-b10630`,
+  `p100-b10758`). A rebase starts a new branch and leaves the old one untouched, so every build
+  stays available for recovery. This document describes `p100-b10758`.
 
 ## Status per patch (against b81c99b47)
 
@@ -240,10 +242,10 @@ LCP slot matching in the server.
 The branch is a linear commit series, so updating is one rebase:
 
 ```sh
-git branch p100-b<old-build> p100               # keep the old tip
 git fetch origin --tags
-git rebase --onto <new-tag> <old-base> p100     # old-base: the "Base:" commit above
-git range-diff <old-base>..p100-b<old-build> <new-tag>..p100   # expect '=' everywhere except resolved patches
+git branch p100-b<new-build> p100-b<old-build>             # old branch stays untouched
+git rebase --onto <new-tag> <old-base> p100-b<new-build>   # old-base: the "Base:" commit above
+git range-diff <old-base>..p100-b<old-build> <new-tag>..p100-b<new-build>   # '=' except resolved patches
 ```
 
 `git fetch origin` over HTTPS fails on the workstation (`could not read Username for
@@ -271,7 +273,7 @@ upstream tunes for newer hardware).
 To regenerate patch files in the layout of the source repo:
 
 ```sh
-git format-patch --no-numbered --zero-commit -o patches/ <base>..p100
+git format-patch --no-numbered --zero-commit -o patches/ <base>..p100-b<build>
 ```
 
 ## Test checklist (on the GPU server)
@@ -350,3 +352,5 @@ on `qwen35` that the kill switches above do not explain points here first.
   that need `mtmd.h` with `LLAMA_BUILD_TOOLS=OFF`, unrelated to the patches). CUDA build and the
   test checklist not yet run on the server. The patch repo moved to a `v0.2.0` base on 2026-08-29
   (`dc4740d`); `v0.2.0` predates b10630, so its patch files are not newer than this branch.
+- 2026-09-02: branch `p100` renamed to `p100-b10758`; one branch per upstream base from now on
+  (see Branch layout). The fork's `p100` (`e9b087580`) is two doc commits behind `p100-b10630`.
