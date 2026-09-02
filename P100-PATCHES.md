@@ -18,13 +18,14 @@ Every patch also carries its reasoning in the comments it adds to the source.
 
 ## Branch layout
 
-- Base: upstream `master` at `5d5cb4c3a` (`b10630`).
+- Base: upstream `master` at `b81c99b47` (`b10758` + 1 commit, master of 2026-09-02).
 - One commit per patch, subject `p100: NN-name`, in the original numeric order.
   Order matters: several patches touch the same lines and later ones build on earlier ones.
-- Commits after the patch series: the meta backend gist and this document. 09 and 22 are
-  not on the branch (deferred, see below).
+- Commits after the patch series: the meta backend gist and this document. 09, 22 and 28 are
+  not on the branch (deferred, see below); 03 and 06 were dropped (superseded upstream, see below).
+- The tip before each rebase is kept as a branch named after the old base (`p100-b10630`).
 
-## Status per patch (against b10630)
+## Status per patch (against b81c99b47)
 
 Scope tags are from the patch repo. "Fires" says whether the patch does anything for the
 models listed above; inert patches are kept to stay close to the upstream patch set.
@@ -33,10 +34,8 @@ models listed above; inert patches are kept to stay close to the upstream patch 
 |---:|---|---|---|---|
 | 01 | vmad-dp4a-sm60 | sm_60 | clean | yes (all quantized matvec) |
 | 02 | mmvq-rows-per-block-sm60 | pre-Turing | clean | yes |
-| 03 | topk-moe-multirow | CUDA | clean | MoE only |
 | 04 | concat-non-cont-flat | CUDA | clean | qwen35 (delta-net) |
 | 05 | mmvf-f32-pascal | pre-Turing | clean | yes (batch 2-8 F32 matvec) |
-| 06 | mmq-mul-mat-id-sm60 | sm_60 | clean | MoE only |
 | 07 | mmvq-moe-rows-sm60 | all archs | clean | MoE only |
 | 08 | mmvq-mmid-batch-sm60 | pre-Volta | clean | MoE only |
 | 09 | mmvq-nwarps-small-k-sm60 | pre-Turing | **deferred** (see below) | MoE only |
@@ -58,7 +57,7 @@ models listed above; inert patches are kept to stay close to the upstream patch 
 | 25 | gdn-gather-single-snapshot | CUDA (delta-net) | clean | qwen35 |
 | 26 | cpy-fused-rows | CUDA | clean | yes |
 | 27 | fuse-concat-gather | CUDA (delta-net) | clean | qwen35 |
-| 28 | top-k-partial | CUDA | clean | GPU sampling only |
+| 28 | top-k-partial | CUDA | **deferred** (see below) | GPU sampling only |
 | 29 | mmvq-iq3xxs-grid-smem | CUDA | clean | IQ3_XXS only |
 | 30 | mmvq-ksigns-smem | CUDA | clean | IQ2/IQ3 only |
 
@@ -98,6 +97,36 @@ step has the same shape and upstream reuse already hits, so the measured +0.97% 
 +72 MiB VRAM) does not apply. It also adds four `ggml_backend_sched` instances with their own
 compute buffers, which is more surface for `-sm tensor`. Revisit when MTP is switched on, and
 then measure `LLAMA_DEC_SLOTS=0` vs `4` on the real workload instead of trusting the number.
+
+### 03 topk-moe-multirow and 06 mmq-mul-mat-id-sm60 (dropped)
+
+Both superseded upstream between b10630 and b81c99b47, so the commits were dropped on
+2026-09-02:
+
+- 03: #27621 (`41ef91f7c`) made the fused topk-moe kernel multi-row (`TOPK_MOE_ROWS_PER_BLOCK`)
+  and extended the MoE glu and router fusion past one token, which is what 03 did.
+- 06: #26264 (`fc35562ba`) adds the same rule to `ggml_cuda_should_use_mmq` (MMQ for `MUL_MAT_ID`
+  only, on `cc >= PASCAL` without native DP4A) plus a separate MMQ tile config for non-DP4A Pascal
+  (`mmq-config-pascal-older.cuh`, lower occupancy for Q2_K/Q4_K/Q5_K/Q6_K). The dense `MUL_MAT`
+  path is unchanged: dequantize-to-F16 + cuBLAS above 8 columns.
+
+Both were MoE-only and did not fire for the models above. Upstream's versions have not been
+measured here.
+
+### 23 fuse-gdn-beta-sigmoid, 24 fuse-gdn-state-gather
+
+Both insert a fusion rule at the top of `ggml_cuda_try_fuse`, where upstream #25952
+(`3466812d1`) inserted its MoE weighted-reduction rule (`node->op == GGML_OP_MUL`). Resolved by
+keeping upstream's rule first and the patch rule after it; the rules match different ops, so
+the order does not matter. Patch content is unchanged (`git range-diff` against the b10630
+series shows context-only differences for 23, 24 and 29).
+
+### 28 top-k-partial
+
+Conflicts with upstream #27466 (`f8dbcd618`, "ROCm: add radix TOP_K for long rows"), which
+rewrote most of `top-k.cu`; the conflict is one block covering the whole region 28 edits. Only
+used with GPU (backend) sampling, which is off here, so deferred on 2026-09-02 instead of
+re-implemented. Revisit if GPU sampling is switched on.
 
 ### Meta backend gist
 
@@ -141,6 +170,9 @@ Adaptations made against b10630:
   `ggml_backend_meta_alloc_ctx_tensors_from_buft`, `params` in `..._buffer_type_alloc_buffer`,
   `#include <set>`.
 
+Upstream did not touch `ggml-backend-meta.cpp` between b10630 and b81c99b47; the gist commit
+re-applied without conflict.
+
 When rebasing, any new function in `ggml-backend-meta.cpp` that calls
 `ggml_backend_meta_buffer_simple_tensor()` on non-static tensors needs the same treatment.
 `grep -n "ggml_backend_meta_buffer_simple_tensor(" ggml/src/ggml-backend-meta.cpp` should
@@ -157,7 +189,7 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_FUSE_GDN_BETA`, `GGML_CUDA_DISABLE_FUSE_GDN_GATHER` | 23, 24 | kill switches |
 | `GGML_CUDA_DISABLE_CPY_ROWS` | 26 | kill switch |
 | `GGML_CUDA_DISABLE_CONCAT_ROWS`, `GGML_CUDA_DISABLE_FUSE_CONCAT_GATHER` | 27 | kill switches |
-| `GGML_CUDA_DISABLE_TOP_K_PARTIAL` | 28 | kill switch |
+| `GGML_CUDA_DISABLE_TOP_K_PARTIAL` | 28 | kill switch (not on the branch) |
 | `LLAMA_SAMPLER_PREFILTER=0` | 13 | kill switch |
 | `LLAMA_DEC_SLOTS=N` (default 4, 0 = off), `LLAMA_DEC_MAX_TOK` (default 4) | 22 | decode slots (not on the branch) |
 | `LLAMA_MTP_DRAFT_VOCAB=<file>` | 15 | enable draft vocab subset |
@@ -165,8 +197,8 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_FUSION=1` | upstream | disables all CUDA fusion, including the patched rules of 18, 19, 20, 23, 24, 27 |
 | `LLAMA_GRAPH_REUSE_DISABLE=1` | upstream | disables graph reuse (28.9 -> 18.1 t/s tg here, -27%; pp unchanged) |
 
-No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 03,
-06-08). To bisect one of those, build with the commit dropped (`git rebase -i` or
+No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
+To bisect one of those, build with the commit dropped (`git rebase -i` or
 `git revert`). 21 is a scheduler patch (`ggml-backend.cpp`, lazy `ggml_backend_sched_reset`)
 next to where the meta backend crash lived; it was on the branch for the 89k validation run
 above, so it is cleared for `-sm tensor`, but it is the first one to drop if scheduler-side
@@ -179,7 +211,8 @@ LCP slot matching in the server.
 ## Runtime notes (2x P100, `-sm tensor`)
 
 - Batches wider than 8 columns run quantized matmuls through dequantize-to-F16 + cuBLAS on
-  sm_60 (MMQ is excluded below DP4A, see the comment in `ggml_cuda_should_use_mmq`). The
+  sm_60 (MMQ is excluded below DP4A for dense `MUL_MAT`, see `ggml_cuda_should_use_mmq`; since
+  #26264 upstream allows it for `MUL_MAT_ID` only). The
   F16 copy lives in the CUDA temp pool for the call. Prompt processing sizes the pool for
   the layer matrices, but the LM head only ever runs at width 1 there (logits for the last
   token), so the first time more than 8 positions need logits - a speculative verify batch
@@ -207,8 +240,18 @@ LCP slot matching in the server.
 The branch is a linear commit series, so updating is one rebase:
 
 ```sh
+git branch p100-b<old-build> p100               # keep the old tip
 git fetch origin --tags
 git rebase --onto <new-tag> <old-base> p100     # old-base: the "Base:" commit above
+git range-diff <old-base>..p100-b<old-build> <new-tag>..p100   # expect '=' everywhere except resolved patches
+```
+
+`git fetch origin` over HTTPS fails on the workstation (`could not read Username for
+'https://github.com'`, git 2.34, sandboxed or not) while SSH works, so fetch upstream with:
+
+```sh
+git fetch git@github.com:ggml-org/llama.cpp.git \
+    '+refs/heads/master:refs/remotes/origin/master' 'refs/tags/*:refs/tags/*'
 ```
 
 Turn on `git rerere` once (`git config rerere.enabled true`) so a conflict resolved once is
@@ -256,13 +299,18 @@ is a large context (50k+) followed by a request with a near-exact prefix cache h
 assert and for the router respawning the child; `GGML_META_DEBUG=1` logs the meta backend's
 rebuilds if that needs pinning down.
 
-Output vs. stock: the only patches that change numbers are 03 (MoE, above one row), 12
-(Q4_1 weights, n >= 2) and 15 (off unless `LLAMA_MTP_DRAFT_VOCAB` is set). None of them fire
+Output vs. stock: the only patches that change numbers are 12 (Q4_1 weights, n >= 2) and 15
+(off unless `LLAMA_MTP_DRAFT_VOCAB` is set). Neither fires
 for Q4_K_M/Q6_K `qwen35` without speculative decoding, so a greedy run (`--temp 0 --seed 1`)
 of the same prompt through this build and a stock build of the same base commit is expected
 to be identical to the last token, not just similar. Any divergence is a bug; bisect at
 runtime with the kill switches above (start with `GGML_CUDA_DISABLE_FUSION=1`, then
 `LLAMA_SAMPLER_PREFILTER=0`) before rebuilding anything.
+
+Since the 2026-09-02 rebase upstream forces the fused GDN ops on (#27877 set `auto_fgdn = false`,
+`fused_gdn_ar/ch = true`); b10630 probed the backend first. With CUDA and the meta backend the
+probe should already have picked fused, so no change is expected for `qwen35`. A tg difference
+on `qwen35` that the kill switches above do not explain points here first.
 
 ## Change log
 
@@ -290,3 +338,15 @@ runtime with the kill switches above (start with `GGML_CUDA_DISABLE_FUSION=1`, t
   gist is what fixed it (a plain version bump would not have - the only meta-backend commits
   between b10133 and b10615 are #26502 and its revert #27433, plus #27574 which is a
   different mechanism).
+- 2026-09-02: rebased onto `b81c99b47` (`b10758` + 1; 128 upstream commits, 2026-08-26 to
+  2026-09-02). 03 and 06 dropped (superseded by #27621 and #26264), 28 deferred (`top-k.cu`
+  rewritten by #27466). 23 and 24 conflicted with #25952 at the top of `ggml_cuda_try_fuse`,
+  both rules kept; 25 and 27 only conflicted in a dry run that had skipped 23. The gist and every
+  other patch applied without conflict. Upstream did not retune the constants of 02, 05, 07, 08
+  (its mmvq/mmvf changes are SWIGLU_CLAMP fusion plumbing) and did not touch
+  `ggml-backend-meta.cpp`. Old tip kept as branch `p100-b10630`. Host side compile-checked with
+  the CPU-only build (`llama`, `llama-common`, `test-sampling` build and `test-sampling` passes;
+  the full `build-cpu` target set now fails on upstream's `test-chat` including server headers
+  that need `mtmd.h` with `LLAMA_BUILD_TOOLS=OFF`, unrelated to the patches). CUDA build and the
+  test checklist not yet run on the server. The patch repo moved to a `v0.2.0` base on 2026-08-29
+  (`dc4740d`); `v0.2.0` predates b10630, so its patch files are not newer than this branch.
