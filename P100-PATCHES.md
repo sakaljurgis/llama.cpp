@@ -141,6 +141,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | # | Patch | Scope | Fires for our models |
 |---:|---|---|---|
 | 31 | server-ckpt-adopt | host (server) | yes (hybrid/recurrent models, every follow-up request) |
+| 32 | mmvq-q4k-hfma2 | sm_60 (CUDA) | yes (every Q4_K matvec at decode widths 1-8) |
 
 ### 31 server-ckpt-adopt
 
@@ -161,6 +162,42 @@ user message re-decodes 4 + the previous rendered reply extra (~10 tokens here).
 change, but a follow-up is now decoded as one batch of 28 instead of 10 + 18, so greedy tokens on
 follow-ups can differ from a legacy run at near-tied positions (batch-shape numerics of the
 cuBLAS path). `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream placement exactly.
+
+### 32 mmvq-q4k-hfma2
+
+`ggml/src/ggml-cuda/mmvq-q4k-f16-sm60.cu/.cuh`, a hook in `ggml_cuda_mul_mat_vec_q` next to the
+patch 12 hook, and an activation cache in `common.cuh`. GP100 has no DP4A: patch 01 emulates
+the int8 dot product with 4 `vmad` per 4 MACs, while `__hfma2` does 2 MACs per instruction at
+full rate. Tier 0 showed tg is matvec-bound (`mul_mat_vec_q` 77% of a token at 315 GB/s of a
+603 GB/s ceiling), so a Q4_K matvec on HFMA2 is the lever; patch 12 does the same for Q4_1,
+which no K-quant model uses.
+
+The kernel expands the nibbles to half2 with LOP3 magic constants, accumulates one half2 per
+sub-block, applies the 6-bit scales and mins in half and sums the blocks in FP32. The
+activations are converted once per matvec to half scaled by the amax of each 256-element
+block (plus per-sub-block sums for the min term), stored so that a warp step reads one
+contiguous 512 B line per slot, and the next step's header and nibbles are prefetched into
+registers at widths 1 and 2 (the register budget does not allow it above). Widths 1-8 in one
+template, 2 rows per block at width 1 and 4 above; the same single-slot activation cache as
+the q8_1 path, so gate and up share one conversion.
+
+Measured on 4096x14336 (us per call, new vs the int8 path, same binary): width 1 70 vs 104
+(1.49x, 471 GB/s of weights), 2 96 vs 167, 3 105 vs 232, 4 127 vs 296, 5 136 vs 389, 8 224
+vs 632. Model tg on Qwen3.8-27B-UD-Q4_K_M: +2.5% (30.0 vs 29.3 t/s at d0, 28.9 vs 28.3 at
+d16384). That file is a mixed quant in which Q4_K is only 17.7% of the tg kernel time (Q5_K
+24.7%, IQ4_XS 19.4%, Q6_K 9.0%, Q3_K 3.5%), and the model's k=5120 shapes reach 373 GB/s
+against 459 at k=14336, so the kernel is 1.21x in-model. The same treatment for Q5_K, IQ4_XS
+and Q6_K is the follow-up that carries the tg gain.
+
+Math change (half accumulation within a block). Perplexity (wiki.test.raw, `-c 2048 -b 2048`,
+decoded at `-ub 1` over 4 chunks and `-ub 8` over 10 chunks so that the matvec path is what runs;
+the plan's `-ub 2048` run never touches it): ub 1 new 6.2352 vs int8 path 6.2431 (-0.13%), ub 8 new 5.4006 vs 5.3942 (+0.12%); the int8
+path equals the stock build to the last digit in both. Greedy (`--temp 0 --seed 1`, 256 tokens):
+the int8 path is byte-identical to stock; the new path matches for the first 76 words and then
+takes a different continuation at a near-tied token.
+Kill switch `GGML_CUDA_DISABLE_MMVQ_F16_K=1` (restores the int8 path exactly); tuning knobs
+`GGML_A16K_ROWS`, `GGML_A16K_NWARPS`, `GGML_A16K_PF`, `GGML_A16K_SMALL_GRID`,
+`GGML_A16K_NCOLS_MIN`, `GGML_A16K_NCOLS_MAX`, `GGML_A16K_LOG=1`.
 
 ### Meta backend gist
 
@@ -231,6 +268,8 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_FUSION=1` | upstream | disables all CUDA fusion, including the patched rules of 18, 19, 20, 23, 24, 27 |
 | `LLAMA_GRAPH_REUSE_DISABLE=1` | upstream | disables graph reuse (28.9 -> 18.1 t/s tg here, -27%; pp unchanged) |
 | `LLAMA_SERVER_CKPT_LEGACY=1` | 31 | upstream checkpoint placement (3 checkpoints + 3 decodes per follow-up) |
+| `GGML_CUDA_DISABLE_MMVQ_F16_K=1` | 32 | kill switch (Q4_K HFMA2 matvec, back to the int8 path) |
+| `GGML_A16K_*` | 32 | Q4_K HFMA2 kernel tuning (`ROWS`, `NWARPS`, `PF`, `SMALL_GRID`, `NCOLS_MIN/MAX`, `LOG`) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -343,13 +382,16 @@ is a large context (50k+) followed by a request with a near-exact prefix cache h
 assert and for the router respawning the child; `GGML_META_DEBUG=1` logs the meta backend's
 rebuilds if that needs pinning down.
 
-Output vs. stock: the only patches that change numbers are 12 (Q4_1 weights, n >= 2) and 15
-(off unless `LLAMA_MTP_DRAFT_VOCAB` is set). Neither fires
-for Q4_K_M/Q6_K `qwen35` without speculative decoding, so a greedy run (`--temp 0 --seed 1`)
-of the same prompt through this build and a stock build of the same base commit is expected
-to be identical to the last token, not just similar. Any divergence is a bug; bisect at
-runtime with the kill switches above (start with `GGML_CUDA_DISABLE_FUSION=1`, then
-`LLAMA_SAMPLER_PREFILTER=0`) before rebuilding anything.
+Output vs. stock: the patches that change numbers are 12 (Q4_1 weights, n >= 2), 15 (off
+unless `LLAMA_MTP_DRAFT_VOCAB` is set) and 32 (every Q4_K matvec at decode widths 1-8, on by
+default). Run the greedy comparison (`--temp 0 --seed 1`, same prompt, this build vs a stock
+build of the same base commit) with `GGML_CUDA_DISABLE_MMVQ_F16_K=1`: with the switch set the
+output is expected to be identical to the last token, not just similar, and any divergence is
+a bug; bisect at runtime with the kill switches above (start with `GGML_CUDA_DISABLE_FUSION=1`,
+then `LLAMA_SAMPLER_PREFILTER=0`) before rebuilding anything. Without the switch the Q4_K path
+of 32 may take a different token at a near-tied position (2026-09-03: identical for the first
+76 words of a 256-token run, then a different continuation); its check is the perplexity one
+in the section on 32.
 
 Since the 2026-09-02 rebase upstream forces the fused GDN ops on (#27877 set `auto_fgdn = false`,
 `fused_gdn_ar/ch = true`); b10630 probed the backend first. With CUDA and the meta backend the
@@ -399,3 +441,9 @@ on `qwen35` that the kill switches above do not explain points here first.
   local patch `p100x: 31-server-ckpt-adopt` (follow-up prompt phase 1302 -> 732 ms).
 - 2026-09-02: branch `p100` renamed to `p100-b10758`; one branch per upstream base from now on
   (see Branch layout). The fork's `p100` (`e9b087580`) is two doc commits behind `p100-b10630`.
+- 2026-09-03: local patch 32 (`p100x: 32-mmvq-q4k-hfma2`): HFMA2 Q4_K matvec for sm_60, widths
+  1-8, 1.49x-2.85x the int8 path per call, tg +2.5% on the mixed UD-Q4_K_M (Q4_K is 17.7% of its
+  tg kernel time; Q5_K/IQ4_XS/Q6_K next). Perplexity at `-ub 1`/`-ub 8` within 0.13% of stock (the int8 path equals stock); greedy
+  identical to stock with the kill switch, diverges after 76 words without it. Full `test-backend-ops`
+  14675/14675 on CUDA1 and 14674/14675 on CUDA0 (the known q4_1 width-1 tolerance case, passes
+  alone and on stock). Kill switch `GGML_CUDA_DISABLE_MMVQ_F16_K=1`.
