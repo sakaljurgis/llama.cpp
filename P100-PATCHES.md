@@ -21,8 +21,10 @@ Every patch also carries its reasoning in the comments it adds to the source.
 - Base: upstream `master` at `b81c99b47` (`b10758` + 1 commit, master of 2026-09-02).
 - One commit per patch, subject `p100: NN-name`, in the original numeric order.
   Order matters: several patches touch the same lines and later ones build on earlier ones.
-- Commits after the patch series: the meta backend gist and this document. 09, 22 and 28 are
-  not on the branch (deferred, see below); 03 and 06 were dropped (superseded upstream, see below).
+- Commits after the patch series: the meta backend gist, this document, and local patches
+  written for this machine with subject `p100x: NN-name`, numbered from 31 so they never collide
+  with the upstream patch repo's 01-30 (see "Local patches" below). 09, 22 and 28 are not on the
+  branch (deferred, see below); 03 and 06 were dropped (superseded upstream, see below).
 - One branch per upstream base, named `p100-b<build>` (`p100-b10133`, `p100-b10630`,
   `p100-b10758`). A rebase starts a new branch and leaves the old one untouched, so every build
   stays available for recovery. This document describes `p100-b10758`.
@@ -130,6 +132,36 @@ rewrote most of `top-k.cu`; the conflict is one block covering the whole region 
 used with GPU (backend) sampling, which is off here, so deferred on 2026-09-02 instead of
 re-implemented. Revisit if GPU sampling is switched on.
 
+## Local patches (p100x)
+
+Written against this branch from measurements on the 2x P100 server (2026-09-03, see
+`P100-OPTIMIZATION-PLAN.md` for the plan and `~/p100-opt/P100-OPTIMIZATION-LOG.md` on the server
+for the numbers). Same rules as the upstream set: one commit each, a kill switch each.
+
+| # | Patch | Scope | Fires for our models |
+|---:|---|---|---|
+| 31 | server-ckpt-adopt | host (server) | yes (hybrid/recurrent models, every follow-up request) |
+
+### 31 server-ckpt-adopt
+
+`tools/server/server-context.cpp`. For recurrent and hybrid models the server keeps context
+checkpoints (copies of the recurrent state, 149.6 MiB for Qwen3.8-27B) so a later request can
+roll back. Upstream (PR 20288) breaks the prompt batch at the start of the last user message and
+at 4 and 4+n_ubatch tokens before the end, creating a checkpoint at each break regardless of
+`--checkpoint-min-step`, and re-creates a checkpoint at the restore point after every restore.
+On a 25k-token chat every 32-token follow-up therefore paid 1 restore, 3 erases, 3 x 150 MiB
+checkpoint saves and 3 separate small decodes: 1302 ms prompt phase, 1.98 s wall.
+
+The patch (a) makes `create_checkpoint` adopt the newest checkpoint when it already holds the
+state at the batch start (the one just restored), instead of erasing and copying it again, and
+(b) drops the forced break and the min-step bypass at the last user message; the periodic
+user-message breaks and the two near-end breaks stay. Measured: prompt phase 1302 -> 732 ms,
+follow-up wall 1.98 -> 1.41 s; regenerate and exact-repeat cases unchanged; editing the last
+user message re-decodes 4 + the previous rendered reply extra (~10 tokens here). Not a math
+change, but a follow-up is now decoded as one batch of 28 instead of 10 + 18, so greedy tokens on
+follow-ups can differ from a legacy run at near-tied positions (batch-shape numerics of the
+cuBLAS path). `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream placement exactly.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -198,6 +230,7 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_A16_*` | 12 | Q4_1 HFMA2 kernel tuning |
 | `GGML_CUDA_DISABLE_FUSION=1` | upstream | disables all CUDA fusion, including the patched rules of 18, 19, 20, 23, 24, 27 |
 | `LLAMA_GRAPH_REUSE_DISABLE=1` | upstream | disables graph reuse (28.9 -> 18.1 t/s tg here, -27%; pp unchanged) |
+| `LLAMA_SERVER_CKPT_LEGACY=1` | 31 | upstream checkpoint placement (3 checkpoints + 3 decodes per follow-up) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -233,9 +266,18 @@ LCP slot matching in the server.
   limit. Measured 2026-08-26 with `n-max 7 n-min 4` at 200k ctx: tg 27.1-27.4 t/s flat at
   25-27k context (= no-speculation baseline), drafts fire on ~1% of reasoning tokens
   (acceptance 0.64-1.0 when they do). Harmless; only pays on repetitive output.
-- A fixed ~1 s prompt phase per request shows up on short follow-ups (`929 ms / 55 tokens`)
-  with and without a draft model; cause not identified (not the meta-backend re-splits,
-  those are ~20 ms each).
+- The fixed ~1 s prompt phase per request on short follow-ups (`929 ms / 55 tokens`) was the
+  server's checkpoint logic for recurrent models, not the meta-backend re-splits and not
+  `--cache-ram` (measured identical at 16384 and 0; with `--parallel 1` the slot is always
+  re-selected by prefix similarity, so the host KV save never runs). Patch 31 removes most of it;
+  what remains (~730 ms) is one 150 MiB checkpoint save (~200 ms) and a 28-token decode through
+  the dequant + cuBLAS path (~390 ms), see `P100-OPTIMIZATION-PLAN.md` items J4b and A8.
+- Measured 2026-09-03 with the standard protocol (`P100-OPTIMIZATION-PLAN.md` section 4): branch
+  pp2048 421 t/s, tg 29.3 t/s at depth 0 (stock 417 / 21.6); tg is matvec-bound, `mul_mat_vec_q`
+  is 77% of the step at 315 GB/s of the 603 GB/s the card delivers; GPU busy 97%, so launch
+  overhead and CUDA graphs are not a lever on Pascal. `NCCL_P2P_LEVEL=SYS` is worth +1.5% pp,
+  +0.9% tg (NCCL otherwise bounces through host memory). `--load-mode dio` loads in 70 s from the
+  HDD vs 4 s for mmap; keep mmap.
 
 ## Updating to a new upstream
 
@@ -352,5 +394,8 @@ on `qwen35` that the kill switches above do not explain points here first.
   that need `mtmd.h` with `LLAMA_BUILD_TOOLS=OFF`, unrelated to the patches). CUDA build and the
   test checklist not yet run on the server. The patch repo moved to a `v0.2.0` base on 2026-08-29
   (`dc4740d`); `v0.2.0` predates b10630, so its patch files are not newer than this branch.
+- 2026-09-03: Tier 0 of `P100-OPTIMIZATION-PLAN.md` measured on the server (hardware fact sheet,
+  baselines branch vs stock, nsys breakdowns, NCCL transport, server per-request timeline). First
+  local patch `p100x: 31-server-ckpt-adopt` (follow-up prompt phase 1302 -> 732 ms).
 - 2026-09-02: branch `p100` renamed to `p100-b10758`; one branch per upstream base from now on
   (see Branch layout). The fork's `p100` (`e9b087580`) is two doc commits behind `p100-b10630`.
