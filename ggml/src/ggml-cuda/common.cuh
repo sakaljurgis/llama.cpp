@@ -1447,6 +1447,16 @@ struct ggml_backend_cuda_context {
     size_t              q8_1_cache_size   = 0;
     int64_t             q8_1_cache_s[4]   = { 0, 0, 0, 0 };
 
+    // The same single-slot cache for the half activations of the sm_60 Q4_K HFMA2 matvec
+    // (mmvq-q4k-f16-sm60.cu); key = (ne00, s11).
+    char *              a16k_cache_mem    = nullptr;
+    size_t              a16k_cache_cap    = 0;
+    const ggml_tensor * a16k_cache_src1   = nullptr;
+    const void *        a16k_cache_data   = nullptr;
+    cudaStream_t        a16k_cache_stream = nullptr;
+    size_t              a16k_cache_size   = 0;
+    int64_t             a16k_cache_s[2]   = { 0, 0 };
+
     // A GET_ROWS whose execution was deferred so it can be folded into its consumer.  Set up here
     // for gated_delta_net; the concat path reuses the same two fields.
     // Cleared at the top of every graph computation, like the q8_1 cache, because it holds
@@ -1490,6 +1500,22 @@ struct ggml_backend_cuda_context {
             q8_1_cache_cap = 0;
         }
         q8_1_cache_clear();
+    }
+
+    void a16k_cache_clear() {
+        a16k_cache_src1   = nullptr;
+        a16k_cache_data   = nullptr;
+        a16k_cache_stream = nullptr;
+        a16k_cache_size   = 0;
+    }
+
+    void a16k_cache_free() {
+        if (a16k_cache_mem != nullptr) {
+            (void) cudaFree(a16k_cache_mem);
+            a16k_cache_mem = nullptr;
+            a16k_cache_cap = 0;
+        }
+        a16k_cache_clear();
     }
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
