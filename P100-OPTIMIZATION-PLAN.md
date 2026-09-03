@@ -1081,11 +1081,13 @@ Keep mmap.
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
 | A8 | MMVQ column-chunk loop for 9-64 columns on sm_60 | 28-token decode ~390 -> ~150 ms per follow-up; speculative widths > 8 | J4 numbers |
 | J4b | make the 150 MiB checkpoint save faster (288 shard copies + sync each, 200 ms vs 37 ms restore) | ~150 ms per follow-up | J4 |
+| B4c | Q4_K HFMA2 kernel at short k: 4 blocks per warp step or 2 warps when nblocks < 32 (launcher-level; `~/p100-opt/log/B4-notes.md`) | k=5120 shapes 373 -> ~450 GB/s, ~+1% tg | B4 |
 
 ### Tier 2: medium changes (design note to the user first, 2-5 days each)
 
 | Item | Change | Expected | Depends on |
 |---|---|---|---|
+| B4b | HFMA2 matvec for Q5_K (Q4_K scale block plus one high-bit plane, same kernel structure), then IQ4_XS (16-entry table instead of the LOP3 magic), then Q6_K | up to ~+15% tg on the UD-Q4_K_M if each type reaches the Q4_K kernel's 1.2-1.5x in-model | B4 |
 | G3 | per-subgraph CUDA graph cache so `-sm tensor` can use graphs | the bulk of the launch-bound share found in G1 | G2 success |
 | C2 | retune the Pascal FP16 tile table (D=128, D=256) | +5-15% tg and pp at 32k+ | C1 |
 | C3 | VEC for GQA tg on Pascal with a KV-length threshold | measured per KV length | C1 |
@@ -1098,7 +1100,7 @@ Keep mmap.
 
 | Item | Change | Why it might pay | Why it might not |
 |---|---|---|---|
-| B4 | HFMA2 GEMV for Q4_K/Q6_K (extend patch 12) | 2 MAC per instruction vs ~0.6 for emulated dp4a | MMVQ may already be bandwidth bound (B3 decides) |
+| B4 | DONE 2026-09-03 as `p100x: 32-mmvq-q4k-hfma2` (Q4_K only): 1.49x at width 1 (471 GB/s), up to 2.85x at widths 5-8 per call; tg +2.5% | Q4_K is only 17.7% of the tg kernel time on the UD-Q4_K_M (Q5_K 24.7%, IQ4_XS 19.4%, Q6_K 9.0%): B4b carries the rest | the k=5120 shapes reach 373 GB/s against 459 at k=14336 (B4c) |
 | A7 | HFMA2 tiled GEMM with in-register dequant | removes the F16 round trip and temporaries | cuBLAS is already at ~68-80% of peak |
 | F7 | P2P direct allreduce kernel for 2 GPUs | < 10 us per collective vs 20-40 | needs stable P2P; Pascal has no `__nanosleep` |
 | G4 | fewer subgraph boundaries in the meta backend | 1 CUDA graph per device per token | deep change in `ggml_backend_meta_graph_compute` |
