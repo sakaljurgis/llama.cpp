@@ -1081,7 +1081,7 @@ Keep mmap.
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
 | A8 | MMVQ column-chunk loop for 9-64 columns on sm_60 | 28-token decode ~390 -> ~150 ms per follow-up; speculative widths > 8 | J4 numbers |
 | J4b | make the 150 MiB checkpoint save faster (288 shard copies + sync each, 200 ms vs 37 ms restore) | ~150 ms per follow-up | J4 |
-| B4c | HFMA2 K-quant kernels at short k (Q4_K, Q5_K, Q6_K since B4b): 4 blocks per warp step or 2 warps when nblocks < 32 (launcher-level; `~/p100-opt/log/B4-notes.md`, `B4b-notes.md`) | in-model 1.21x / 1.14x / 1.30x against 1.49x / 1.36x / 1.40x at k=14336; the Q6_K LM head (k=5120, 1 GB per token) is the largest single kernel affected; ~+3% tg | B4 B4b |
+| B4c | DONE 2026-09-04 as `p100x: 34-mmvq-k-shortk`: prefetch mode 2 (header loaded in its own step) per type and width, at width 1 only for Q5_K below 24 blocks; tg +0.5% (31.7 t/s at d0), speculative verify widths 2/4 +4% / +2%; measured with a new any-shape timing tool (`~/p100-opt/b4c/shape.cpp`) that Area B work should use from now on | the gap itself stands: k=5120 runs at 0.74-0.81 of the k=14336 rate, the streaming part is within 3% of the DRAM ceiling and only a fixed 0.38 step per warp is addressable; a shorter warp step is measured out (see What not to do); the LM head was already at its ceiling | B4 B4b |
 
 ### Tier 2: medium changes (design note to the user first, 2-5 days each)
 
@@ -1120,6 +1120,11 @@ Keep mmap.
   its int8 path already runs at ~400 GB/s on GP100 (70% of the DRAM ceiling, 78 us on 4096x14336),
   the best HFMA2 config (16 instructions per 8 weights) is 6% slower there and costs 4.8% tg in the
   model. A win needs a different kernel structure, not a better table.
+- Do not shorten the HFMA2 K-quant warp step (4 blocks per step, half-step pipeline) to fix short k
+  (B4c, 2026-09-04): halving the bytes in flight per warp lost 18-26% per call; the kernel's streaming
+  part is already within 3% of the DRAM ceiling and only the fixed pipeline cost (0.38 of a step per
+  warp) remains. Measure Area B changes with `~/p100-opt/b4c/shape.cpp` at the model's shapes and at
+  per-GPU row counts (`-sm tensor` halves the rows a GPU sees), not only on the 4096x14336 test shape.
 
 ## 4. Measurement and validation protocol
 
