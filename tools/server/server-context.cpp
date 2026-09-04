@@ -909,6 +909,7 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+    int ckpt_legacy  = 0; // env: LLAMA_SERVER_CKPT_LEGACY, 1 = upstream checkpoint placement
 
     int n_empty_consecutive = 0;
 
@@ -1337,6 +1338,15 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_CKPT_LEGACY = getenv("LLAMA_SERVER_CKPT_LEGACY");
+            ckpt_legacy = LLAMA_SERVER_CKPT_LEGACY ? atoi(LLAMA_SERVER_CKPT_LEGACY) : 0;
+
+            if (ckpt_legacy) {
+                SRV_WRN("LLAMA_SERVER_CKPT_LEGACY = %d\n", ckpt_legacy);
             }
         }
 
@@ -2297,6 +2307,19 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+
+        // the newest checkpoint already holds this exact state (usually the one just restored): reuse it instead of copying it again
+        if (!ckpt_legacy && !slot.prompt.checkpoints.empty()) {
+            auto & cur = slot.prompt.checkpoints.back();
+
+            if (cur.n_tokens == slot.prompt.n_tokens() - n_tokens_cur && cur.pos_min == pos_min && cur.pos_max == pos_max) {
+                cur.id_task = id_task;
+
+                SLT_TRC(slot, "reusing context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                return;
+            }
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -3519,12 +3542,12 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
+                        // break at user messages at least min step past the last checkpoint (legacy: also at the last user message)
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if ((ckpt_legacy && pos == last_user_pos) || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -3594,10 +3617,10 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // no need to create checkpoints that are too close together, unless near the prompt end (legacy: or at the last user message)
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            (ckpt_legacy && is_last_user_message) || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 

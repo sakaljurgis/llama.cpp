@@ -1033,6 +1033,49 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
+// The per-byte sign masks depend only on the 7 bit field they are unpacked from, so
+// the whole unpack_ksigns / __vcmpne4 chain can be replaced by one table read.  That
+// chain is expensive on sm_60 specifically: there is no byte-wise SIMD compare and no
+// byte-wise SIMD subtract, so __vcmpne4 and __vsub4 are both expanded into several
+// LOP3/LOP32I, and s*0x01010101 becomes three XMAD.
+//
+// Every byte of iq2xxs_grid, iq2xs_grid and iq3xxs_grid is >= 4, so (g ^ 0xff) + 1 per
+// byte cannot carry into the next byte and a plain 32 bit add replaces __vsub4.
+//
+// Same rule as iq3xxs_grid_smem_init(): every kernel that reaches a vec_dot using this
+// must call ksigns_smem_init() before any early return, because of the __syncthreads().
+static __device__ __forceinline__ uint32_t * ksigns_smem() {
+    __shared__ uint32_t s_ksigns[256];
+    return s_ksigns;
+}
+
+static __device__ __forceinline__ void ksigns_smem_init(const int tid, const int nthreads) {
+    uint32_t * s_ksigns = ksigns_smem();
+    for (int u = tid; u < 128; u += nthreads) {
+        const uint32_t s = u | ((__popc(u) & 1) << 7);
+        uint32_t mask_l = 0;
+        uint32_t mask_h = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            mask_l |= ((s >> (0 + i)) & 1) * (0xffu << (8*i));
+            mask_h |= ((s >> (4 + i)) & 1) * (0xffu << (8*i));
+        }
+        s_ksigns[u]       = mask_l;
+        s_ksigns[u + 128] = mask_h;
+    }
+    __syncthreads();
+}
+
+// unpack_ksigns truncates its argument to 8 bits and recovers the 8th sign from the
+// parity, in which bit 7 cancels, so only the low 7 bits of v matter here as well.
+static __device__ __forceinline__ void apply_ksigns(int & lo, int & hi, const uint32_t v) {
+    const uint32_t * s_ksigns = ksigns_smem();
+    const uint32_t mask_l = s_ksigns[(v & 0x7f)];
+    const uint32_t mask_h = s_ksigns[(v & 0x7f) + 128];
+    lo = (lo ^ mask_l) + (mask_l & 0x01010101);
+    hi = (hi ^ mask_h) + (mask_h & 0x01010101);
+}
+
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
 #define VDR_IQ2_XXS_Q8_1_MMQ  2
 
@@ -1049,15 +1092,13 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+        int grid0 = grid_pos.x;
+        int grid1 = grid_pos.y;
+        apply_ksigns(grid0, grid1, aux32 >> (7 * k0 / 2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
@@ -1086,14 +1127,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
-        const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
+        int grid_l = grid_pos.x;
+        int grid_h = grid_pos.y;
+        apply_ksigns(grid_l, grid_h, q2[l0/2] >> 9);
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
@@ -1160,6 +1198,29 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
 #define VDR_IQ3_XXS_Q8_1_MMQ  2
 
+// The 32 lanes of a warp index iq3xxs_grid independently, so a global load of it
+// is split into as many sectors as there are distinct addresses and replayed
+// serially; staging the 1 KiB table in shared memory leaves only bank conflicts.
+// __constant__ is worse than global here, because the constant cache broadcasts
+// one address per cycle and a divergent index serialises 32 ways.
+//
+// Every kernel that reaches vec_dot_iq3_xxs_q8_1 must call iq3xxs_grid_smem_init()
+// first, before any early return, because it contains a __syncthreads().  The
+// dispatch goes through a function-pointer table, so a missing call is not a
+// compile error: it reads uninitialised shared memory and returns wrong values.
+static __device__ __forceinline__ uint32_t * iq3xxs_grid_smem() {
+    __shared__ uint32_t s_grid[256];
+    return s_grid;
+}
+
+static __device__ __forceinline__ void iq3xxs_grid_smem_init(const int tid, const int nthreads) {
+    uint32_t * s_grid = iq3xxs_grid_smem();
+    for (int i = tid; i < 256; i += nthreads) {
+        s_grid[i] = iq3xxs_grid[i];
+    }
+    __syncthreads();
+}
+
 static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1169,20 +1230,16 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     const uint8_t * q3 = (const uint8_t *) &q3_packed;
     const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
 
+    const uint32_t * s_grid = iq3xxs_grid_smem();
+
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
-
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        int grid_l = s_grid[q3[l0 + 0]];
+        int grid_h = s_grid[q3[l0 + 1]];
+        apply_ksigns(grid_l, grid_h, aux32 >> (7*l0/2));
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
-
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);

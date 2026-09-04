@@ -733,9 +733,21 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     return __dp4a(a, b, c);
 #else // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+#if __CUDA_ARCH__ >= 600
+    // sm_60 (GP100) has no DP4A. PTX vmad (scalar MAC with byte selectors) avoids the
+    // byte extraction (BFE/SHR), cutting dot4 from ~15 to ~6.75 SASS instructions.
+    int r = c;
+    asm("vmad.s32.s32.s32 %0, %1.b0, %2.b0, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;\n\t"
+        "vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;"
+        : "+r"(r) : "r"(a), "r"(b));
+    return r;
+#else
     const int8_t * a8 = (const int8_t *) &a;
     const int8_t * b8 = (const int8_t *) &b;
     return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
+#endif
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
 
 #endif // defined(GGML_USE_HIP)
@@ -1416,6 +1428,95 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // Single-slot cache of a matvec's q8_1-quantized activation, so that the second
+    // matmul of a gate/up pair does not redo the identical quantization.  The key is cleared at
+    // the top of every graph compute because it holds a tensor pointer, which a later graph may
+    // reuse; the buffer itself is kept.
+    //
+    // The buffer is a plain device allocation, NOT a pool one.  The pool is a stack allocator that
+    // asserts every free is the top of the stack, so holding a pool allocation across calls breaks
+    // it whenever a caller allocates before mul_mat_vec_q and frees after -- which is exactly what
+    // ggml_cuda_mul_mat_id's sorted-gather path does.  It grows and is never shrunk, so after
+    // warmup there are no allocations at all.
+    char *              q8_1_cache_mem    = nullptr;
+    size_t              q8_1_cache_cap    = 0;
+    const ggml_tensor * q8_1_cache_src1   = nullptr;
+    const void *        q8_1_cache_data   = nullptr;
+    cudaStream_t        q8_1_cache_stream = nullptr;
+    size_t              q8_1_cache_size   = 0;
+    int64_t             q8_1_cache_s[4]   = { 0, 0, 0, 0 };
+
+    // The same single-slot cache for the half activations of the sm_60 K-quant HFMA2 matvec
+    // (mmvq-k-f16-sm60.cu); key = (ne00, s11, activation layout).
+    char *              a16k_cache_mem    = nullptr;
+    size_t              a16k_cache_cap    = 0;
+    const ggml_tensor * a16k_cache_src1   = nullptr;
+    const void *        a16k_cache_data   = nullptr;
+    cudaStream_t        a16k_cache_stream = nullptr;
+    size_t              a16k_cache_size   = 0;
+    int64_t             a16k_cache_s[3]   = { 0, 0, 0 };
+
+    // A GET_ROWS whose execution was deferred so it can be folded into its consumer.  Set up here
+    // for gated_delta_net; the concat path reuses the same two fields.
+    // Cleared at the top of every graph computation, like the q8_1 cache, because it holds
+    // tensor pointers.
+    const ggml_tensor * gdn_gather_node  = nullptr;  // the deferred GET_ROWS node
+    const ggml_tensor * gdn_gather_owner = nullptr;  // the node consuming it (GATED_DELTA_NET or CONCAT)
+
+    // The row indices are saved at the position the GET_ROWS occupied.  Deferring execution lets
+    // galloc reuse the input tensor's addresses for something else in the meantime (which really
+    // happens with the small per-slot compute buffers), so reading them at gdn would be corrupt.
+    int32_t *           gdn_rows_scratch   = nullptr;
+    size_t              gdn_rows_scratch_n = 0;
+    // The tensor the snapshot came from; an identical one is not saved again.  Every SSM layer uses
+    // the same index tensor, so once per graph is enough.  Cleared per graph computation.
+    const ggml_tensor * gdn_rows_src       = nullptr;
+
+    // Called on every consumption; does not forget gdn_rows_src
+    void gdn_gather_clear() {
+        gdn_gather_node  = nullptr;
+        gdn_gather_owner = nullptr;
+    }
+
+    // Called once at the top of a graph computation
+    void gdn_gather_reset_graph() {
+        gdn_gather_clear();
+        gdn_rows_src = nullptr;
+    }
+
+    // Forget the key, keep the buffer.  Called at the top of every graph computation.
+    void q8_1_cache_clear() {
+        q8_1_cache_src1   = nullptr;
+        q8_1_cache_data   = nullptr;
+        q8_1_cache_stream = nullptr;
+        q8_1_cache_size   = 0;
+    }
+
+    void q8_1_cache_free() {
+        if (q8_1_cache_mem != nullptr) {
+            (void) cudaFree(q8_1_cache_mem);
+            q8_1_cache_mem = nullptr;
+            q8_1_cache_cap = 0;
+        }
+        q8_1_cache_clear();
+    }
+
+    void a16k_cache_clear() {
+        a16k_cache_src1   = nullptr;
+        a16k_cache_data   = nullptr;
+        a16k_cache_stream = nullptr;
+        a16k_cache_size   = 0;
+    }
+
+    void a16k_cache_free() {
+        if (a16k_cache_mem != nullptr) {
+            (void) cudaFree(a16k_cache_mem);
+            a16k_cache_mem = nullptr;
+            a16k_cache_cap = 0;
+        }
+        a16k_cache_clear();
+    }
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
