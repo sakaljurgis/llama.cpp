@@ -1447,15 +1447,15 @@ struct ggml_backend_cuda_context {
     size_t              q8_1_cache_size   = 0;
     int64_t             q8_1_cache_s[4]   = { 0, 0, 0, 0 };
 
-    // The same single-slot cache for the half activations of the sm_60 Q4_K HFMA2 matvec
-    // (mmvq-q4k-f16-sm60.cu); key = (ne00, s11).
+    // The same single-slot cache for the half activations of the sm_60 K-quant HFMA2 matvec
+    // (mmvq-k-f16-sm60.cu); key = (ne00, s11, activation layout).
     char *              a16k_cache_mem    = nullptr;
     size_t              a16k_cache_cap    = 0;
     const ggml_tensor * a16k_cache_src1   = nullptr;
     const void *        a16k_cache_data   = nullptr;
     cudaStream_t        a16k_cache_stream = nullptr;
     size_t              a16k_cache_size   = 0;
-    int64_t             a16k_cache_s[2]   = { 0, 0 };
+    int64_t             a16k_cache_s[3]   = { 0, 0, 0 };
 
     // A GET_ROWS whose execution was deferred so it can be folded into its consumer.  Set up here
     // for gated_delta_net; the concat path reuses the same two fields.

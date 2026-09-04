@@ -1,6 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvq-f16-sm60.cuh"
-#include "mmvq-q4k-f16-sm60.cuh"
+#include "mmvq-k-f16-sm60.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1500,9 +1500,9 @@ void ggml_cuda_mul_mat_vec_q(
         ggml_cuda_mmvq_f16_sm60(ctx, src0, src1, dst);
         return;
     }
-    // Same for Q4_K, widths 1..8 (kill switch GGML_CUDA_DISABLE_MMVQ_F16_K=1).
-    if (ggml_cuda_mmvq_q4k_f16_sm60_supported(src0, src1, ids, dst, fusion)) {
-        ggml_cuda_mmvq_q4k_f16_sm60(ctx, src0, src1, dst);
+    // Same for the K-quants (Q4_K, Q5_K, IQ4_XS, Q6_K), widths 1..8 (kill switch GGML_CUDA_DISABLE_MMVQ_F16_K=1).
+    if (ggml_cuda_mmvq_k_f16_sm60_supported(src0, src1, ids, dst, fusion)) {
+        ggml_cuda_mmvq_k_f16_sm60(ctx, src0, src1, dst);
         return;
     }
 
