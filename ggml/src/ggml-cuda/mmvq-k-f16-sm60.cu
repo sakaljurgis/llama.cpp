@@ -33,6 +33,15 @@
 // for Q4_K and Q5_K and up to width 4 for IQ4_XS and Q6_K; above that the register pressure of the
 // accumulators wins and the plain loop is faster.
 //
+// What the prefetch buffer holds is a second trade (pf mode 1 against mode 2, see mul_mat_vec_k_a16).
+// A warp is limited by how many weight bytes it has in flight, which is the size of that buffer times
+// the number of resident warps, so taking the header out of it (it is read after the accumulation
+// loop, not inside it) can go either way: 4 registers per row less against a third fewer bytes in
+// flight.  Which side wins depends on the width and, at width 1, on the k range: a warp that runs
+// only 2 or 3 of the 8 block steps (nblocks < 24, i.e. every k=5120 tensor of the target model) pays
+// a fixed cost of 0.38 steps for the pipeline and prefers the smaller buffer, while at k=14336 the
+// bigger buffer wins by 5-7% (B4c; the same measurement is why a shorter warp step does not pay).
+//
 // Math per sub-block j: a' = a/amax with amax per 256-element block, so |q*a'| <= 15 and a lane sums
 // 16 products into one half2 without overflow.  sc_j and m_j (6 bit) become exact halves with the same
 // magic trick, sc*sum and m*ysum and the d/dmin multiply happen in half, the subtraction of the two
@@ -123,6 +132,28 @@ static int a16k_layout(const ggml_type type) {
 // 4096x14336 against 88 for the best HFMA2 config), and in the model it costs 4.8% tg at width 1.
 static int a16k_ncols_min(const ggml_type type) {
     return type == GGML_TYPE_IQ4_XS ? 4 : 1;
+}
+
+// B4c: widths at which the header is loaded inside its own step (pf mode 2) instead of riding in the
+// prefetch buffer.  Measured per type on the model shapes and on 4096x14336 against the B4b default
+// of that width, which is mode 1 unless noted: Q4_K width 2 +8%, width 4 +3% (B4b runs mode 0 there);
+// Q5_K width 2 +5%; Q6_K width 2 +3%, width 3 +3%; IQ4_XS width 3 +3%, width 4 +5%.  The widths left
+// out lose: Q4_K and Q5_K at width 3 and Q5_K at width 4 are faster with no prefetch at all, IQ4_XS
+// at width 2 loses 6% and Q6_K at width 4 is a wash.
+// Width 1 is in the mask only for the types that win there with a short k range (the k condition is
+// in launch_a16k), which is the one with the largest register block: Q5_K (125 registers, 16 resident
+// warps) gains 2-5% at every k=5120 shape and at both row counts a shape can have, split over two
+// GPUs or not, and IQ4_XS the same 3-8% (it runs the int8 path at width 1 anyway).  Q4_K's block is
+// small enough (95) that it is a wash: +3.7% at 8704 rows but -2.2% at 5120, +0.1% in the model.
+// Q6_K gains at most 1% and loses 1.1% on its 124160 row LM head, which is 77% of the type's bytes.
+static int a16k_pf2_widths(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:   return (1 << 2) | (1 << 4);
+        case GGML_TYPE_Q5_K:   return (1 << 1) | (1 << 2);
+        case GGML_TYPE_Q6_K:   return (1 << 2) | (1 << 3);
+        case GGML_TYPE_IQ4_XS: return (1 << 1) | (1 << 3) | (1 << 4);
+        default:               return 0;
+    }
 }
 
 static int a16k_align(const ggml_type type) {
@@ -236,7 +267,11 @@ static __global__ void quantize_a16k(
 // is a per row constant and there is no divergence.
 #define A16K_Q6_W(q, X, sh8) __funnelshift_r((q)[(X) >> 2], (q)[((X) >> 2) + 1], (sh8))
 
-template <ggml_type type, int nrows, int nqh>
+// do_hdr and do_qs select the two halves of a block's load.  They are separate because the header
+// (the 6 bit scales and mins, or the int8 scales and d of Q6_K) is only read after the 8 word
+// accumulation loop of its own step, so it does not have to travel through the prefetch buffer:
+// pf mode 2 loads it at the top of its own step, which is 4 registers per row less than mode 1.
+template <ggml_type type, int nrows, int nqh, bool do_hdr, bool do_qs>
 static __device__ __forceinline__ void a16k_load_x(
         const char * const (&xrow)[nrows], const int koff, const int goff,
         int4 (&hdr)[nrows], int (&qh)[nrows][nqh], int (&qw)[nrows][8], const int (&sh8)[nrows], const int gq6) {
@@ -244,49 +279,61 @@ static __device__ __forceinline__ void a16k_load_x(
     for (int r = 0; r < nrows; ++r) {
         const char * p = xrow[r] + koff;
         if constexpr (a16k_traits<type>::q6) {
-            // gq6 packs the lane's block offsets: run A of ql, run B, the qh run and the scale byte.
-            const int * q = (const int *) ((uintptr_t) p & ~(uintptr_t) 3);
-            const int rA = (gq6 >> 0) & 0xff, rB = rA + 32, rC = (gq6 >> 8) & 0xff;
+            if constexpr (do_qs) {
+                // gq6 packs the lane's block offsets: run A of ql, run B, the qh run and the scale byte.
+                const int * q = (const int *) ((uintptr_t) p & ~(uintptr_t) 3);
+                const int rA = (gq6 >> 0) & 0xff, rB = rA + 32, rC = (gq6 >> 8) & 0xff;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                qw[r][i]     = A16K_Q6_W(q, rA + 4*i, sh8[r]);
-                qw[r][4 + i] = A16K_Q6_W(q, rB + 4*i, sh8[r]);
-                qh[r][i]     = A16K_Q6_W(q, rC + 4*i, sh8[r]);
+                for (int i = 0; i < 4; ++i) {
+                    qw[r][i]     = A16K_Q6_W(q, rA + 4*i, sh8[r]);
+                    qw[r][4 + i] = A16K_Q6_W(q, rB + 4*i, sh8[r]);
+                    qh[r][i]     = A16K_Q6_W(q, rC + 4*i, sh8[r]);
+                }
             }
-            // 4 int8 scales at stride 2 and the fp16 d: byte and short loads, both always in bounds.
-            // Kept as halves in the order of the accumulators: (m0, m2) and (m1, m3).
-            const signed char    * sc = (const signed char    *) (p + 192 + ((gq6 >> 16) & 0xff));
-            const unsigned short * dp = (const unsigned short *) (p + 208);
-            hdr[r].x = (int) __half_as_ushort(__int2half_rn(sc[0])) | (((int) __half_as_ushort(__int2half_rn(sc[4]))) << 16);
-            hdr[r].y = (int) __half_as_ushort(__int2half_rn(sc[2])) | (((int) __half_as_ushort(__int2half_rn(sc[6]))) << 16);
-            hdr[r].z = (int) dp[0];
+            if constexpr (do_hdr) {
+                // 4 int8 scales at stride 2 and the fp16 d: byte and short loads, both always in bounds.
+                // Kept as halves in the order of the accumulators: (m0, m2) and (m1, m3).
+                const signed char    * sc = (const signed char    *) (p + 192 + ((gq6 >> 16) & 0xff));
+                const unsigned short * dp = (const unsigned short *) (p + 208);
+                hdr[r].x = (int) __half_as_ushort(__int2half_rn(sc[0])) | (((int) __half_as_ushort(__int2half_rn(sc[4]))) << 16);
+                hdr[r].y = (int) __half_as_ushort(__int2half_rn(sc[2])) | (((int) __half_as_ushort(__int2half_rn(sc[6]))) << 16);
+                hdr[r].z = (int) dp[0];
+            }
             continue;
         }
         if constexpr (a16k_traits<type>::table) {
             // block_iq4_xs is 8 byte aligned only: header (d, scales_h, scales_l) is one LDG.64 and
             // the lane's 32 bytes of qs are four more.
-            const int2 h = *((const int2 *) p);
-            hdr[r].x = h.x;
-            hdr[r].y = h.y;
+            if constexpr (do_hdr) {
+                const int2 h = *((const int2 *) p);
+                hdr[r].x = h.x;
+                hdr[r].y = h.y;
+            }
+            if constexpr (do_qs) {
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int2 q = *((const int2 *) (p + goff + 8*j));
-                qw[r][2*j + 0] = q.x;
-                qw[r][2*j + 1] = q.y;
+                for (int j = 0; j < 4; ++j) {
+                    const int2 q = *((const int2 *) (p + goff + 8*j));
+                    qw[r][2*j + 0] = q.x;
+                    qw[r][2*j + 1] = q.y;
+                }
             }
             continue;
         }
-        hdr[r] = *((const int4 *) p);
-        if constexpr (a16k_traits<type>::has_qh) {
-            const int4 h0 = *((const int4 *) (p + 16));
-            const int4 h1 = *((const int4 *) (p + 32));
-            qh[r][0] = h0.x; qh[r][1] = h0.y; qh[r][2] = h0.z; qh[r][3] = h0.w;
-            qh[r][4] = h1.x; qh[r][5] = h1.y; qh[r][6] = h1.z; qh[r][7] = h1.w;
+        if constexpr (do_hdr) {
+            hdr[r] = *((const int4 *) p);
         }
-        const int4 q0 = *((const int4 *) (p + goff));
-        const int4 q1 = *((const int4 *) (p + goff + 16));
-        qw[r][0] = q0.x; qw[r][1] = q0.y; qw[r][2] = q0.z; qw[r][3] = q0.w;
-        qw[r][4] = q1.x; qw[r][5] = q1.y; qw[r][6] = q1.z; qw[r][7] = q1.w;
+        if constexpr (do_qs) {
+            if constexpr (a16k_traits<type>::has_qh) {
+                const int4 h0 = *((const int4 *) (p + 16));
+                const int4 h1 = *((const int4 *) (p + 32));
+                qh[r][0] = h0.x; qh[r][1] = h0.y; qh[r][2] = h0.z; qh[r][3] = h0.w;
+                qh[r][4] = h1.x; qh[r][5] = h1.y; qh[r][6] = h1.z; qh[r][7] = h1.w;
+            }
+            const int4 q0 = *((const int4 *) (p + goff));
+            const int4 q1 = *((const int4 *) (p + goff + 16));
+            qw[r][0] = q0.x; qw[r][1] = q0.y; qw[r][2] = q0.z; qw[r][3] = q0.w;
+            qw[r][4] = q1.x; qw[r][5] = q1.y; qw[r][6] = q1.z; qw[r][7] = q1.w;
+        }
     }
 }
 
@@ -361,7 +408,14 @@ static __device__ __forceinline__ void a16k_expand(
     }
 }
 
-template <ggml_type type, int ncols_dst, int nrows, int nwarps, bool prefetch>
+// pfmode 0: no prefetch, the whole block is loaded at the top of its own step.
+// pfmode 1: the next step's header, qh and qs are prefetched into registers (B4/B4b).
+// pfmode 2: the same, except that the header is not prefetched but loaded at the top of its own step
+//           and read after the accumulation loop.  That is 4 registers per row less than mode 1, so
+//           the wider register blocks get resident warps back (Q4_K width 2: 166 against 168, Q5_K
+//           width 1: 122 against 125), at the price of a load latency that only the 8 words of the
+//           step itself cover.
+template <ggml_type type, int ncols_dst, int nrows, int nwarps, int pfmode>
 static __global__ void __launch_bounds__(WARP_SIZE*nwarps)
 mul_mat_vec_k_a16(
         const void * __restrict__ vx, const int4 * __restrict__ aq, const half2 * __restrict__ ys,
@@ -427,23 +481,28 @@ mul_mat_vec_k_a16(
     const int kb0   = threadIdx.y*A16K_BPW + b;
     const int kstep = A16K_BPW*nwarps;
 
+    constexpr bool pf_hdr = pfmode == 1; // the header travels through the prefetch buffer
+
     int4 hdr[nrows], hdr_next[nrows];
     int  qh[nrows][nqh] = {{0}}, qh_next[nrows][nqh] = {{0}}; // unused for a type without a qh plane
     int  qw[nrows][8], qw_next[nrows][8];
-    if constexpr (prefetch) {
+    if constexpr (pfmode != 0) {
         if (kb0 < nblocks) {
-            a16k_load_x<type, nrows, nqh>(xrow, kb0*(int) sizeof(block_t), goff, hdr, qh, qw, sh8, gq6);
+            a16k_load_x<type, nrows, nqh, pf_hdr, true>(xrow, kb0*(int) sizeof(block_t), goff, hdr, qh, qw, sh8, gq6);
         }
     }
 
     for (int kb = kb0; kb < nblocks; kb += kstep) {
         const bool more = kb + kstep < nblocks;
-        if constexpr (prefetch) {
+        if constexpr (pfmode != 0) {
+            if constexpr (pfmode == 2) {
+                a16k_load_x<type, nrows, nqh, true, false>(xrow, kb*(int) sizeof(block_t), goff, hdr, qh, qw, sh8, gq6);
+            }
             if (more) {
-                a16k_load_x<type, nrows, nqh>(xrow, (kb + kstep)*(int) sizeof(block_t), goff, hdr_next, qh_next, qw_next, sh8, gq6);
+                a16k_load_x<type, nrows, nqh, pf_hdr, true>(xrow, (kb + kstep)*(int) sizeof(block_t), goff, hdr_next, qh_next, qw_next, sh8, gq6);
             }
         } else {
-            a16k_load_x<type, nrows, nqh>(xrow, kb*(int) sizeof(block_t), goff, hdr, qh, qw, sh8, gq6);
+            a16k_load_x<type, nrows, nqh, true, true>(xrow, kb*(int) sizeof(block_t), goff, hdr, qh, qw, sh8, gq6);
         }
 
         half2 Y[ncols_dst];
@@ -594,11 +653,13 @@ mul_mat_vec_k_a16(
             }
         }
 
-        if constexpr (prefetch) {
+        if constexpr (pfmode != 0) {
             if (more) {
 #pragma unroll
                 for (int r = 0; r < nrows; ++r) {
-                    hdr[r] = hdr_next[r];
+                    if constexpr (pf_hdr) {
+                        hdr[r] = hdr_next[r];
+                    }
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         qw[r][i] = qw_next[r][i];
@@ -736,7 +797,7 @@ bool ggml_cuda_mmvq_k_f16_sm60_supported(
     return true;
 }
 
-template <ggml_type type, int ncols_dst, int nrows, bool prefetch>
+template <ggml_type type, int ncols_dst, int nrows, int pfmode>
 static void launch_a16k_nw(
         const void * vx, const int4 * aq, const half2 * ys, const float * yd, float * dst,
         const int nblocks, const int nrows_x, const int stride_row_x, const int stride_col_dst,
@@ -744,33 +805,37 @@ static void launch_a16k_nw(
     const dim3 grid((nrows_x + nrows - 1)/nrows, 1, 1);
     switch (nwarps) {
         case 1:
-            mul_mat_vec_k_a16<type, ncols_dst, nrows, 1, prefetch><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
+            mul_mat_vec_k_a16<type, ncols_dst, nrows, 1, pfmode><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
                 vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst);
             break;
         case 2:
-            mul_mat_vec_k_a16<type, ncols_dst, nrows, 2, prefetch><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
+            mul_mat_vec_k_a16<type, ncols_dst, nrows, 2, pfmode><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
                 vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst);
             break;
         default:
-            mul_mat_vec_k_a16<type, ncols_dst, nrows, 4, prefetch><<<grid, dim3(WARP_SIZE, 4, 1), 0, stream>>>(
+            mul_mat_vec_k_a16<type, ncols_dst, nrows, 4, pfmode><<<grid, dim3(WARP_SIZE, 4, 1), 0, stream>>>(
                 vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst);
             break;
     }
 }
 
-// Only widths that can win with a prefetch get both instantiations.
+// Only widths that can win with a prefetch get the prefetching instantiations.
 template <ggml_type type, int ncols_dst, int nrows>
 static void launch_a16k_pf(
         const void * vx, const int4 * aq, const half2 * ys, const float * yd, float * dst,
         const int nblocks, const int nrows_x, const int stride_row_x, const int stride_col_dst,
-        const int nwarps, const bool prefetch, cudaStream_t stream) {
+        const int nwarps, const int pfmode, cudaStream_t stream) {
     if constexpr (ncols_dst <= 4) {
-        if (prefetch) {
-            launch_a16k_nw<type, ncols_dst, nrows, true>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, stream);
+        if (pfmode == 2) {
+            launch_a16k_nw<type, ncols_dst, nrows, 2>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, stream);
+            return;
+        }
+        if (pfmode == 1) {
+            launch_a16k_nw<type, ncols_dst, nrows, 1>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, stream);
             return;
         }
     }
-    launch_a16k_nw<type, ncols_dst, nrows, false>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, stream);
+    launch_a16k_nw<type, ncols_dst, nrows, 0>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, stream);
 }
 
 // Rows per block and prefetch, measured per type on 4096x14336 (test-backend-ops perf, both knobs
@@ -786,6 +851,9 @@ static void launch_a16k_pf(
 // Warps per block: 1 unless the grid is too small to fill the SMs.  2 warps look 6-7% better for Q6_K
 // at widths 1-3 on the 56 block test shape but lose 0.4% tg in the model, where k = 5120 leaves only
 // 20 blocks to split between them.  All three overridable for tuning.
+// The prefetch mode (B4c) is chosen per type and width by a16k_pf2_widths, plus the k range at
+// width 1; rows and nwarps are unchanged by B4c, a sweep of both at k = 5120 and 6144 found nothing
+// above 3% and nothing that held for two shapes of the same type.
 template <ggml_type type, int ncols_dst>
 static void launch_a16k(
         const void * vx, const int4 * aq, const half2 * ys, const float * yd, float * dst,
@@ -795,13 +863,12 @@ static void launch_a16k(
     static const int env_nwarps = a16k_env_int("GGML_A16K_NWARPS", 0);
     static const int env_pf     = a16k_env_int("GGML_A16K_PF", -1);
     static const int small_grid = a16k_env_int("GGML_A16K_SMALL_GRID", 128);
+    static const int shortk     = a16k_env_int("GGML_A16K_SHORTK", 1);
+    static const int shortk_nb  = a16k_env_int("GGML_A16K_SHORTK_NB", 24);
     static const int log_level  = a16k_env_int("GGML_A16K_LOG", 0);
 
     constexpr bool wide_pf = type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K;
-    bool prefetch = ncols_dst <= (wide_pf ? 4 : 2);
-    if (env_pf == 0 || env_pf == 1) {
-        prefetch = env_pf == 1;
-    }
+    int pfmode = ncols_dst <= (wide_pf ? 4 : 2) ? 1 : 0;
 
     int rows = ncols_dst == 1 ? 2 : 4;
     if (type == GGML_TYPE_Q5_K && ncols_dst >= 8) {
@@ -812,6 +879,20 @@ static void launch_a16k(
     }
     if (type == GGML_TYPE_Q6_K && (ncols_dst == 4 || ncols_dst >= 8)) {
         rows = 2;
+    }
+
+    // B4c.  At width 1 the header trade is decided by the k range: pf mode 2 wins while a warp runs
+    // only 2 to 3 of the 8 block steps (nblocks < 24, which is every k=5120 tensor of the model) and
+    // loses 5-7% at k=14336, where the pipeline has enough steps to pay for the wider buffer.  At the
+    // other widths it is the width that decides, per type (a16k_pf2_widths).
+    // GGML_A16K_SHORTK=0 restores the B4b configuration exactly.
+    if (shortk != 0 && ((a16k_pf2_widths(type) >> ncols_dst) & 1) != 0 &&
+        (ncols_dst != 1 || nblocks < shortk_nb)) {
+        pfmode = 2;
+    }
+
+    if (env_pf >= 0 && env_pf <= 2) {
+        pfmode = env_pf;
     }
     if (env_rows == 2 || env_rows == 4 || (env_rows == 8 && ncols_dst <= 4)) {
         rows = env_rows;
@@ -830,23 +911,23 @@ static void launch_a16k(
         static int nlog = 0;
         if (nlog < 32) {
             ++nlog;
-            fprintf(stderr, "a16k: type=%s ne00=%d ne01=%d ncols=%d rows=%d nwarps=%d prefetch=%d grid=%d\n",
-                    ggml_type_name(type), nblocks*A16K_QK, nrows_x, ncols_dst, rows, nwarps, (int) prefetch, grid);
+            fprintf(stderr, "a16k: type=%s ne00=%d ne01=%d ncols=%d rows=%d nwarps=%d pf=%d grid=%d\n",
+                    ggml_type_name(type), nblocks*A16K_QK, nrows_x, ncols_dst, rows, nwarps, pfmode, grid);
         }
     }
 
     switch (rows) {
         case 2:
-            launch_a16k_pf<type, ncols_dst, 2>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, prefetch, stream);
+            launch_a16k_pf<type, ncols_dst, 2>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, pfmode, stream);
             break;
         case 8:
             if constexpr (ncols_dst <= 4) {
-                launch_a16k_pf<type, ncols_dst, 8>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, prefetch, stream);
+                launch_a16k_pf<type, ncols_dst, 8>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, pfmode, stream);
                 break;
             }
             // fallthrough
         default:
-            launch_a16k_pf<type, ncols_dst, 4>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, prefetch, stream);
+            launch_a16k_pf<type, ncols_dst, 4>(vx, aq, ys, yd, dst, nblocks, nrows_x, stride_row_x, stride_col_dst, nwarps, pfmode, stream);
             break;
     }
 }

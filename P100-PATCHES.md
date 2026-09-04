@@ -143,6 +143,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 31 | server-ckpt-adopt | host (server) | yes (hybrid/recurrent models, every follow-up request) |
 | 32 | mmvq-q4k-hfma2 | sm_60 (CUDA) | yes (every Q4_K matvec at decode widths 1-8) |
 | 33 | mmvq-k-hfma2 | sm_60 (CUDA) | yes (Q5_K and Q6_K matvec at widths 1-8, IQ4_XS at 4-8) |
+| 34 | mmvq-k-shortk | sm_60 (CUDA) | yes (prefetch mode of the same kernels per type/width and k) |
 
 ### 31 server-ckpt-adopt
 
@@ -261,6 +262,52 @@ Left for later: a layer with an IQ4_XS gate and a Q5_K up converts its activatio
 4-8 (different layouts; a two-slot cache would fix it, ceiling ~1.7% of kernel time), and the
 short-k gap (plan item B4c) now costs all three types.
 
+### 34 mmvq-k-shortk
+
+`ggml/src/ggml-cuda/mmvq-k-f16-sm60.cu` only (+141/-60). Plan item B4c: the HFMA2 K-quant matvec
+ran the model's k=5120 and 6144 tensors (20 and 24 blocks) at 0.74-0.81 of its k=14336 rate.
+Measured first with a new timing tool that runs the in-tree kernel at any (type, k, rows, width)
+(`~/p100-opt/b4c/shape.cpp` on the server; `test-backend-ops perf` only has m=4096 k=14336): the
+gap is a width-1 effect (at widths 4 and 8 the short shapes are as fast as the long ones), it is the
+k loop and not the grid (a 69632-row grid at k=5120 still saturates 24% below k=14336), and a warp
+pays a fixed 0.38 of an 8-block step while the streaming part already runs at 566 GB/s, within 3% of
+the DRAM ceiling. So only the fixed part is addressable, and the existing knobs (rows, nwarps,
+prefetch swept at k=5120/6144) gave at most 3% and never the same setting for two shapes of one type.
+
+The change is a third prefetch mode. The header of a step (the 6-bit scales and mins, or Q6_K's
+int8 scales and d) is only read after the step's accumulation loop, so it can be loaded at the top
+of its own step instead of riding in the prefetch buffer (pf mode 2: 4 registers per row less than
+mode 1, at the price of a load latency covered only by the step's own 8 words). Which side wins is
+decided per type and width by a bitmask (`a16k_pf2_widths`: Q4_K widths 2 and 4, Q5_K 1 and 2,
+Q6_K 2 and 3, IQ4_XS 3 and 4) and at width 1 by the k range (`nblocks < 24`, i.e. the k=5120
+tensors; at k=14336 mode 1 wins by 5-7%). Rows and nwarps are unchanged. Width 1 stays on mode 1
+for Q4_K (a wash: +3.7% at 8704 rows, -2.2% at 5120, +0.1% in the model) and Q6_K (+1% on the short
+shapes, -1.3% on the LM head, which is 77% of the type's bytes). One trap worth recording:
+`-sm tensor` halves the rows each GPU sees, so a rule tuned on full-row shapes can flip sign in the
+model; the width-1 rule was re-measured at per-GPU row counts (`b4c/split.sh`) before it was
+narrowed to Q5_K.
+
+Measured (us per call, new vs `GGML_A16K_SHORTK=0`): at m=4096 k=14336 Q4_K width 2 88.2 vs 95.9
+(+8.1%) and width 4 121.0 vs 127.0 (+4.7%), IQ4_XS width 4 142.2 vs 148.3 (+4.1%), Q6_K width 2
+160.7 vs 164.2 and width 3 178.0 vs 180.7, everything else within noise; at the model's k=5120
+shapes Q5_K width 1 +2.2-4.9%, Q4_K width 2 +6-8%. Model tg 31.72 vs 31.57 t/s at d0 (+0.5%) and
+30.46 vs 30.30 at d16384 (+0.5%), +8.2% / +7.7% cumulative over the int8 path; speculative verify
+widths (`-p 2,4,8 -n 0`) +4.0% at 2 (noisy), +2.1% at 4, unchanged at 8. nsys: Q5_K matvec 928 ->
+898 ms (-3.3%), Q4_K and Q6_K unchanged by design, total tg kernel time -0.5%; the LM head is
+untouched at 1.43 ms per call.
+
+No math change: greedy output is byte-identical to `GGML_A16K_SHORTK=0`, perplexity equals patch
+33's to the last digit (6.2364 / 5.4074), the kill-switch path stays byte-identical to stock. Full
+`test-backend-ops` 14675/14675 on CUDA0 and CUDA1. No spills in the new instantiations.
+
+Kill switch `GGML_A16K_SHORTK=0` (restores the patch 33 configuration exactly); knobs
+`GGML_A16K_SHORTK_NB` (block count below which width 1 takes mode 2, default 24) and `GGML_A16K_PF`
+now accepts 2; `GGML_A16K_LOG=1` prints `pf=`. Not done, with numbers: a half-step pipeline (4 blocks
+per warp step) lost 18-26% because halving the bytes in flight per warp costs more than the shorter
+pipeline drain saves, which is also the argument against the plan's 4-blocks-per-step candidate;
+`__launch_bounds__` min-blocks lost 1-7% and made Q5_K spill; the short-k gap itself stands at
+0.74-0.81 of the long-k rate for everything except Q5_K.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -333,6 +380,8 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_MMVQ_F16_K=1` | 32, 33 | kill switch (HFMA2 K-quant matvec: Q4_K, Q5_K, IQ4_XS, Q6_K; back to the int8 path) |
 | `GGML_CUDA_DISABLE_MMVQ_F16_K_TYPES=q5_K,iq4_xs,...` | 33 | per-type kill switch (comma separated `ggml_type_name` values) |
 | `GGML_A16K_*` | 32, 33 | HFMA2 K-quant kernel tuning (`ROWS`, `NWARPS`, `PF`, `SMALL_GRID`, `NCOLS_MIN/MAX`, `LOG`); `NCOLS_MIN` overrides the per-type minimum (IQ4_XS default 4) |
+| `GGML_A16K_SHORTK=0` | 34 | kill switch (prefetch mode 2 off, patch 33 configuration) |
+| `GGML_A16K_SHORTK_NB=N` (default 24), `GGML_A16K_PF=2` | 34 | width-1 block-count threshold for mode 2; force prefetch mode 2 |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -380,7 +429,7 @@ LCP slot matching in the server.
   overhead and CUDA graphs are not a lever on Pascal. `NCCL_P2P_LEVEL=SYS` is worth +1.5% pp,
   +0.9% tg (NCCL otherwise bounces through host memory). `--load-mode dio` loads in 70 s from the
   HDD vs 4 s for mmap; keep mmap.
-- 2026-09-04, same protocol: with patches 32 and 33 tg is 31.6 t/s at depth 0 and 30.3 at depth
+- 2026-09-04, same protocol: with patches 32-34 tg is 31.7 t/s at depth 0 and 30.5 at depth
   16384 (int8 path 29.3 / 28.2). The Q4_K, Q5_K and Q6_K matvecs run on HFMA2; IQ4_XS stays on
   the int8 path at widths 1-3 (already ~400 GB/s there) and is now the largest tg kernel (21%).
 
@@ -519,3 +568,9 @@ on `qwen35` that the kill switches above do not explain points here first.
   30.3 at d16384. Full `test-backend-ops` 14675/14675 on both cards; perplexity within 0.25% of stock
   at `-ub 1`/`-ub 8` (the int8 path equals stock); greedy identical to stock with the kill switch.
   New per-type kill switch `GGML_CUDA_DISABLE_MMVQ_F16_K_TYPES`.
+- 2026-09-04: local patch 34 (`p100x: 34-mmvq-k-shortk`): prefetch mode 2 (header loaded in its own
+  step) per type and width in the HFMA2 K-quant matvec, chosen with a new any-shape timing tool; tg
+  +0.5% (31.7 t/s at d0, +8.2% over the int8 path), speculative verify widths 2/4 +4% / +2%; no math
+  change (greedy byte-identical to the switch-off path); full `test-backend-ops` 14675/14675 on both
+  cards. Kill switch `GGML_A16K_SHORTK=0`. The short-k gap itself stands (0.74-0.81 of the long-k rate)
+  and a shorter warp step is measured out (-18-26%).
