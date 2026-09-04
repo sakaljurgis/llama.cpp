@@ -142,6 +142,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 |---:|---|---|---|
 | 31 | server-ckpt-adopt | host (server) | yes (hybrid/recurrent models, every follow-up request) |
 | 32 | mmvq-q4k-hfma2 | sm_60 (CUDA) | yes (every Q4_K matvec at decode widths 1-8) |
+| 33 | mmvq-k-hfma2 | sm_60 (CUDA) | yes (Q5_K and Q6_K matvec at widths 1-8, IQ4_XS at 4-8) |
 
 ### 31 server-ckpt-adopt
 
@@ -170,7 +171,8 @@ patch 12 hook, and an activation cache in `common.cuh`. GP100 has no DP4A: patch
 the int8 dot product with 4 `vmad` per 4 MACs, while `__hfma2` does 2 MACs per instruction at
 full rate. Tier 0 showed tg is matvec-bound (`mul_mat_vec_q` 77% of a token at 315 GB/s of a
 603 GB/s ceiling), so a Q4_K matvec on HFMA2 is the lever; patch 12 does the same for Q4_1,
-which no K-quant model uses.
+which no K-quant model uses. Patch 33 renamed these files to `mmvq-k-f16-sm60.cu/.cuh` and
+generalized them to Q5_K, IQ4_XS and Q6_K; the Q4_K path is unchanged.
 
 The kernel expands the nibbles to half2 with LOP3 magic constants, accumulates one half2 per
 sub-block, applies the 6-bit scales and mins in half and sums the blocks in FP32. The
@@ -198,6 +200,66 @@ takes a different continuation at a near-tied token.
 Kill switch `GGML_CUDA_DISABLE_MMVQ_F16_K=1` (restores the int8 path exactly); tuning knobs
 `GGML_A16K_ROWS`, `GGML_A16K_NWARPS`, `GGML_A16K_PF`, `GGML_A16K_SMALL_GRID`,
 `GGML_A16K_NCOLS_MIN`, `GGML_A16K_NCOLS_MAX`, `GGML_A16K_LOG=1`.
+
+### 33 mmvq-k-hfma2
+
+`ggml/src/ggml-cuda/mmvq-k-f16-sm60.cu/.cuh` (patch 32's `mmvq-q4k-f16-sm60.cu/.cuh` renamed and
+generalized), the hook in `ggml_cuda_mul_mat_vec_q` and the `a16k` activation cache in `common.cuh`
+(its key gains an activation layout id). Extends the HFMA2 matvec of patch 32 to the other quant
+types of the UD-Q4_K_M: Q5_K (24.7% of its tg kernel time), IQ4_XS (19.4%) and Q6_K (9.0%, mostly
+`output.weight`, the 1 GB LM head at k=5120). Kernel, launcher and quantizer take a `ggml_type`
+template parameter with a small per-type traits struct; the Q4_K arm keeps patch 32's exact
+instruction sequence and its numbers to 0.1 us.
+
+Per type. Q5_K has the Q4_K header and qs order plus a 32 B high-bit plane: every lane loads the
+plane (the L1 serves 3 of the 4 lanes of a block), one funnel-shift rotate per pair puts the bit at
+mantissa bit 4 (low nibble) or 8 (high nibble) and the existing LOP3 folds it in, 8 instructions more
+per 8 weights (24% of the width-1 kernel time). IQ4_XS blocks are 8 B aligned (136 B), so header and
+qs are LDG.64; each 16 B run of qs is one 32-element sub-block (low nibbles 0-15, high 16-31), so the
+quantizer has a second activation layout and the two accumulators split the words 4+4; the values
+come from `kvalues_iq4nl`, held biased by 128 in 4 registers and resolved with the `__byte_perm`
+trick of `get_int_from_table_16`, then one more `__byte_perm` inserts the 0x64 high byte (16
+instructions per 8 weights against 5 for Q4_K). Q6_K blocks are 2 B aligned (210 B), so every
+32-bit word is two aligned loads and a funnel shift by a per-row constant (20 load instructions per
+block against 3 for Q4_K); lane g takes the format's natural group (`ql[l]`, `ql[l+32]`, `qh[l]` of
+half g>>1, l in the 16-run g&1), so the four lanes read ql and qh once between them, holds 4
+sub-block accumulators and applies the int8 scales in half; the -32 sits in the magic constant.
+
+Per-type defaults from a rows x prefetch sweep at every width: prefetch to width 2 for Q4_K/Q5_K
+and to width 4 for IQ4_XS/Q6_K; rows 2 at width 1 and 4 above, except Q5_K at width 8, IQ4_XS at
+widths 2-3 and Q6_K at widths 4 and 8 (2 rows). Two warps per block win 6-7% for Q6_K at widths 1-3
+on the 56-block test shape but lose 0.4% tg in the model (k=5120 leaves 20 blocks to split), so the
+grid rule of patch 32 stays. IQ4_XS runs the new path only from width 4 up: its int8 matvec already
+reaches 399 GB/s at width 1 on GP100 (78 us on 4096x14336, 70% of the measured DRAM ceiling,
+against 317 GB/s for int8 Q4_K), the best HFMA2 config is 6% slower there and enabling it costs
+4.8% tg in the model. Beating it needs a different kernel structure, not a better table.
+
+Measured (test-backend-ops perf, 4096x14336, us per call, new vs the same binary with that type on
+the int8 path): Q5_K width 1 96.9 vs 131.4 (1.36x, 417 GB/s of weights), 2 121.4 vs 199.4, 3 144.4
+vs 264.7, 4 148.3 vs 318.8, 5 166.4 vs 412.1, 8 291.9 vs 659.7 (up to 2.48x); Q6_K width 1 147.5 vs
+206.3 (1.40x, 327 GB/s), 2 164.2 vs 221.6, 3 180.8 vs 248.9, 4 215.1 vs 290.9, 5 200.6 vs 365.7, 8
+342.3 vs 499.1 (up to 1.82x); IQ4_XS width 4 148.1 vs 162.4, 5 158.0 vs 259.0, 8 228.6 vs 434.5
+(1.10x-1.90x). Model tg on Qwen3.8-27B-UD-Q4_K_M (`-sm tensor -fa on`, tg64, two alternating passes):
+31.57 t/s at d0 and 30.28 at d16384, against 30.02 / 28.77 with patch 32 alone and 29.30 / 28.23 on
+the int8 path: +5.2% over patch 32 at both depths, +7.8% / +7.3% over the int8 path. Per type at d0:
+Q5_K +3.0%, Q6_K +2.1%, IQ4_XS 0 at width 1 by design. nsys over 64 tokens: the Q5_K matvec 1061 ->
+931 ms (1.14x in-model, the k=5120/6144 shapes again), Q6_K 385 -> 295 ms (1.30x), total tg kernel
+time 4308 ms before patch 32 -> 3983 ms (-7.5%); IQ4_XS is now the largest kernel (841 ms, 21.1%).
+
+Math change as in 32. Perplexity (wiki.test.raw, `-c 2048 -b 2048`, `-ub 1` over 4 chunks and
+`-ub 8` over 10): new 6.2364 / 5.4074, int8 path 6.2431 / 5.3942 = stock to the last digit, i.e.
+-0.11% / +0.25%. Greedy (256 tokens): the kill-switch path is byte-identical to stock; the new path
+diverges after the same 76 words as patch 32's Q4_K-only path. Full `test-backend-ops` 14675/14675
+on CUDA0 and on CUDA1. No spills in the default configs (Q6_K width 7 with 4 rows spills 48 B and is
+not in the perf set; the width 6-7 defaults are interpolated).
+
+Kill switches `GGML_CUDA_DISABLE_MMVQ_F16_K=1` (all types, exact int8 path) and
+`GGML_CUDA_DISABLE_MMVQ_F16_K_TYPES=q5_K,iq4_xs,q6_K,q4_K` (comma separated `ggml_type_name`
+values, per type). Knobs as in 32; `GGML_A16K_NCOLS_MIN` now overrides the per-type minimum
+(`GGML_A16K_NCOLS_MIN=1` forces IQ4_XS on at width 1), `GGML_A16K_LOG=1` prints the type.
+Left for later: a layer with an IQ4_XS gate and a Q5_K up converts its activations twice at widths
+4-8 (different layouts; a two-slot cache would fix it, ceiling ~1.7% of kernel time), and the
+short-k gap (plan item B4c) now costs all three types.
 
 ### Meta backend gist
 
@@ -268,8 +330,9 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_FUSION=1` | upstream | disables all CUDA fusion, including the patched rules of 18, 19, 20, 23, 24, 27 |
 | `LLAMA_GRAPH_REUSE_DISABLE=1` | upstream | disables graph reuse (28.9 -> 18.1 t/s tg here, -27%; pp unchanged) |
 | `LLAMA_SERVER_CKPT_LEGACY=1` | 31 | upstream checkpoint placement (3 checkpoints + 3 decodes per follow-up) |
-| `GGML_CUDA_DISABLE_MMVQ_F16_K=1` | 32 | kill switch (Q4_K HFMA2 matvec, back to the int8 path) |
-| `GGML_A16K_*` | 32 | Q4_K HFMA2 kernel tuning (`ROWS`, `NWARPS`, `PF`, `SMALL_GRID`, `NCOLS_MIN/MAX`, `LOG`) |
+| `GGML_CUDA_DISABLE_MMVQ_F16_K=1` | 32, 33 | kill switch (HFMA2 K-quant matvec: Q4_K, Q5_K, IQ4_XS, Q6_K; back to the int8 path) |
+| `GGML_CUDA_DISABLE_MMVQ_F16_K_TYPES=q5_K,iq4_xs,...` | 33 | per-type kill switch (comma separated `ggml_type_name` values) |
+| `GGML_A16K_*` | 32, 33 | HFMA2 K-quant kernel tuning (`ROWS`, `NWARPS`, `PF`, `SMALL_GRID`, `NCOLS_MIN/MAX`, `LOG`); `NCOLS_MIN` overrides the per-type minimum (IQ4_XS default 4) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -317,6 +380,9 @@ LCP slot matching in the server.
   overhead and CUDA graphs are not a lever on Pascal. `NCCL_P2P_LEVEL=SYS` is worth +1.5% pp,
   +0.9% tg (NCCL otherwise bounces through host memory). `--load-mode dio` loads in 70 s from the
   HDD vs 4 s for mmap; keep mmap.
+- 2026-09-04, same protocol: with patches 32 and 33 tg is 31.6 t/s at depth 0 and 30.3 at depth
+  16384 (int8 path 29.3 / 28.2). The Q4_K, Q5_K and Q6_K matvecs run on HFMA2; IQ4_XS stays on
+  the int8 path at widths 1-3 (already ~400 GB/s there) and is now the largest tg kernel (21%).
 
 ## Updating to a new upstream
 
@@ -447,3 +513,9 @@ on `qwen35` that the kill switches above do not explain points here first.
   identical to stock with the kill switch, diverges after 76 words without it. Full `test-backend-ops`
   14675/14675 on CUDA1 and 14674/14675 on CUDA0 (the known q4_1 width-1 tolerance case, passes
   alone and on stock). Kill switch `GGML_CUDA_DISABLE_MMVQ_F16_K=1`.
+- 2026-09-04: local patch 33 (`p100x: 33-mmvq-k-hfma2`): the HFMA2 matvec of 32 generalized to
+  Q5_K, IQ4_XS (widths 4-8 only, its int8 path already runs at 400 GB/s) and Q6_K; files renamed to
+  `mmvq-k-f16-sm60.cu/.cuh`. tg 30.0 -> 31.6 t/s at d0 (+5.2%; +7.8% over the int8 path), 28.8 ->
+  30.3 at d16384. Full `test-backend-ops` 14675/14675 on both cards; perplexity within 0.25% of stock
+  at `-ub 1`/`-ub 8` (the int8 path equals stock); greedy identical to stock with the kill switch.
+  New per-type kill switch `GGML_CUDA_DISABLE_MMVQ_F16_K_TYPES`.
