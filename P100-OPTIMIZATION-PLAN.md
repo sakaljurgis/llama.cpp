@@ -1081,13 +1081,13 @@ Keep mmap.
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
 | A8 | MMVQ column-chunk loop for 9-64 columns on sm_60 | 28-token decode ~390 -> ~150 ms per follow-up; speculative widths > 8 | J4 numbers |
 | J4b | make the 150 MiB checkpoint save faster (288 shard copies + sync each, 200 ms vs 37 ms restore) | ~150 ms per follow-up | J4 |
-| B4c | Q4_K HFMA2 kernel at short k: 4 blocks per warp step or 2 warps when nblocks < 32 (launcher-level; `~/p100-opt/log/B4-notes.md`) | k=5120 shapes 373 -> ~450 GB/s, ~+1% tg | B4 |
+| B4c | HFMA2 K-quant kernels at short k (Q4_K, Q5_K, Q6_K since B4b): 4 blocks per warp step or 2 warps when nblocks < 32 (launcher-level; `~/p100-opt/log/B4-notes.md`, `B4b-notes.md`) | in-model 1.21x / 1.14x / 1.30x against 1.49x / 1.36x / 1.40x at k=14336; the Q6_K LM head (k=5120, 1 GB per token) is the largest single kernel affected; ~+3% tg | B4 B4b |
 
 ### Tier 2: medium changes (design note to the user first, 2-5 days each)
 
 | Item | Change | Expected | Depends on |
 |---|---|---|---|
-| B4b | HFMA2 matvec for Q5_K (Q4_K scale block plus one high-bit plane, same kernel structure), then IQ4_XS (16-entry table instead of the LOP3 magic), then Q6_K | up to ~+15% tg on the UD-Q4_K_M if each type reaches the Q4_K kernel's 1.2-1.5x in-model | B4 |
+| B4b | DONE 2026-09-04 as `p100x: 33-mmvq-k-hfma2`: Q5_K 1.36x and Q6_K 1.40x at width 1 per call (1.14x / 1.30x in-model, short k again), IQ4_XS only from width 4 (its int8 path already runs at 400 GB/s, see What not to do); tg 30.0 -> 31.6 t/s at d0 (+5.2%; +7.8% over the int8 path), 28.8 -> 30.3 at d16384 | left: two-slot `a16k` cache for mixed-type gate/up pairs at widths 4-8 (~1.7% of kernel time), width 6-7 defaults interpolated | B4 |
 | G3 | per-subgraph CUDA graph cache so `-sm tensor` can use graphs | the bulk of the launch-bound share found in G1 | G2 success |
 | C2 | retune the Pascal FP16 tile table (D=128, D=256) | +5-15% tg and pp at 32k+ | C1 |
 | C3 | VEC for GQA tg on Pascal with a KV-length threshold | measured per KV length | C1 |
@@ -1116,6 +1116,10 @@ Keep mmap.
 - Do not try quantized KV, `-sm row`, `GGML_CUDA_FORCE_MMQ`, `GGML_CUDA_PEER_MAX_BATCH_SIZE`,
   or unified memory; the reasons are in Part 2.
 - Do not add tests under `tests/`; use `test-backend-ops` cases and the protocol in section 4.
+- Do not retry the IQ4_XS HFMA2 matvec at widths 1-3 with a better table lookup (B4b, 2026-09-04):
+  its int8 path already runs at ~400 GB/s on GP100 (70% of the DRAM ceiling, 78 us on 4096x14336),
+  the best HFMA2 config (16 instructions per 8 weights) is 6% slower there and costs 4.8% tg in the
+  model. A win needs a different kernel structure, not a better table.
 
 ## 4. Measurement and validation protocol
 
