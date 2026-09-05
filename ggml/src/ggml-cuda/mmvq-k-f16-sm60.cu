@@ -67,6 +67,7 @@
 // qh word serves both the low and the high nibble half of a byte pair: 11 instructions per 8 weights.
 
 #include "mmvq-k-f16-sm60.cuh"
+#include "mmvq.cuh" // A8: the shared column-chunk ceiling and split
 
 #include <cstdio>
 #include <cstdlib>
@@ -786,9 +787,13 @@ bool ggml_cuda_mmvq_k_f16_sm60_supported(
         return false;
     }
     static const int env_ncols_min = a16k_env_int("GGML_A16K_NCOLS_MIN", 0);
-    static const int ncols_max     = a16k_env_int("GGML_A16K_NCOLS_MAX", 8);
+    static const int env_ncols_max = a16k_env_int("GGML_A16K_NCOLS_MAX", 0);
     const int ncols_min = env_ncols_min > 0 ? env_ncols_min : a16k_ncols_min(src0->type);
-    if (src1->ne[1] < ncols_min || src1->ne[1] > ncols_max || src1->ne[1] > 8) {
+    // A8: above 8 columns the kernel is launched once per chunk (ggml_cuda_mmvq_k_f16_sm60), so the
+    // ceiling here is the one the dispatch gate applied.  With GGML_CUDA_MMVQ_MAX_COLS_SM60=8 (or
+    // on any other arch) it is 8 and this is the pre-A8 gate.  GGML_A16K_NCOLS_MAX still caps it.
+    const int ncols_max = env_ncols_max > 0 ? env_ncols_max : ggml_cuda_mmvq_max_cols_sm60(src0->type, cc);
+    if (src1->ne[1] < ncols_min || src1->ne[1] > ncols_max) {
         return false;
     }
     if (!ggml_is_contiguous(dst)) {
@@ -1017,20 +1022,37 @@ void ggml_cuda_mmvq_k_f16_sm60(
     const int stride_row_x   = src0->nb[1]/ggml_type_size(src0->type);
     const int stride_col_dst = dst->nb[1]/ggml_type_size(dst->type);
 
-#define A16K_CASE(T, N) case N: launch_a16k<T, N>(src0->data, aq, ys, yd, (float *) dst->data, nblocks, ne01, stride_row_x, stride_col_dst, stream); break;
+    // A8: column strides of the three parts of the activation cache, so a chunk of at most 8
+    // columns can be handed to the kernel without re-quantizing anything.  They are the strides
+    // the kernel itself uses (stride_col_aq, stride_col_ys and nblocks for yd).
+    const size_t stride_col_aq = (size_t) nb_pad*32;
+    const size_t stride_col_ys = (size_t) nblocks*4;
+
+#define A16K_CASE(T, N) case N: launch_a16k<T, N>(src0->data, aq_c, ys_c, yd_c, dst_c, nblocks, ne01, stride_row_x, stride_col_dst, stream); break;
 #define A16K_CASES(T)                                             \
-    switch (ne11) {                                               \
+    switch (cols) {                                               \
         A16K_CASE(T, 1) A16K_CASE(T, 2) A16K_CASE(T, 3)           \
         A16K_CASE(T, 4) A16K_CASE(T, 5) A16K_CASE(T, 6)           \
         A16K_CASE(T, 7) A16K_CASE(T, 8)                           \
         default: GGML_ABORT("unsupported ncols_dst");              \
     }
-    switch (src0->type) {
-        case GGML_TYPE_Q4_K: A16K_CASES(GGML_TYPE_Q4_K) break;
-        case GGML_TYPE_Q5_K: A16K_CASES(GGML_TYPE_Q5_K) break;
-        case GGML_TYPE_IQ4_XS: A16K_CASES(GGML_TYPE_IQ4_XS) break;
-        case GGML_TYPE_Q6_K: A16K_CASES(GGML_TYPE_Q6_K) break;
-        default: GGML_ABORT("unsupported type");
+    // One launch per column chunk; ne11 <= 8 is a single chunk of ne11 columns, i.e. unchanged.
+    const int nchunks = ggml_cuda_mmvq_cols_nchunks(ne11);
+    int64_t   c0      = 0;
+    for (int i = 0; i < nchunks; ++i) {
+        const int     cols  = nchunks == 1 ? (int) ne11 : ggml_cuda_mmvq_cols_chunk(ne11, nchunks, i);
+        const int4  * aq_c  = aq + (size_t) c0*stride_col_aq;
+        const half2 * ys_c  = ys + (size_t) c0*stride_col_ys;
+        const float * yd_c  = yd + (size_t) c0*nblocks;
+        float       * dst_c = (float *) dst->data + (size_t) c0*stride_col_dst;
+        switch (src0->type) {
+            case GGML_TYPE_Q4_K: A16K_CASES(GGML_TYPE_Q4_K) break;
+            case GGML_TYPE_Q5_K: A16K_CASES(GGML_TYPE_Q5_K) break;
+            case GGML_TYPE_IQ4_XS: A16K_CASES(GGML_TYPE_IQ4_XS) break;
+            case GGML_TYPE_Q6_K: A16K_CASES(GGML_TYPE_Q6_K) break;
+            default: GGML_ABORT("unsupported type");
+        }
+        c0 += cols;
     }
 #undef A16K_CASES
 #undef A16K_CASE
