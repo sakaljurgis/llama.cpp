@@ -428,6 +428,8 @@ Items:
   dequantize chunk, GEMM chunk into the matching rows of dst. Same math, same output. Gain: not
   speed, it removes the OOM and frees ~1.3 GB per card of pool headroom that today has to be
   held back via `--ctx-size`. That headroom is worth context or a second slot. Effort: medium.
+  Note 2026-09-05: at 9-64 columns A8 (patch 35) routes the LM head through the matvec loop, so
+  the F16 copy is no longer allocated there; A4 still matters at `-ub 2048`.
   Risk: medium (batched GEMM variants `ne12/ne13 > 1` must keep the non-chunked path). Kill
   switch: the env var at 0.
 - A5 Keep the weight F16 copy across the ubatches of one prompt: with `-b 2048 -ub 512` the same
@@ -440,7 +442,8 @@ Items:
   `-ub 512/2048`. Expected: slower than cuBLAS F16 (int8 dot via 4x `vmad` per `dp4a`, ~0.6 MAC per
   instruction vs 2 MAC per HFMA2), but it uses no F16 temporary, so record it as the memory-saving
   fallback number. No commit unless it wins.
-- A8 Small batches (9-64 columns) without the full dequant: measured 2026-09-03 (J4 notes), a
+- A8 DONE 2026-09-05 (`p100x: 35-mmvq-cols-sm60`, numbers in the Tier 1 table and P100-PATCHES.md 35).
+  Original item: Small batches (9-64 columns) without the full dequant: measured 2026-09-03 (J4 notes), a
   28-token follow-up decode costs ~390 ms on the cuBLAS path (every weight matrix dequantized to
   F16 per call), while 8 columns through MMVQ cost ~35 ms. Loop MMVQ over column chunks of 8 for
   `ne11` 9..N on sm_60 (or raise the sm_60 MMVQ ceiling if the kernel allows) and find the
@@ -950,7 +953,8 @@ Items:
   checkpoint" / "created context checkpoint" lines in J1; if reprocessing from a checkpoint shows
   up on follow-ups, lower `--checkpoint-min-step` (more checkpoints, each costing a ~100 MB
   state copy during pp) and measure.
-- J5 Speculative decoding (revisit after A4 and G):
+- J5 Speculative decoding (revisit after A4 and G): note 2026-09-05: with A8 verify widths 9-64 cost 1.1-3.9x less
+  (a draft of 15 runs at 107 t/s instead of 37), widths 2-8 unchanged;
   - MTP (`draft-mtp`): the untested `--draft-p-min 0` (constant verify width 5 keeps graph reuse
     at ~100%; measured today ~10% reuse with p-min 0.75 and 15-20 ms per miss). Keep the verify
     width <= 8 (`--spec-draft-n-max 7` or less) until A4 lands, or the LM head F16 copy OOMs.
@@ -1079,7 +1083,7 @@ Keep mmap.
 | I1 | prefilter condition vs suppress tokens | up to 2% tg if the prefilter was off | I1 measurement |
 | A2 | vectorized dequant for Q4_K/Q6_K | 2-10% pp at small `-ub`, ~1% at 2048 | A1 |
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
-| A8 | MMVQ column-chunk loop for 9-64 columns on sm_60 | 28-token decode ~390 -> ~150 ms per follow-up; speculative widths > 8 | J4 numbers |
+| A8 | DONE 2026-09-05 as `p100x: 35-mmvq-cols-sm60`: loop the matvec over balanced column chunks (target 7, floor 6) for 9..N columns on GP100, per-type ceiling Q4_K 64, Q5_K 48, Q6_K 32, IQ4_XS 64, int8 32; pp9 3.87x, pp16 2.84x, pp28 2.30x, pp32 1.93x, pp48 1.43x, pp64 1.12x, unchanged at 96 and above; the 25k-chat follow-up prompt phase 710 -> 434 ms and the request 1.34 -> 1.07 s; tg and pp2048 unchanged | the LM head F16 copy is gone at these widths (small-batch half of A4); J4b is now the larger half of a follow-up; verify widths 9-64 are 1.1-3.9x cheaper (J5) | J4 |
 | J4b | make the 150 MiB checkpoint save faster (288 shard copies + sync each, 200 ms vs 37 ms restore) | ~150 ms per follow-up | J4 |
 | B4c | DONE 2026-09-04 as `p100x: 34-mmvq-k-shortk`: prefetch mode 2 (header loaded in its own step) per type and width, at width 1 only for Q5_K below 24 blocks; tg +0.5% (31.7 t/s at d0), speculative verify widths 2/4 +4% / +2%; measured with a new any-shape timing tool (`~/p100-opt/b4c/shape.cpp`) that Area B work should use from now on | the gap itself stands: k=5120 runs at 0.74-0.81 of the k=14336 rate, the streaming part is within 3% of the DRAM ceiling and only a fixed 0.38 step per warp is addressable; a shorter warp step is measured out (see What not to do); the LM head was already at its ceiling | B4 B4b |
 
