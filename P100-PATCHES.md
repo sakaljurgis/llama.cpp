@@ -144,6 +144,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 32 | mmvq-q4k-hfma2 | sm_60 (CUDA) | yes (every Q4_K matvec at decode widths 1-8) |
 | 33 | mmvq-k-hfma2 | sm_60 (CUDA) | yes (Q5_K and Q6_K matvec at widths 1-8, IQ4_XS at 4-8) |
 | 34 | mmvq-k-shortk | sm_60 (CUDA) | yes (prefetch mode of the same kernels per type/width and k) |
+| 35 | mmvq-cols-sm60 | sm_60 (CUDA) | yes (every quantized MUL_MAT of 9-64 columns: follow-up re-decodes, speculative verify above 8) |
 
 ### 31 server-ckpt-adopt
 
@@ -308,6 +309,80 @@ pipeline drain saves, which is also the argument against the plan's 4-blocks-per
 `__launch_bounds__` min-blocks lost 1-7% and made Q5_K spill; the short-k gap itself stands at
 0.74-0.81 of the long-k rate for everything except Q5_K.
 
+### 35 mmvq-cols-sm60
+
+`ggml/src/ggml-cuda/mmvq.cu`, `mmvq.cuh` and `mmvq-k-f16-sm60.cu` (+142/-15). Plan item A8,
+dispatch only: no kernel is changed. GP100 has no DP4A, so `ggml_cuda_should_use_mmq` refuses
+every dense quantized `MUL_MAT` and everything wider than `MMVQ_MAX_BATCH_SIZE` (8) is dequantized
+to F16 and multiplied by cuBLAS. Measured first at the model's per-GPU shapes with a copy of the
+B4c shape tool (`~/p100-opt/a8/`): the step at 9 columns is 8.0x (Q4_K 5120x8704: 176 us at width 8,
+1409 us at width 9, for 12.5% more work), and from there cuBLAS is nearly flat to 64 columns,
+because what it spends is the dequantization of the whole weight matrix plus the F16 round trip and
+not the GEMM. The matvec costs 8-64 us per column depending on type and shape, so a loop of column
+chunks stays cheaper until the chunk count catches up; the crossover is 105-133 columns for Q4_K,
+89-113 for Q5_K, 94-120 for IQ4_XS, 60-104 for Q6_K and 43-51 for the int8 path (Q3_K).
+
+The change is a loop over column chunks in the two matvec host entries plus one branch in the gate.
+`ggml_cuda_should_use_mmvq` gets an sm_60 arm (`cc == GGML_CUDA_CC_PASCAL`, 600 exactly, so sm_61
+with its DP4A and MMQ is untouched) returning `ne11 <= ggml_cuda_mmvq_max_cols_sm60(type)`, a
+per-type ceiling. `ggml_cuda_mul_mat_vec_q` quantizes the activations once for all `ne11` columns
+as before and then calls `mul_mat_vec_q_switch_type` once per chunk with the src1 and dst column
+offsets; `ggml_cuda_mmvq_k_f16_sm60` does the same around its width `switch`, offsetting the three
+parts of the a16k activation cache. `MMVQ_MAX_BATCH_SIZE` itself, `get_mmvq_mmid_max_batch`, the
+`ids` asserts and every other architecture are unchanged, and `mul_mat_id` never enters the loop.
+
+The split is `ceil(ncols/7)` nearly equal chunks, not 8 columns until the remainder: the kernel's
+cost per column has its minimum at width 5-7 because the width-8 configuration needs the most
+registers per row, and 28 columns as 7+7+7+7 cost 552 us against 624 us as 8+8+8+4 (Q4_K
+5120x8704). It has a floor, though: when that split would put a chunk below 6 columns the fewest
+chunks are taken instead, because a narrow chunk costs more in the model than the per-call time of
+the kernels suggests (16 columns as 8+8 spend 8% less matvec kernel time in nsys than as 6+5+5,
+and 8% more pp; the per-call table has 6+5+5 0.3% ahead; the mechanism is not explained). The
+floor moves only n = 15, 16, 22, 23 and 29.
+
+Ceilings (measured, per type): Q4_K 64, Q5_K 48, Q6_K 32, IQ4_XS 64, everything else 32. Each is
+the largest width at which the loop still won on every per-GPU shape of the model, cross-checked
+with `llama-bench`, which is slightly more favourable to the loop than the per-call table (Q3_K at
+32 is a wash per call but 5% faster than cuBLAS in the model, so 32 and not 28).
+
+Measured (`llama-bench -m $MODEL_Q4 -ngl 99 -sm tensor -fa on -b 2048 -ub 2048 -p <w> -n 0 -r 5`,
+pp t/s, new against `GGML_CUDA_MMVQ_MAX_COLS_SM60=8`):
+
+    width      9    12    15    16    22    23    24    28    29    32    48    64    96   128
+    old    23.5  30.7  37.2  39.6  44.2  46.1  48.0  55.9  57.3  62.8  90.5 117.2 130.9 217.0
+    new    90.7 110.2 107.2 112.6 116.3 114.6 119.8 128.3 121.6 121.3 129.2 131.6 130.9 218.8
+    x      3.87  3.59  2.88  2.84  2.63  2.49  2.50  2.30  2.12  1.93  1.43  1.12  1.00  1.01
+
+tg and pp2048 do not move (tg64 31.54-31.72 t/s in both arms, pp2048 420.5-421.3 in both, pp8
+unchanged). Per call the loop is 3.1-7.6x at 9 columns, 2.0-3.4x at 28 and 0.7-1.5x at 64
+depending on the type, Q4_K best and the int8 path worst. nsys at pp28: total GPU kernel time
+3999 -> 1768 ms, the 2457 ms of `maxwell_hgemm_128x64_tn` and the 1268 ms of `dequantize_block_*`
+replaced by 1329 ms of `mul_mat_vec_k_a16` and 198 ms of `mul_mat_vec_q`. End to end (the J4
+harness, a 23570-token chat and 10 follow-ups, each a 32-token re-decode): prompt phase 709.7 ->
+434.3 ms (1.63x), whole request 1.344 -> 1.074 s (-20%), the 16 generated tokens unchanged at 528
+vs 531 ms, the first 23570-token request unchanged at 66.3 vs 66.0 s. At these widths the Q6_K
+LM head no longer allocates its 1.27 GB F16 copy per call (the small-batch half of plan item A4).
+
+The result differs numerically from cuBLAS F16 at widths 9 to the ceiling (F16 or int8 activations
+instead of an F16 GEMM with F32 accumulation), the same trade patches 32-34 make at widths 1-8.
+Perplexity (wiki.test.raw, `-c 2048 --chunks 10`): -ub 16 5.4074 against stock 5.4076 (-0.004%),
+-ub 32 5.4069 against 5.4267 (-0.36%), -ub 64 5.4292 against 5.4247 (+0.083%); the kill switch at
+-ub 32 gives 5.4267, stock to four decimals. 256 greedy tokens are byte-identical between new and
+old at -ub 512 and at -ub 16, so A8 does not move the sampled tokens on that prompt at all; the
+branch's divergence from stock at word 76 is patch 32/33 and disappears with
+`GGML_CUDA_DISABLE_MMVQ_F16_K=1` on top of the kill switch. Full `test-backend-ops` 14675/14675 on
+CUDA0 and CUDA1.
+
+Kill switch `GGML_CUDA_MMVQ_MAX_COLS_SM60=8` (or `=0`): every type goes back to 8, the a16k width
+gate is the pre-A8 one and both loops run exactly once with no offset, i.e. the launches of
+27d6d7876. Values below 8 are clamped to 8. Knobs: `GGML_CUDA_MMVQ_COLS_CHUNK=N` (2-8, default 7)
+sets the target chunk width and with it the floor (N-1), so 8 means "fewest chunks";
+`GGML_CUDA_MMVQ_COLS_LOG=1` prints the first 32 chunked calls. Not done, with numbers: a per-type
+chunk width (Q6_K and Q3_K want 8, the others 7, worth 3-17% on their share of the bytes, left as
+one global rule); a ceiling above the values above, which loses at 96 and 128 columns (a uniform
+1024 costs 38% of pp128); and Q4_1, whose dedicated HFMA2 kernel still stops at 8 columns, so its
+wider batches take the int8 chunk loop.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -382,6 +457,8 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_A16K_*` | 32, 33 | HFMA2 K-quant kernel tuning (`ROWS`, `NWARPS`, `PF`, `SMALL_GRID`, `NCOLS_MIN/MAX`, `LOG`); `NCOLS_MIN` overrides the per-type minimum (IQ4_XS default 4) |
 | `GGML_A16K_SHORTK=0` | 34 | kill switch (prefetch mode 2 off, patch 33 configuration) |
 | `GGML_A16K_SHORTK_NB=N` (default 24), `GGML_A16K_PF=2` | 34 | width-1 block-count threshold for mode 2; force prefetch mode 2 |
+| `GGML_CUDA_MMVQ_MAX_COLS_SM60=8` | 35 | kill switch (per-type MMVQ column ceiling on GP100; 8 or 0 = upstream `ne11 <= 8`, values below 8 clamped) |
+| `GGML_CUDA_MMVQ_COLS_CHUNK=N` (2-8, default 7), `GGML_CUDA_MMVQ_COLS_LOG=1` | 35 | target chunk width of the column split (floor N-1; 8 = fewest chunks); log the first 32 chunked calls |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -574,3 +651,10 @@ on `qwen35` that the kill switches above do not explain points here first.
   change (greedy byte-identical to the switch-off path); full `test-backend-ops` 14675/14675 on both
   cards. Kill switch `GGML_A16K_SHORTK=0`. The short-k gap itself stands (0.74-0.81 of the long-k rate)
   and a shorter warp step is measured out (-18-26%).
+- 2026-09-05: local patch 35 (`p100x: 35-mmvq-cols-sm60`): MMVQ column-chunk loop for 9-64 columns on
+  GP100 (dispatch only, no kernel change): balanced chunks of about 7 columns over the activations
+  quantized once, per-type ceiling Q4_K 64, Q5_K 48, Q6_K 32, IQ4_XS 64, int8 32, above which dequant +
+  cuBLAS stays. pp9 3.87x, pp16 2.84x, pp28 2.30x, pp32 1.93x, pp48 1.43x, pp64 1.12x, unchanged at 96+;
+  the 25k-chat follow-up prompt phase 710 -> 434 ms (request 1.34 -> 1.07 s); tg and pp2048 unchanged.
+  Perplexity within 0.36% of stock at `-ub 16/32/64`; greedy byte-identical new vs old; full
+  `test-backend-ops` 14675/14675 on both cards. Kill switch `GGML_CUDA_MMVQ_MAX_COLS_SM60=8`.

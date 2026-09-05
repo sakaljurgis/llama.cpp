@@ -309,6 +309,65 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// A8.  Per-type column ceiling for MMVQ on GP100: the chunk loop costs a fixed amount per column
+// while dequant + cuBLAS costs a nearly width-independent constant (at 9 columns Q4_K 5120x8704
+// takes 1409 us against 176 us for the width-8 matvec), so there is a crossover and it is type
+// dependent.  Each value below is the largest width at which the loop still won on every shape of
+// the model measured for that type (~/p100-opt/a8/table.sh, per-GPU row counts; the crossovers
+// themselves are 105-133 for Q4_K, 89-113 for Q5_K, 60-104 for Q6_K, 94-120 for IQ4_XS and 43-51
+// for the int8 path), cross-checked with llama-bench on the model.  The int8 value is measured on
+// Q3_K, where 32 is a wash per call but 5% faster than cuBLAS in the model.
+#define A8_COLS_CHUNK        7 // target columns per chunk; a chunk is never narrower than this - 1
+#define A8_MAX_COLS_Q4_K    64
+#define A8_MAX_COLS_Q5_K    48
+#define A8_MAX_COLS_Q6_K    32
+#define A8_MAX_COLS_IQ4_XS  64
+#define A8_MAX_COLS_INT8    32
+
+static int mmvq_max_cols_sm60_default(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:   return A8_MAX_COLS_Q4_K;
+        case GGML_TYPE_Q5_K:   return A8_MAX_COLS_Q5_K;
+        case GGML_TYPE_Q6_K:   return A8_MAX_COLS_Q6_K;
+        case GGML_TYPE_IQ4_XS: return A8_MAX_COLS_IQ4_XS;
+        default:               return A8_MAX_COLS_INT8;
+    }
+}
+
+int ggml_cuda_mmvq_max_cols_sm60(const enum ggml_type type, const int cc) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc != GGML_CUDA_CC_PASCAL) {
+        return MMVQ_MAX_BATCH_SIZE;
+    }
+    static const char * env     = getenv("GGML_CUDA_MMVQ_MAX_COLS_SM60");
+    static const int    env_max = env ? atoi(env) : -1;
+
+    const int max_cols = env_max >= 0 ? env_max : mmvq_max_cols_sm60_default(type);
+    return max_cols < MMVQ_MAX_BATCH_SIZE ? MMVQ_MAX_BATCH_SIZE : max_cols;
+}
+
+// A8.  The kernel's cost per column is not monotonic in the width: the width-8 configuration needs
+// the most registers per row, so a chunk of A8_COLS_CHUNK columns is the cheapest way to move a
+// column and ceil(ncols/A8_COLS_CHUNK) nearly equal chunks beat 8 columns until the remainder (28
+// columns as 7+7+7+7 cost 552 us against 624 us as 8+8+8+4 on Q4_K 5120x8704).  Chunks narrower
+// than that are the other way round, and by more than the per-call time of the kernels says: at 16
+// columns 8+8 costs 8% less matvec kernel time in the model than 6+5+5 (nsys, A8 notes), so when
+// the split would go below A8_COLS_CHUNK-1 columns, take the fewest chunks instead.
+int ggml_cuda_mmvq_cols_nchunks(const int64_t ncols) {
+    if (ncols <= MMVQ_MAX_BATCH_SIZE) {
+        return 1;
+    }
+    static const char * env       = getenv("GGML_CUDA_MMVQ_COLS_CHUNK");
+    static const int    env_chunk = env ? atoi(env) : 0;
+
+    const int chunk = env_chunk >= 2 && env_chunk <= MMVQ_MAX_BATCH_SIZE ? env_chunk : A8_COLS_CHUNK;
+
+    const int64_t nmin  = (ncols + MMVQ_MAX_BATCH_SIZE - 1)/MMVQ_MAX_BATCH_SIZE; // widest chunks
+    const int64_t nwant = (ncols + chunk - 1)/chunk;
+    const int64_t nkeep = ncols/(chunk - 1); // more chunks than this would go below chunk-1 columns
+
+    return (int) std::max(nmin, std::min(nwant, nkeep));
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -391,6 +450,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_PASCAL) {
+        // A8: GP100 has no MMQ, so above 8 columns the alternative is dequant + cuBLAS, not MMQ.
+        return ne11 <= ggml_cuda_mmvq_max_cols_sm60(type, cc);
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
@@ -1590,11 +1653,36 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
-        ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
-        ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    // A8: at most MMVQ_MAX_BATCH_SIZE columns per launch.  Only sm_60 lets a wider MUL_MAT in
+    // (ggml_cuda_should_use_mmvq); there the matvec runs once per column chunk over the
+    // activations quantized above, which beats dequantize-to-F16 + cuBLAS up to the per-type
+    // ceiling.  stride_col_y is the q8_1 column stride and the channel stride spans all ne11
+    // columns, so an offset of c0*stride_col_y selects the chunk in every channel.  MUL_MAT_ID is
+    // out of scope: its width is bounded by get_mmvq_mmid_max_batch and the column offsets do not
+    // apply to its layout, so the body then runs exactly once with no offset.
+    const int nchunks = ids ? 1 : ggml_cuda_mmvq_cols_nchunks(ncols_dst);
+
+    static const int cols_log = getenv("GGML_CUDA_MMVQ_COLS_LOG") ? atoi(getenv("GGML_CUDA_MMVQ_COLS_LOG")) : 0;
+    if (cols_log > 0 && nchunks > 1) {
+        static int nlog = 0;
+        if (nlog < 32) {
+            ++nlog;
+            fprintf(stderr, "mmvq-cols: type=%s ne00=%d ne01=%d ncols=%d chunks=%d\n",
+                    ggml_type_name(src0->type), (int) ne00, (int) ne01, (int) ncols_dst, nchunks);
+        }
+    }
+
+    int64_t c0 = 0;
+    for (int i = 0; i < nchunks; ++i) {
+        const int cols = nchunks == 1 ? (int) ncols_dst : ggml_cuda_mmvq_cols_chunk(ncols_dst, nchunks, i);
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, (const block_q8_1 *) src1_q8_1_d + c0*stride_col_y, ids_d, fusion_local,
+            dst_d + c0*stride_col_dst, ne00,
+            ne01,              cols,          s01, stride_col_y,     stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+        c0 += cols;
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
