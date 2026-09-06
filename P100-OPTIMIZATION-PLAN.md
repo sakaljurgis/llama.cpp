@@ -555,6 +555,15 @@ Current behavior on sm_60 (no `p100:` commit touches `fattn*`; this is stock ups
 - No defrag exists any more; `llama_kv_cache::update` only does cross-stream copies and the RoPE
   K-shift graph.
 
+Correction (2026-09-05, C2 measurements): the primary model is D=256 with GQA 6 (24 q heads, 4 kv
+heads; 12 and 2 per GPU under `-sm tensor`), not D=128; the Tier 0 C1 numbers at GQA 4 and 8 do not
+bracket it, because the launcher packs by powers of two and 6 landed on `ncols2 = 2` (three blocks
+per kv head each streaming the whole K/V); and only the tile kernel is ever selected for this model
+(every launch is in `~/p100-opt/log/C2-41.log`). The table's `occupancy` field is a register budget
+(`65536/(nthreads*occupancy)`), not a block count: every `ncols 2/4` FP16 entry at 64/128 threads
+and occupancy 2 has no effective register limit. Patch 36 fixes the D=256 entries; the D=128 ones
+are probably the same one-line fix (unmeasured).
+
 Why it matters: measured pp falls 475 -> 270 t/s and tg 28.9 -> 22.8 t/s between 3.7k and 89k
 context on Qwen3.8-27B; that delta is attention. Back-of-envelope: at 89k the tile kernel runs
 at roughly 35-45% of the card's FLOP or bandwidth ceiling in both modes, while cuBLAS reaches
@@ -567,7 +576,8 @@ Items:
   lengths 4096/32768/65536, `nb` = 1 for tg and 512/2048 for pp; gemma4: D=256, sliding window
   1024 for local layers). Record us and derived GB/s (tg) or TFLOPS (pp). Note which kernel ran
   (`nsys` kernel names: `flash_attn_tile`, `flash_attn_ext_vec`, `flash_attn_combine_results`).
-- C2 Tune the Pascal FP16 tile table (`ggml_cuda_fattn_tile_get_config_nvidia_fp16`) for D=128
+- C2 DONE 2026-09-05 (`p100x: 36-fattn-tile-p100`, numbers in the Tier 2 table and P100-PATCHES.md 36).
+  Original item: Tune the Pascal FP16 tile table (`ggml_cuda_fattn_tile_get_config_nvidia_fp16`) for D=128
   and D=256: sweep `nthreads` (128/256), `occupancy` (2/3/4), `nbatch_fa` (32/64/128), `nbatch_K`
   (32/64/128) at ncols 2/8/16/32 with the C1 harness. The table is a plain constexpr switch, so a
   sweep is a rebuild per point (or make it env-overridable in a scratch build:
@@ -576,12 +586,14 @@ Items:
   the attention kernel, i.e. +5-15% tg and pp at 32k+ context, nothing at 4k. Kill switch: none
   needed if the table is just retuned (document old values); add `GGML_CUDA_FATTN_TILE_LEGACY=1`
   if the change is structural.
-- C3 Try VEC for tg with GQA on Pascal: in a scratch build, return VEC for
+- C3 NO (2026-09-05, measured in C2: 1.4-1.8x slower at every KV length, see the Tier 2 row).
+  Original item: Try VEC for tg with GQA on Pascal: in a scratch build, return VEC for
   `Q->ne[1] == 1` regardless of `gqa_opt_applies` on the Pascal branch and compare C1 numbers at
   KV 4k/32k/64k. VEC processes one q column per block with 128 threads; TILE with `ncols2` GQA
   packing shares K/V loads across the GQA group, which is why upstream prefers it. Measure
   instead of guessing; keep whichever wins per KV length (a KV-length threshold is a fine rule).
-- C4 `parallel_blocks` on sm_60: log the chosen `parallel_blocks` (add a one-line `GGML_CUDA_FATTN_LOG`
+- C4 NO (2026-09-05, measured in C2: the search fills one wave, forcing more costs 6-83%, see the Tier 1
+  row; the ragged-last-tile tie-break is C2b). Original item: `parallel_blocks` on sm_60: log the chosen `parallel_blocks` (add a one-line `GGML_CUDA_FATTN_LOG`
   debug print in a scratch build) for tg at 4k/32k/64k. 56 SMs with occupancy 2 means 112 blocks
   fill the card; with `ncols2` GQA packing and 8 KV heads a single-token decode has few blocks
   unless `parallel_blocks` is large. If the search stops early (95% rule) at long KV, force
@@ -591,7 +603,9 @@ Items:
   and its reason with `git log -S"ggml_cuda_get_max_cpy_bytes"`). Test 16 in a scratch build with
   `test-backend-ops` (correctness) and C1 (speed). Alignment asserts may fire; that is the answer
   then.
-- C6 Gemma 4 prep: D=256 tile configs are in the same table (C2 covers them); logit softcap only
+- C6 Gemma 4 prep: D=256 tile configs are in the same table (C2 covers them; note 2026-09-05: its SWA
+  layers are D=256 GQA 2 and take the retuned `(256, 256, 2)` entry, 1.13x per launch at n_kv 1024;
+  the global layers are D=512 GQA 8, untouched); logit softcap only
   selects a template. iSWA layers use a small cache (`n_swa`), so their attention cost is flat.
   Verify `-sm tensor` supports the gemma4 arch (allow-list in `src/llama-model.cpp` ~:351) before
   planning anything else for it; `test-llama-archs` runs every arch through the meta backend.
@@ -1077,7 +1091,7 @@ Keep mmap.
 | A4 | chunked dequant + GEMM for huge src0 (LM head) | removes the OOM, frees ~1.3 GB per card | A1 (optional) |
 | F5 | internal allreduce on sm_60 (`__nanosleep` replacement) | A/B vs NCCL at tg; may win 1-3 ms per token | F1 F2 |
 | B2 | re-enable MMVQ gate/up fusion on Pascal | 0-3% tg | B1 |
-| C4 | `parallel_blocks` logging + forced values for long KV | up to +10% tg at 64k | C1 |
+| C4 | NO (2026-09-05, C2 measurement): the `parallel_blocks` search already fills exactly one wave at tg (`ntiles_dst` 6, `max_blocks_per_sm` 4, `pb` 37, 222 of 224 block slots, 99% efficiency at every depth from 4k up); forcing 2x costs 6% at 32k and 21% at 4k, 4x costs 83% at 32k. What the search does miss is the ragged last KV tile (`ntiles_KV % pb`), which makes the `ncols2 = 6` packing of C2 non-monotonic between 2k and 8k: see C2b | - | C1 |
 | E5 | `rms_norm` register cache width for `n_embd` 5120 | < 1% | E1 |
 | D4 E6 | one or two extra fusion rules from the census | ~0.5% per launch removed | D1 E1 |
 | I1 | prefilter condition vs suppress tokens | up to 2% tg if the prefilter was off | I1 measurement |
@@ -1085,6 +1099,7 @@ Keep mmap.
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
 | A8 | DONE 2026-09-05 as `p100x: 35-mmvq-cols-sm60`: loop the matvec over balanced column chunks (target 7, floor 6) for 9..N columns on GP100, per-type ceiling Q4_K 64, Q5_K 48, Q6_K 32, IQ4_XS 64, int8 32; pp9 3.87x, pp16 2.84x, pp28 2.30x, pp32 1.93x, pp48 1.43x, pp64 1.12x, unchanged at 96 and above; the 25k-chat follow-up prompt phase 710 -> 434 ms and the request 1.34 -> 1.07 s; tg and pp2048 unchanged | the LM head F16 copy is gone at these widths (small-batch half of A4); J4b is now the larger half of a follow-up; verify widths 9-64 are 1.1-3.9x cheaper (J5) | J4 |
 | J4b | make the 150 MiB checkpoint save faster (288 shard copies + sync each, 200 ms vs 37 ms restore) | ~150 ms per follow-up | J4 |
+| C2b | `parallel_blocks` tie-break in `launch_fattn`: among the values with the best wave efficiency prefer the one minimising `ceil(ntiles_KV/pb)`, then re-measure the C2 gate (n_kv 512-16384, 1-2 Q columns) and lower it if the curve is monotonic | +12% on the attention kernel at n_kv 4096 (about 2% of a tg step there); smooths every Pascal FA launch | C2 |
 | B4c | DONE 2026-09-04 as `p100x: 34-mmvq-k-shortk`: prefetch mode 2 (header loaded in its own step) per type and width, at width 1 only for Q5_K below 24 blocks; tg +0.5% (31.7 t/s at d0), speculative verify widths 2/4 +4% / +2%; measured with a new any-shape timing tool (`~/p100-opt/b4c/shape.cpp`) that Area B work should use from now on | the gap itself stands: k=5120 runs at 0.74-0.81 of the k=14336 rate, the streaming part is within 3% of the DRAM ceiling and only a fixed 0.38 step per warp is addressable; a shorter warp step is measured out (see What not to do); the LM head was already at its ceiling | B4 B4b |
 
 ### Tier 2: medium changes (design note to the user first, 2-5 days each)
@@ -1093,8 +1108,8 @@ Keep mmap.
 |---|---|---|---|
 | B4b | DONE 2026-09-04 as `p100x: 33-mmvq-k-hfma2`: Q5_K 1.36x and Q6_K 1.40x at width 1 per call (1.14x / 1.30x in-model, short k again), IQ4_XS only from width 4 (its int8 path already runs at 400 GB/s, see What not to do); tg 30.0 -> 31.6 t/s at d0 (+5.2%; +7.8% over the int8 path), 28.8 -> 30.3 at d16384 | left: two-slot `a16k` cache for mixed-type gate/up pairs at widths 4-8 (~1.7% of kernel time), width 6-7 defaults interpolated | B4 |
 | G3 | per-subgraph CUDA graph cache so `-sm tensor` can use graphs | the bulk of the launch-bound share found in G1 | G2 success |
-| C2 | retune the Pascal FP16 tile table (D=128, D=256) | +5-15% tg and pp at 32k+ | C1 |
-| C3 | VEC for GQA tg on Pascal with a KV-length threshold | measured per KV length | C1 |
+| C2 | DONE 2026-09-05 as `p100x: 36-fattn-tile-p100`: FP16 tile table for D=256 (the model is D=256 GQA 6, not D=128): the tg entry had no register budget (255 registers, 4 blocks and 8 warps per SM) and GQA 6 fell onto `ncols2 = 2` with a 3x K/V re-read; new `ncols2 = 6` packing above n_kv 16384 at 1-2 Q columns plus `(128, 4, 64, 64)` for `ncols 2`; attention kernel 1.12x at 16k, 1.31x at 32k, 1.46x at 64k, 1.70x at 128k (92% of the read ceiling); tg +0.7% at d0, +1.6% at d16384, +3.3% at d32768, +7.9% at d65536; pp unchanged (its table entry is already optimal, 14 candidates lost) | left: the 16384 gate (C2b); the same register-budget fix for the D=128 and small-head `ncols 2/4` entries (unmeasured, llama-class shape); C5 has no headroom at 131k any more | C1 |
+| C3 | NO (2026-09-05, C2 measurement): the vector kernel is 1.4-1.8x slower than the tile kernel at every KV length from 4k to 128k on the model's shape; it has no GQA packing at all (6x K/V re-read against the tile kernel's 3x, 1x with patch 36). No KV-length threshold wins | - | C1 |
 | F6 | size-dependent allreduce transport | tg wins from F4/F5 without losing pp | F4 F5 |
 | F9 | batch the synchronous split-input copies | < 1 ms per token, only if the timeline shows them | F2 |
 | D2 | GDN kernel occupancy at tg | a few % of the delta-net share | D1 + nvprof |
@@ -1129,6 +1144,11 @@ Keep mmap.
   part is already within 3% of the DRAM ceiling and only the fixed pipeline cost (0.38 of a step per
   warp) remains. Measure Area B changes with `~/p100-opt/b4c/shape.cpp` at the model's shapes and at
   per-GPU row counts (`-sm tensor` halves the rows a GPU sees), not only on the 4096x14336 test shape.
+- Do not use the vector flash-attention kernel for single-column tg on Pascal (C3, 2026-09-05): it is
+  1.4-1.8x slower than the tile kernel at every KV length because it has no GQA packing.
+- Do not force `parallel_blocks` above the search result on Pascal (C4, 2026-09-05): the search fills
+  exactly one wave at tg; 2x costs 6-21%, 4x up to 83%. The one thing it misses is the ragged last KV
+  tile (C2b).
 
 ## 4. Measurement and validation protocol
 
@@ -1348,6 +1368,8 @@ Original list:
 | `LLAMA_SERVER_SLOTS_DEBUG=1`, `LLAMA_TRACE=1` | server slot/trace logging (J1) |
 | `CUDA_SCALE_LAUNCH_QUEUES=4x` | larger CUDA command buffer (G5) |
 | `CUDA_VISIBLE_DEVICES` | single-card runs |
+| `GGML_CUDA_FATTN_TILE_LEGACY=1` | patch 36 kill switch: b10758 flash-attention tile kernels, no GQA 6 packing |
+| `GGML_CUDA_FATTN_LOG=1` | patch 36: one line per distinct flash-attention launch (kernel, ncols1/ncols2, config, parallel_blocks, grid) |
 
 ## Appendix B: reading order for a new agent
 
