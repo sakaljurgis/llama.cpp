@@ -145,6 +145,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 33 | mmvq-k-hfma2 | sm_60 (CUDA) | yes (Q5_K and Q6_K matvec at widths 1-8, IQ4_XS at 4-8) |
 | 34 | mmvq-k-shortk | sm_60 (CUDA) | yes (prefetch mode of the same kernels per type/width and k) |
 | 35 | mmvq-cols-sm60 | sm_60 (CUDA) | yes (every quantized MUL_MAT of 9-64 columns: follow-up re-decodes, speculative verify above 8) |
+| 36 | fattn-tile-p100 | sm_60 (CUDA) | yes (every flash-attention launch of the model: retuned tg entry for D=256; GQA 6 packing at 1-2 Q columns above n_kv 16384) |
 
 ### 31 server-ckpt-adopt
 
@@ -383,6 +384,90 @@ one global rule); a ceiling above the values above, which loses at 96 and 128 co
 1024 costs 38% of pp128); and Q4_1, whose dedicated HFMA2 kernel still stops at 8 columns, so its
 wider batches take the int8 chunk loop.
 
+### 36 fattn-tile-p100
+
+`ggml/src/ggml-cuda/fattn-tile.cuh`, `fattn-common.cuh` and `fattn.cu` (+251/-42). Plan item C2,
+with C3 and C4 folded in as measurements. The Pascal FP16 flash-attention tile table has carried a
+"TODO optimize kernel parameters for FP16 NVIDIA (P100)" since it was written, and only GP100 uses
+it: sm_61 takes the FP32 table (slow FP16), Volta and newer take the MMA kernel. Two things were
+wrong for Qwen3.8-27B, which is D=256 with 24 q heads and 4 kv heads (GQA 6; 12 and 2 per GPU
+under `-sm tensor`), not the D=128 the plan assumed. Every FLASH_ATTN_EXT of the model picks the
+tile kernel (`GGML_CUDA_FATTN_LOG=1` log of every launch in `~/p100-opt/log/C2-41.log`).
+
+First, `occupancy` in that table is only the `__launch_bounds__` min-blocks hint, i.e. the register
+budget `65536/(nthreads*occupancy)`. At the tg entry (`ncols 2`, 64 threads, occupancy 2) that
+budget is 512 registers per thread, above the hardware maximum of 255, so ptxas is unconstrained
+and spends all 255, and exactly 4 blocks of 2 warps fit per SM: 8 of the SM's 64 warp slots. The
+entry is not "occupancy 2", it is "no register limit", the least occupied entry of the table.
+`(128, 4, 64, 64)` gives ptxas a real 128-register budget and two warps per KV tile: +1.7% at
+n_kv 32768 and +9.6% at 131072 per launch, nothing lost at 4096. Sweeping the other parameters says
+`nbatch_K` must stay 64 (every 32 loses 8-19% at depth: 64 contiguous bytes per K row per load
+instead of 128, and eight KQ steps per tile instead of four) and that the `ncols 32` (prompt) entry
+is already optimal: 14 candidates, none faster, the best 1% slower.
+
+Second, and this is where the time is: with the power-of-two `ncols2` chain a GQA ratio of 6 lands
+on `ncols2 = 2`, so three CUDA blocks per kv head each stream the whole K/V. Forcing `ncols2 = 1`
+(six streams) costs 2.3x the time at every depth, i.e. the re-read is paid in DRAM time, so the
+patch adds `ncols2 = 6`: a `(256, 256, 6)` table entry (192 threads = 6 warps, one Q column each,
+occupancy 4, `nbatch_fa 64`, `nbatch_K 64`), a `(256, 256, 12)` entry for two Q columns, and a
+branch before the `% 2` case that takes them. `nwarps` need not be a power of two (6 warps), but
+`KQ_cs = min(cpw, 4)` must be, which rules out 2 and 4 warps for `ncols 6`. The branch is gated on
+`K->ne[1] >= 16384 && K->ne[2] >= 2 && gqa_ratio % 8 != 0` and on at most 2 Q columns, all four
+clauses measured: below n_kv 16384 the L2 already absorbs most of the re-read (the shipped path
+runs at a nominal 855 GB/s there, above the 603 GB/s DRAM ceiling) while the coarser grid, one
+output tile per kv head instead of three, costs 5-11%; with one kv head the grid is a single output
+tile and it costs up to 50%; multiples of 8 pack more per block on `ncols2 = 8`; and
+`cols_per_block 24` for 3-8 Q columns loses 14-17% at 4k for a 10% gain at 32k. The gate sits at
+16384 because the curve is non-monotonic between 2k and 8k: the `parallel_blocks` search ignores
+the ragged last KV tile (`ntiles_KV % parallel_blocks`), so at 8192 16 of 224 blocks do two KV
+tiles and the wave waits for them; a tie-break there would likely let the gate come down to about
+4096 (follow-up C2b).
+
+Measured per launch (`~/p100-opt/c2/fa-shape.cpp`, one FLASH_ATTN_EXT op at the model's per-GPU
+shape, new vs `GGML_CUDA_FATTN_TILE_LEGACY=1`): tg 1.12x at n_kv 16384, 1.31x at 32768, 1.46x at
+65536, 1.70x at 131072 (485 us against 824, 553 GB/s of K/V read once, 92% of the card's read
+ceiling); two Q columns 1.20x / 1.43x / 1.60x at 16384 / 32768 / 131072; everything else unchanged
+to three digits. Model (`llama-bench -p 0 -n 64`, median of two alternating passes): tg 31.90 vs
+31.70 t/s at d0 (+0.7%), 30.93 vs 30.47 at d16384 (+1.6%), 30.02 vs 29.06 at d32768 (+3.3%),
+28.37 vs 26.31 at d65536 (+7.9%); pp2048 419 vs 419 t/s at d0 and 333 vs 335 at d16384
+(unchanged); speculative verify widths 2, 4 and 8 unchanged. Server harness at a 23.6k context
+(`tmp/j4run.sh` style): the generation part of a follow-up 517.7 vs 528.5 ms (+2.1% tg),
+`prompt_ms` and the 23570-token first request unchanged. Prompt processing is untouched by design.
+Extrapolated to the production `-c 160000` (about 30% attention share at 130-160k, kernel 1.70x):
+about +12% tg, not measured.
+
+Correctness: `test-backend-ops` 14675/14675 on CUDA0 and CUDA1 (and 2942/2942 of
+`-o FLASH_ATTN_EXT` with and without the kill switch), but the suite has no small-batch GQA 6 case
+(its only `hsk 256, nr23 {6,1}` cases are `nb = 512`, which take `ncols2 = 2` as before), so the
+new path is covered by `~/p100-opt/c2/check6.sh`: 14 shapes (n_kv 256 to 65536, 1 to 4 kv heads,
+GQA 4, 6 and 12, 1 and 2 Q columns) against the CPU backend, NMSE 1.2e-6 to 1.8e-4, within a few
+percent of the legacy path's figure. Run it after every rebase that touches `fattn-tile.cuh`.
+Perplexity (`-c 2048 --chunks 20` and `-c 32768 --chunks 4`) identical to stock to the last digit
+in all arms, as expected: perplexity is prompt processing and never runs the changed paths.
+Greedy 128 tokens after a 22054-token prompt (`-c 24576`, the `ncols2 = 6` kernel runs during
+generation): new, old and stock byte-identical.
+
+Kill switch `GGML_CUDA_FATTN_TILE_LEGACY=1` restores the b10758 kernels exactly (the changed
+`ncols 2` entry is instantiated a second time with its old values behind a template `cfg` index,
+and the `ncols2 = 6` branch is skipped); the legacy per-launch times reproduce the pre-patch
+measurements to 0.1%. Knob `GGML_CUDA_FATTN_LOG=1` prints one line per distinct flash-attention
+launch tuple (kernel kind, ncols1/ncols2, config, blocks per SM, parallel_blocks, grid); off by
+default. Compile time of `fattn-tile-instance-dkq256-dv256.cu` 73.3 s against 65.5 s. The
+`(256, 256, 6)` and `(256, 256, 12)` rows added to the FP32 and the two AMD tables exist so the
+kernel compiles for those targets; they are never reached (the branch is GP100 only) and were not
+measured.
+
+Not done, with numbers: the `ncols 32` prompt entry (14 candidates, best 1% slower than shipped);
+the `ncols 4/8/16` speculative-verify entries (every candidate that gains 5-16% at depth loses
+1-13% at n_kv 4096, and they are unreachable for a GQA-6 model at 1-2 columns anyway);
+`cols_per_block 24` for 3-8 Q columns (above); the vector kernel for single-column tg (plan item
+C3: 1.4-1.8x slower than the tile kernel at every KV length, no threshold wins); forcing
+`parallel_blocks` above what the search picks (plan item C4: 2x costs 6-21%, 4x up to 83%; the
+search already fills exactly one wave, `ntiles_dst 6` x `pb 37` = 222 of 224 block slots).
+Rebase note: all three files are upstream-churned; the table edits are one-line entries, the
+launcher edit is the `launch_fattn_tile_cfg` indirection in every `cols_per_block` case of
+`launch_fattn_tile_switch_ncols1`.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -459,6 +544,8 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_A16K_SHORTK_NB=N` (default 24), `GGML_A16K_PF=2` | 34 | width-1 block-count threshold for mode 2; force prefetch mode 2 |
 | `GGML_CUDA_MMVQ_MAX_COLS_SM60=8` | 35 | kill switch (per-type MMVQ column ceiling on GP100; 8 or 0 = upstream `ne11 <= 8`, values below 8 clamped) |
 | `GGML_CUDA_MMVQ_COLS_CHUNK=N` (2-8, default 7), `GGML_CUDA_MMVQ_COLS_LOG=1` | 35 | target chunk width of the column split (floor N-1; 8 = fewest chunks); log the first 32 chunked calls |
+| `GGML_CUDA_FATTN_TILE_LEGACY=1` | 36 | kill switch (b10758 flash-attention tile kernels: old `(256, 256, 2)` entry, no GQA 6 packing) |
+| `GGML_CUDA_FATTN_LOG=1` | 36 | one stderr line per distinct flash-attention launch tuple (kernel kind, ncols1/ncols2, config, blocks per SM, parallel_blocks, grid) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -658,3 +745,12 @@ on `qwen35` that the kill switches above do not explain points here first.
   the 25k-chat follow-up prompt phase 710 -> 434 ms (request 1.34 -> 1.07 s); tg and pp2048 unchanged.
   Perplexity within 0.36% of stock at `-ub 16/32/64`; greedy byte-identical new vs old; full
   `test-backend-ops` 14675/14675 on both cards. Kill switch `GGML_CUDA_MMVQ_MAX_COLS_SM60=8`.
+- 2026-09-06: local patch 36 (`p100x: 36-fattn-tile-p100`, measured 2026-09-05): Pascal FP16
+  flash-attention tile table for D=256 (the model is D=256 GQA 6, not D=128): the tg entry had no
+  register budget (255 registers, 8 warps per SM) and GQA 6 fell onto `ncols2 = 2` with a 3x K/V
+  re-read; `(128, 4, 64, 64)` for `ncols 2` plus `ncols2 = 6` packing above n_kv 16384 at 1-2 Q
+  columns. Attention kernel 1.31x at 32k, 1.70x at 128k; tg +0.7% at d0, +1.6% at d16384, +3.3% at
+  d32768, +7.9% at d65536; pp unchanged (its entry is already optimal). Full `test-backend-ops`
+  14675/14675 on both cards plus `c2/check6.sh` for the GQA 6 path (the suite has no such case);
+  perplexity identical to stock; greedy byte-identical after a 22k prompt. C3 (VEC at tg) and C4
+  (forced `parallel_blocks`) measured out. Kill switch `GGML_CUDA_FATTN_TILE_LEGACY=1`.
