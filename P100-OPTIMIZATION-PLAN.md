@@ -967,6 +967,16 @@ Items:
   checkpoint" / "created context checkpoint" lines in J1; if reprocessing from a checkpoint shows
   up on follow-ups, lower `--checkpoint-min-step` (more checkpoints, each costing a ~100 MB
   state copy during pp) and measure.
+- J4b DONE 2026-09-06 (`p100x: 37-server-ckpt-save`, numbers in the Tier 1 table and P100-PATCHES.md 37).
+  Correction: the "200 ms DtoH" of the J4 timeline was the log-timestamp gap around `create_checkpoint`, not
+  the copy. Measured (`~/p100-opt/log/J4b-notes.md`): the 149.6 MiB device-to-host copy is 768 shard copies in
+  30.5 ms (5.14 GB/s), the restore is 36.9 ms HtoD, and the rest of the window was 72.8 ms of
+  `std::vector::resize` on a fresh mapping plus 8.5 ms of `free`. `llama_state_seq_get_data_ext` calls
+  `ctx->synchronize()`, so host work placed before it is hidden behind whatever decode is still in flight
+  (about 66 ms here); anyone timing host work near a state call must account for that. `--ctx-checkpoints`
+  defaults to 32 on this branch, not 8. After patches 35 and 37 a follow-up prompt phase is ~417 ms =
+  restore 37 + 28-token decode ~200 (+ its ~66 ms tail) + copy 30 + 4-token decode ~82: the two small
+  decodes are now the largest pieces (J5 / Area A / Area G).
 - J5 Speculative decoding (revisit after A4 and G): note 2026-09-05: with A8 verify widths 9-64 cost 1.1-3.9x less
   (a draft of 15 runs at 107 t/s instead of 37), widths 2-8 unchanged;
   - MTP (`draft-mtp`): the untested `--draft-p-min 0` (constant verify width 5 keeps graph reuse
@@ -1098,7 +1108,7 @@ Keep mmap.
 | A2 | vectorized dequant for Q4_K/Q6_K | 2-10% pp at small `-ub`, ~1% at 2048 | A1 |
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
 | A8 | DONE 2026-09-05 as `p100x: 35-mmvq-cols-sm60`: loop the matvec over balanced column chunks (target 7, floor 6) for 9..N columns on GP100, per-type ceiling Q4_K 64, Q5_K 48, Q6_K 32, IQ4_XS 64, int8 32; pp9 3.87x, pp16 2.84x, pp28 2.30x, pp32 1.93x, pp48 1.43x, pp64 1.12x, unchanged at 96 and above; the 25k-chat follow-up prompt phase 710 -> 434 ms and the request 1.34 -> 1.07 s; tg and pp2048 unchanged | the LM head F16 copy is gone at these widths (small-batch half of A4); J4b is now the larger half of a follow-up; verify widths 9-64 are 1.1-3.9x cheaper (J5) | J4 |
-| J4b | make the 150 MiB checkpoint save faster (288 shard copies + sync each, 200 ms vs 37 ms restore) | ~150 ms per follow-up | J4 |
+| J4b | DONE 2026-09-06 as `p100x: 37-server-ckpt-save`: recycle the storage of an erased context checkpoint instead of allocating a fresh 149.6 MiB vector per save; checkpoint save 112.4 -> 96.4 ms, follow-up prompt phase 433.3 -> 416.9 ms (-3.8%), wall 1.060 -> 1.057 s (inside the noise), RSS unchanged; checkpoints byte-identical (17/17 against a second save of the same state) | the item's premise was wrong: the 149.6 MiB DtoH costs 30.5 ms (5.14 GB/s), faster than the 36.9 ms HtoD restore; the old 112 ms was 8.5 ms free + 72.8 ms allocate/first-touch + the copy, and the allocation was hiding ~66 ms of decode in flight that `ctx->synchronize()` now waits for. Left: that wait plus 30 ms of copy; only a pinned buffer touches the copy (save 30 -> 16 ms, restore 35 -> 18 ms; needs a pinned allocator and up to `--ctx-checkpoints` (default 32) x 149.6 MiB locked per slot); edit/regenerate requests are not covered (their checkpoint is dropped outside `create_checkpoint`) | J4 |
 | C2b | `parallel_blocks` tie-break in `launch_fattn`: among the values with the best wave efficiency prefer the one minimising `ceil(ntiles_KV/pb)`, then re-measure the C2 gate (n_kv 512-16384, 1-2 Q columns) and lower it if the curve is monotonic | +12% on the attention kernel at n_kv 4096 (about 2% of a tg step there); smooths every Pascal FA launch | C2 |
 | B4c | DONE 2026-09-04 as `p100x: 34-mmvq-k-shortk`: prefetch mode 2 (header loaded in its own step) per type and width, at width 1 only for Q5_K below 24 blocks; tg +0.5% (31.7 t/s at d0), speculative verify widths 2/4 +4% / +2%; measured with a new any-shape timing tool (`~/p100-opt/b4c/shape.cpp`) that Area B work should use from now on | the gap itself stands: k=5120 runs at 0.74-0.81 of the k=14336 rate, the streaming part is within 3% of the DRAM ceiling and only a fixed 0.38 step per warp is addressable; a shorter warp step is measured out (see What not to do); the LM head was already at its ceiling | B4 B4b |
 
