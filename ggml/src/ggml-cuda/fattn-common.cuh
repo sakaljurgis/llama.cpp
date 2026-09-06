@@ -6,6 +6,29 @@
 
 #include <cstdint>
 
+// GGML_CUDA_FATTN_LOG=1 prints one line per distinct flash-attention launch tuple on stderr
+// (kernel kind, ncols1/ncols2, config, occupancy, parallel_blocks, grid).  Off by default.
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#include <string>
+
+static bool ggml_cuda_fattn_log_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_FATTN_LOG") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_fattn_log_once(const char * line) {
+    static std::mutex            mtx;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (seen.insert(std::string(line)).second) {
+        fprintf(stderr, "FATTNLOG %s\n", line);
+        fflush(stderr);
+    }
+}
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -1206,6 +1229,18 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
+
+    if (ggml_cuda_fattn_log_enabled()) {
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+                 "run dev=%d DV=%d ncols1=%d ncols2=%d nwarps=%d nbatch_fa=%d Qne=[%d,%d,%d,%d] "
+                 "Kne1=%d nsm=%d mbpsm=%d pb=%d sk=%d grid=[%u,%u,%u] ntiles_dst=%d ntiles_KV=%d",
+                 id, DV, ncols1, ncols2, nwarps, nbatch_fa,
+                 (int) Q->ne[0], (int) Q->ne[1], (int) Q->ne[2], (int) Q->ne[3],
+                 (int) K->ne[1], nsm, max_blocks_per_sm, parallel_blocks, (int) stream_k,
+                 blocks_num.x, blocks_num.y, blocks_num.z, ntiles_dst, ntiles_KV);
+        ggml_cuda_fattn_log_once(buf);
+    }
 
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
         ggml_cuda_kernel_launch(fattn_kernel, launch_params,

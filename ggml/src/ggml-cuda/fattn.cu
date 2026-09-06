@@ -569,7 +569,31 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+
+    if (ggml_cuda_fattn_log_enabled()) {
+        const ggml_tensor * Q    = dst->src[0];
+        const ggml_tensor * K    = dst->src[1];
+        const ggml_tensor * mask = dst->src[3];
+        float max_bias = 0.0f, softcap = 0.0f;
+        memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+        memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
+        const char * kind_name = kernel == BEST_FATTN_KERNEL_TILE ? "tile" :
+                                 kernel == BEST_FATTN_KERNEL_VEC  ? "vec"  :
+                                 kernel == BEST_FATTN_KERNEL_MMA_F16 ? "mma_f16" : "none";
+        char buf[384];
+        snprintf(buf, sizeof(buf),
+                 "sel dev=%d kind=%s Q=[%d,%d,%d,%d] K=[%d,%d,%d,%d] Ktype=%s Vtype=%s mask=%d "
+                 "max_bias=%.1f softcap=%.1f prec=%d sinks=%d",
+                 ggml_cuda_get_device(), kind_name,
+                 (int) Q->ne[0], (int) Q->ne[1], (int) Q->ne[2], (int) Q->ne[3],
+                 (int) K->ne[0], (int) K->ne[1], (int) K->ne[2], (int) K->ne[3],
+                 ggml_type_name(K->type), ggml_type_name(dst->src[2]->type), mask ? 1 : 0,
+                 max_bias, softcap, (int) ggml_flash_attn_ext_get_prec(dst), dst->src[4] ? 1 : 0);
+        ggml_cuda_fattn_log_once(buf);
+    }
+
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
