@@ -146,6 +146,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 34 | mmvq-k-shortk | sm_60 (CUDA) | yes (prefetch mode of the same kernels per type/width and k) |
 | 35 | mmvq-cols-sm60 | sm_60 (CUDA) | yes (every quantized MUL_MAT of 9-64 columns: follow-up re-decodes, speculative verify above 8) |
 | 36 | fattn-tile-p100 | sm_60 (CUDA) | yes (every flash-attention launch of the model: retuned tg entry for D=256; GQA 6 packing at 1-2 Q columns above n_kv 16384) |
+| 37 | server-ckpt-save | host (server) | yes (hybrid/recurrent models, every context checkpoint save on a follow-up) |
 
 ### 31 server-ckpt-adopt
 
@@ -468,6 +469,53 @@ Rebase note: all three files are upstream-churned; the table edits are one-line 
 launcher edit is the `launch_fattn_tile_cfg` indirection in every `cols_per_block` case of
 `launch_fattn_tile_switch_ncols1`.
 
+### 37 server-ckpt-save
+
+`tools/server/server-context.cpp` (+49/-2). Plan item J4b. `create_checkpoint` drops at least one old
+checkpoint and then appends a new one on every follow-up request, and the new one allocated its own
+storage: for Qwen3.8-27B that is a fresh 149.6 MiB `std::vector` per request, 72.8 ms to allocate and
+first-touch (page-fault bound at 2.2 GB/s) plus 8.5 ms to give the old mapping back to the kernel,
+against 30.4 ms for the device-to-host copy that fills it. The patch moves `data_tgt` (and `data_dft`
+when a draft context exists) out of every checkpoint the two eviction loops drop into a local spare
+and into the new checkpoint right after `emplace_back()`, so `update_tgt` resizes a vector that
+already has exactly that size, neither an allocation nor a zero-fill, and the state copy overwrites
+every byte. The `created context checkpoint` trace line now also reports how long the save took.
+
+The item's premise in the plan ("150 MiB DtoH in 200 ms vs 37 ms restore") was wrong twice, measured
+first with scratch timers on the real server path (`~/p100-opt/log/J4b-notes.md` section 1): the
+768 shard copies of the recurrent state take 30.5 ms at 5.14 GB/s, faster than the 36.9 ms HtoD
+restore; and `llama_state_seq_get_data_ext` calls `ctx->synchronize()` before it reads anything, so
+the allocation that ran before it was hiding about 66 ms of decode still in flight from the preceding
+28-token prompt batch. Removing the allocation exposes that wait, which is why the gain is 16 ms and
+not 80.
+
+Measured on a 23.5k-token chat, 32-token follow-ups (`~/p100-opt/j4b/chain1.sh`, `chain2.sh`, two
+passes with the arms alternated): the create window (erase to "created") 112.4 -> 96.4 ms, prompt
+phase 433.3 -> 416.9 ms (-3.8%), token generation unchanged (517.5 vs 518.1 ms per 16 tokens), client
+wall 1.060 -> 1.057 s (inside the +-15 ms scatter of the end-to-end measurement), RSS 2.98 GB and
+locked memory 0 in every arm. The kill switch reproduces the unpatched build exactly (433.3 / 112.4 ms
+against 432.8 / 112.2 ms). Edit and regenerate requests (the harness cases c, c2, b1, b2, a2) do not
+improve: their old checkpoint is dropped by the "erased invalidated context checkpoint" loop in
+`update_slots`, outside `create_checkpoint`, so there is nothing to recycle; covering them needs a
+spare that outlives one call, i.e. a permanent 149.6 MiB per slot, not taken for 16 ms.
+
+Correctness: in a scratch build every checkpoint was saved a second time into a fresh buffer and
+compared byte for byte, 17/17 identical with the patch on and 17/17 with the kill switch on;
+`prompt_n` identical across arms in every case. `test-save-load-state -c 4096 -n 64` passes on both
+builds; `llama-bench` tg64 31.90 vs 31.92 t/s and pp2048 420.87 vs 420.87 t/s (control: nothing below
+the server is touched). `test-backend-ops` not needed. Kill switch `LLAMA_SERVER_CKPT_SAVE_LEGACY=1`
+(read once in `load_model` next to patch 31's switch, logged as a warning) restores a fresh buffer per
+checkpoint.
+
+Not done: a pinned (`ggml_backend_dev_host_buffer_type`) checkpoint buffer, which the microbenchmark
+(`~/p100-opt/j4b/copy-bench.cu`) prices at 30.4 -> 16.2 ms for the save and 35.1 -> 18.1 ms for the
+restore, because it needs a pinned allocator for `common_prompt_checkpoint` (with copy semantics for
+`server_prompt::clone()`), a fallback when the allocation fails, and up to `--ctx-checkpoints`
+(default 32 on this branch) x 149.6 MiB of locked memory per slot. Batching the copies asynchronously
+is worth nothing without it (pageable DtoH is synchronous in the driver: 27.7 vs 28.3 ms) and would
+need a segmented path in `ggml_backend_meta_get_tensor_async`, which asserts `n_segments == 1`; the
+real tensors split into 3 (ssm) and 5 (conv) pieces per layer on two GPUs.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -546,6 +594,7 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_MMVQ_COLS_CHUNK=N` (2-8, default 7), `GGML_CUDA_MMVQ_COLS_LOG=1` | 35 | target chunk width of the column split (floor N-1; 8 = fewest chunks); log the first 32 chunked calls |
 | `GGML_CUDA_FATTN_TILE_LEGACY=1` | 36 | kill switch (b10758 flash-attention tile kernels: old `(256, 256, 2)` entry, no GQA 6 packing) |
 | `GGML_CUDA_FATTN_LOG=1` | 36 | one stderr line per distinct flash-attention launch tuple (kernel kind, ncols1/ncols2, config, blocks per SM, parallel_blocks, grid) |
+| `LLAMA_SERVER_CKPT_SAVE_LEGACY=1` | 37 | kill switch (a freshly allocated buffer for every context checkpoint) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -754,3 +803,9 @@ on `qwen35` that the kill switches above do not explain points here first.
   14675/14675 on both cards plus `c2/check6.sh` for the GQA 6 path (the suite has no such case);
   perplexity identical to stock; greedy byte-identical after a 22k prompt. C3 (VEC at tg) and C4
   (forced `parallel_blocks`) measured out. Kill switch `GGML_CUDA_FATTN_TILE_LEGACY=1`.
+- 2026-09-06: local patch 37 (`p100x: 37-server-ckpt-save`): recycle the storage of an erased context
+  checkpoint instead of allocating a fresh 149.6 MiB vector per save; checkpoint save 112.4 -> 96.4 ms,
+  follow-up prompt phase 433.3 -> 416.9 ms (-3.8%), RSS unchanged, checkpoints byte-identical (17/17
+  against a second save of the same state). The plan's premise was wrong: the DtoH copy is 30.5 ms at
+  5.14 GB/s (faster than the 36.9 ms restore); the rest of the old window was the allocation, which was
+  hiding ~66 ms of decode in flight. Kill switch `LLAMA_SERVER_CKPT_SAVE_LEGACY=1`.
