@@ -488,6 +488,20 @@ static bool ggml_cuda_fattn_tile_use_gqa6(const int cc) {
     return ggml_cuda_fattn_tile_active_cfg() != GGML_CUDA_FATTN_TILE_CFG_LEGACY;
 }
 
+// Smallest n_kv for the GQA 6 packing (gate in launch_fattn_tile_switch_ncols2). GGML_CUDA_FATTN_GQA6_MIN_KV
+// overrides it, 0 packs always (also with one kv head). Two Q columns need more: the tie-break in
+// launch_fattn does not cover them and a ragged last KV round costs them up to 14% below 7680.
+#define GGML_CUDA_FATTN_GQA6_MIN_KV_DEFAULT 2560
+#define GGML_CUDA_FATTN_GQA6_MIN_KV_NCOLS2  7680
+
+static int ggml_cuda_fattn_tile_gqa6_min_kv() {
+    static const int min_kv = []() -> int {
+        const char * s = getenv("GGML_CUDA_FATTN_GQA6_MIN_KV");
+        return s ? atoi(s) : GGML_CUDA_FATTN_GQA6_MIN_KV_DEFAULT;
+    }();
+    return min_kv;
+}
+
 // TODO: deduplicate with mma-f16
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
 static __device__ __forceinline__ void flash_attn_tile_load_tile(
@@ -1429,20 +1443,21 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
         // GP100: a GQA ratio of 6 falls onto ncols2 == 2 and streams K/V three times per kv head.
-        // Pack the whole group once the K/V stream dominates. Measured: it loses below n_kv 16384
-        // (L2 absorbs the re-read, the grid gets coarser), with one kv head, and above 2 Q columns.
+        // Pack the whole group once the K/V stream dominates. Measured: it loses below the n_kv
+        // gate (the grid gets three times coarser), with one kv head, and above 2 Q columns.
         if constexpr (DKQ == 256 && DV == 256) {
-            const bool gqa6_pays = K->ne[1] >= 16384 && K->ne[2] >= 2 && gqa_ratio % 8 != 0;
-            if (use_gqa_opt && gqa6_pays && gqa_ratio % 6 == 0 && Q->ne[2] % 6 == 0 &&
-                    ggml_cuda_fattn_tile_use_gqa6(cc_dev)) {
-                if (Q->ne[1] <= 1) {
-                    launch_fattn_tile_cfg<DKQ, DV,  6, 6, use_logit_softcap>(ctx, dst, cc_dev);
-                    return;
-                }
-                if (Q->ne[1] <= 2) {
-                    launch_fattn_tile_cfg<DKQ, DV, 12, 6, use_logit_softcap>(ctx, dst, cc_dev);
-                    return;
-                }
+            const int  min_kv   = ggml_cuda_fattn_tile_gqa6_min_kv();
+            const int  min_kv_2 = min_kv == 0 ? 0 : std::max(min_kv, GGML_CUDA_FATTN_GQA6_MIN_KV_NCOLS2);
+            const bool gqa6_ok  = use_gqa_opt && gqa_ratio % 6 == 0 && gqa_ratio % 8 != 0 &&
+                Q->ne[2] % 6 == 0 && (K->ne[2] >= 2 || min_kv == 0) &&
+                ggml_cuda_fattn_tile_use_gqa6(cc_dev);
+            if (gqa6_ok && Q->ne[1] <= 1 && K->ne[1] >= min_kv) {
+                launch_fattn_tile_cfg<DKQ, DV,  6, 6, use_logit_softcap>(ctx, dst, cc_dev);
+                return;
+            }
+            if (gqa6_ok && Q->ne[1] <= 2 && K->ne[1] >= min_kv_2) {
+                launch_fattn_tile_cfg<DKQ, DV, 12, 6, use_logit_softcap>(ctx, dst, cc_dev);
+                return;
             }
         }
 

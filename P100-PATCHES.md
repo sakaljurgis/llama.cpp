@@ -147,6 +147,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 35 | mmvq-cols-sm60 | sm_60 (CUDA) | yes (every quantized MUL_MAT of 9-64 columns: follow-up re-decodes, speculative verify above 8) |
 | 36 | fattn-tile-p100 | sm_60 (CUDA) | yes (every flash-attention launch of the model: retuned tg entry for D=256; GQA 6 packing at 1-2 Q columns above n_kv 16384) |
 | 37 | server-ckpt-save | host (server) | yes (hybrid/recurrent models, every context checkpoint save on a follow-up) |
+| 38 | fattn-pb-tiebreak | sm_60 (CUDA) | yes (every one-Q-column flash-attention launch; GQA 6 packing now from n_kv 2560) |
 
 ### 31 server-ckpt-adopt
 
@@ -418,11 +419,11 @@ clauses measured: below n_kv 16384 the L2 already absorbs most of the re-read (t
 runs at a nominal 855 GB/s there, above the 603 GB/s DRAM ceiling) while the coarser grid, one
 output tile per kv head instead of three, costs 5-11%; with one kv head the grid is a single output
 tile and it costs up to 50%; multiples of 8 pack more per block on `ncols2 = 8`; and
-`cols_per_block 24` for 3-8 Q columns loses 14-17% at 4k for a 10% gain at 32k. The gate sits at
-16384 because the curve is non-monotonic between 2k and 8k: the `parallel_blocks` search ignores
-the ragged last KV tile (`ntiles_KV % parallel_blocks`), so at 8192 16 of 224 blocks do two KV
-tiles and the wave waits for them; a tie-break there would likely let the gate come down to about
-4096 (follow-up C2b).
+`cols_per_block 24` for 3-8 Q columns loses 14-17% at 4k for a 10% gain at 32k. The gate sat at 16384
+in this patch because the curve was non-monotonic between 2k and 8k: the `parallel_blocks` search
+ignores the ragged last KV tile (`ntiles_KV % parallel_blocks`), so at 8192 16 of 224 blocks do two KV
+tiles and the wave waits for them. Patch 38 (item C2b) fixes that in `launch_fattn` and lowers the
+gate to 2560.
 
 Measured per launch (`~/p100-opt/c2/fa-shape.cpp`, one FLASH_ATTN_EXT op at the model's per-GPU
 shape, new vs `GGML_CUDA_FATTN_TILE_LEGACY=1`): tg 1.12x at n_kv 16384, 1.31x at 32768, 1.46x at
@@ -516,6 +517,97 @@ is worth nothing without it (pageable DtoH is synchronous in the driver: 27.7 vs
 need a segmented path in `ggml_backend_meta_get_tensor_async`, which asserts `n_segments == 1`; the
 real tensors split into 3 (ssm) and 5 (conv) pieces per layer on two GPUs.
 
+### 38 fattn-pb-tiebreak
+
+`ggml/src/ggml-cuda/fattn-common.cuh` and `fattn-tile.cuh` (+58/-13). Plan item C2b, the follow-up
+patch 36 asked for. The `parallel_blocks` search in `launch_fattn` (the non-stream-k path, i.e.
+everything on Pascal) maximises how full a wave of blocks is and never looks at
+`ntiles_KV % parallel_blocks`. Block `y` walks the KV tiles `y, y+pb, y+2pb, ...`, so a block does
+`ceil(ntiles_KV/pb)` tiles and its neighbours one less, and the launch ends when the longest block
+does. At the model's tg shape the search lands on `pb = 112` (`ntiles_dst 2` x 112 = 224 = one full
+wave of 56 SMs x 4 blocks) for every n_kv from 8192 up, so at n_kv 8192 exactly 16 of 112 blocks per
+output tile do a second KV tile: one round of 224 blocks, then a round of 32. Timing the rounds
+apart (launch overhead about 15 us) gives 28 us for the 224-block round and 18 us for the 32-block
+one, and a 128-block round also costs 18 us: below about 128 blocks this kernel is pure latency and
+a ragged tail throws away a whole round.
+
+The patch adds, after the existing search and only when `ncols1 == 1` (one Q column per block) on
+Pascal: `rounds = ceil(ntiles_KV/parallel_blocks)`, then
+`parallel_blocks = max(pb_start, ceil(ntiles_KV/rounds))`. That is by construction the smallest
+`parallel_blocks` with the same number of rounds, so it never adds a round, never adds a wave, only
+lowers `parallel_blocks` (less combine work), and reduces to today's choice whenever the search's
+value is already the smallest with that round count: a tie-break, not a re-optimisation. Two Q
+columns are excluded because the measurement says the opposite there: that kernel does twice the
+arithmetic per K/V byte, is not bandwidth bound, and the concurrency of the larger `parallel_blocks`
+beats the even split by 4-7% on every row. Rejected with numbers (`~/p100-opt/log/C2b-notes.md`
+3.2): "then the larger wave efficiency" (changes nothing at 8192, all of 64..112 have two rounds
+and 112 the best wave fill), an acceptance band around the best wave efficiency (the useful
+candidate sits at 57% wave fill, no band reaches it), a thin-tail test (keeps 8192, drops 12288 and
+32768).
+
+Per launch, tg (1 Q column, D=256, 2 kv heads, GQA 6), packed `ncols2 = 6` path: 61.51 -> 52.15 us
+at n_kv 8192 (1.18x), 71.99 -> 68.17 at 12288, 90.54 -> 87.54 at 16384, 146.12 -> 143.71 at 32768;
+unpacked `ncols2 = 2` path 36.87 -> 34.70 at 4096 (1.06x, `pb` 37 -> 32) at the price of 0.7% at
+8192 and 2.0% at 12288 (`pb` 37 -> 32 there gives up 15% of the blocks to save one sixth of a
+round; the model does not reach that path above 2560 any more). Everything with more than one Q
+column is unchanged to 0.3%: 2, 4, 8, 32, 512 and 2048 columns at n_kv 4096/16384/32768 all measure
+1.000. A `parallel_blocks` sweep over 32..224 (`log/C2b-pbsweep.log`) says the rule picks the
+measured optimum at n_kv 8192, 12288 and 32768 and is 1% off it at 16384; the predictions written
+before the build matched the measurement to under 1% on every row.
+
+With the curve monotonic the GQA 6 gate of patch 36 comes down from `K->ne[1] >= 16384` to 2560 for
+one Q column (`GGML_CUDA_FATTN_GQA6_MIN_KV_DEFAULT`): the packing is 0.96x at n_kv 2304, 1.10x at
+2560 and 1.06x or better at every measured point above it (1.13x at 8192, 1.21x at 12288, 1.30x at
+32768), i.e. it now runs from a context of about 2.3k instead of 16k. Against patch 36 as committed
+the shipped launch is 1.21x at 2560, 1.12x at 4096, 1.21x at 5120, 1.12x at 8192, 1.19x at 12288,
+1.04x at 16384, 1.02x at 32768. Two Q columns keep the search's `parallel_blocks`, so their curve
+still dips (0.86x at n_kv 5632, where 4 of 84 blocks do the second KV round); their gate is
+`max(knob, 7680)` (`GGML_CUDA_FATTN_GQA6_MIN_KV_NCOLS2`), above which every measured point is 1.13x
+or better. With 4 kv heads (a single card) the packing goes from 0.88x to 1.14x at n_kv 4096 (the
+tie-break takes that launch from 67.08 to 49.69 us) and reaches 1.41x at 32768; with GQA 12 from
+0.77x to 1.00x at 4096 and 1.20x at 32768. The `K->ne[2] >= 2` clause is kept: with one kv head
+the packing is 0.76x at 4096 but 1.09x at 16384 and 1.28x at 65536, so it wants a threshold of its
+own (measured, not applied: a model would need a single kv head per GPU).
+
+Model level: unchanged, and that is the arithmetic. `llama-bench -p 0 -n 64 -d 0,4096,8192,16384
+-r 5` gives 31.88/31.91/31.54/30.92 t/s against 31.91/31.94/31.54/30.91 for patch 36, and
+`-p 2048 -d 0,4096` 420.8/397.2 against 419.7/396.5, all inside the +-0.3% the two passes
+reproduce. The model runs about 16 flash-attention launches per token (the token grows 0.61 ms
+between d8192 and d16384 while the launch grows 38 us), so the 5.7 us saved per launch at n_kv 8448
+is 0.29% of a 31.7 ms token. The value of the patch is the per-launch curve and the gate it
+unlocks, not this benchmark; `pp` and the speculative widths are untouched by construction
+(`ncols1` 16, 2, 4, 8).
+
+Correctness: `test-backend-ops -o FLASH_ATTN_EXT` 2942/2942 in all three arms (new, patch 36, legacy),
+full suite 14675/14675 on CUDA1 and 14674/14675 on CUDA0, where the one failure is
+`MUL_MAT(type_a=iq1_s,m=16,n=1,k=4096)` at ERR 6.6e-4 against a 5.0e-4 tolerance, unrelated to
+flash attention and flaky by construction (the suite seeds its tensors from `std::random_device`);
+it passes on two reruns and on the other card with the same binary. `~/p100-opt/c2b/check6.sh` (22
+shapes against the CPU backend, including the ones at and just above the new gate): NMSE 1.9e-6 to
+2.1e-4, within a few percent of the legacy path's and usually slightly smaller, since the combine
+now sums fewer and more even partial results. Perplexity `-c 2048 --chunks 10` identical (5.4367).
+Greedy 128 tokens after a 5391-token prompt at `-c 8192`, which runs the packed kernel with the new
+`parallel_blocks` throughout the generation (n_kv 5632): byte-identical to stock, to patch 36 and
+to the legacy kernels.
+
+Caveats: the rule fires on every one-Q-column `launch_fattn` call on Pascal (tile at any head size,
+VEC) but was measured at D=256 only; Gemma 4's D=512 GQA 8 layers and D=128 models take it
+unmeasured (C6), and the kill switch below is the answer if one of them regresses. The gate scan has
+256-token steps up to 4096 and 4096-token steps above 8192, so a narrow dip between two measured
+points is not excluded. `test-backend-ops` still has no small-batch GQA 6 case; `c2b/check6.sh`
+covers the packed path.
+
+Kill switches: `GGML_CUDA_FATTN_PB_TIEBREAK=0` restores the b10758 search; `GGML_CUDA_FATTN_TILE_LEGACY=1`
+does that too and restores the b10758 kernels; `GGML_CUDA_FATTN_GQA6_MIN_KV=<n>` moves the gate
+(16384 = patch 36, 0 = pack always, also with one kv head). Not done, with numbers: a tie-break for
+two Q columns (that launch loses up to 14% between n_kv 4608 and 6656 but the naive rule costs 4-7%
+there; needs a rule that knows how far the kernel is from bandwidth saturation); the one-kv-head
+clause above 16384 (one line, its own protocol run); `nbatch_fa 32` as the other lever on the tail
+granularity (5-8% slower per launch in C2, never measured together with `pb`). Rebase note: the
+tie-break is one block at the end of the `else` (non-stream-k) branch of `launch_fattn`, and the
+gate is the `gqa6_ok` lines of `launch_fattn_tile_switch_ncols2`; both files are upstream-churned,
+and 36 and 38 touch the same lines (rebase them as a pair).
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -595,6 +687,8 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_FATTN_TILE_LEGACY=1` | 36 | kill switch (b10758 flash-attention tile kernels: old `(256, 256, 2)` entry, no GQA 6 packing) |
 | `GGML_CUDA_FATTN_LOG=1` | 36 | one stderr line per distinct flash-attention launch tuple (kernel kind, ncols1/ncols2, config, blocks per SM, parallel_blocks, grid) |
 | `LLAMA_SERVER_CKPT_SAVE_LEGACY=1` | 37 | kill switch (a freshly allocated buffer for every context checkpoint) |
+| `GGML_CUDA_FATTN_PB_TIEBREAK=0` | 38 | kill switch (b10758 `parallel_blocks` search; `GGML_CUDA_FATTN_TILE_LEGACY=1` implies it) |
+| `GGML_CUDA_FATTN_GQA6_MIN_KV=<n>` | 38 | smallest n_kv for the GQA 6 packing: default 2560 (7680 at 2 Q columns), 16384 = patch 36, 0 = always, also with one kv head |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -809,3 +903,11 @@ on `qwen35` that the kill switches above do not explain points here first.
   against a second save of the same state). The plan's premise was wrong: the DtoH copy is 30.5 ms at
   5.14 GB/s (faster than the 36.9 ms restore); the rest of the old window was the allocation, which was
   hiding ~66 ms of decode in flight. Kill switch `LLAMA_SERVER_CKPT_SAVE_LEGACY=1`.
+- 2026-09-06: local patch 38 (`p100x: 38-fattn-pb-tiebreak`): `parallel_blocks` tie-break in `launch_fattn`
+  (smallest value with the same number of KV rounds; one Q column, Pascal only) and the GQA 6 packing gate
+  of 36 lowered from n_kv 16384 to 2560 (7680 at 2 Q columns), now the knob `GGML_CUDA_FATTN_GQA6_MIN_KV`.
+  Per launch 1.10-1.21x from n_kv 2560 to 12288 against 36, 1.18x at 8192 from the tie-break alone; model
+  tg unchanged within 0.3% (about 16 FA launches per token). FA suite 2942/2942 in all arms, full suite
+  clean on CUDA1 and one unrelated flaky iq1_s case on CUDA0; check6 22 shapes; perplexity identical;
+  greedy byte-identical to stock with the packed kernel running. Kill switches
+  `GGML_CUDA_FATTN_PB_TIEBREAK=0`, `GGML_CUDA_FATTN_TILE_LEGACY=1`.

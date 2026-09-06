@@ -19,6 +19,20 @@ static bool ggml_cuda_fattn_log_enabled() {
     return enabled;
 }
 
+// GGML_CUDA_FATTN_PB_TIEBREAK=0 turns off the parallel_blocks tie-break in launch_fattn;
+// GGML_CUDA_FATTN_TILE_LEGACY=1 turns it off too, so that variable alone restores the b10758 launches.
+static bool ggml_cuda_fattn_pb_tiebreak() {
+    static const bool enabled = []() -> bool {
+        const char * legacy = getenv("GGML_CUDA_FATTN_TILE_LEGACY");
+        if (legacy && atoi(legacy) != 0) {
+            return false;
+        }
+        const char * tb = getenv("GGML_CUDA_FATTN_PB_TIEBREAK");
+        return !(tb && atoi(tb) == 0);
+    }();
+    return enabled;
+}
+
 static void ggml_cuda_fattn_log_once(const char * line) {
     static std::mutex            mtx;
     static std::set<std::string> seen;
@@ -1174,6 +1188,7 @@ void launch_fattn(
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        const int parallel_blocks_start = parallel_blocks;
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
@@ -1195,6 +1210,16 @@ void launch_fattn(
                 efficiency_percent_best = efficiency_percent;
                 parallel_blocks = parallel_blocks_test;
             }
+        }
+
+        // The search ignores ntiles_KV % parallel_blocks: a ragged last KV round runs a few blocks while
+        // the GPU waits and costs as much as a full round. Take the smallest parallel_blocks with the
+        // same round count (same waves, even blocks, less combine work). Measured on GP100 only.
+        if (ncols1 == 1 && parallel_blocks > 1 &&
+                GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA &&
+                ggml_cuda_fattn_pb_tiebreak()) {
+            const int rounds = (ntiles_KV + parallel_blocks - 1) / parallel_blocks;
+            parallel_blocks  = std::max(parallel_blocks_start, (ntiles_KV + rounds - 1) / rounds);
         }
 
         blocks_num.x = ntiles_x;
