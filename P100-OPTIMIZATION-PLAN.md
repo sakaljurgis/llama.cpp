@@ -411,12 +411,18 @@ Items:
   context: cuBLAS GEMM kernels vs `dequantize_block*` vs `to_fp32` (`convert_unary`) vs fattn vs
   NCCL/allreduce vs everything else. This decides A2-A5. Expected: dequant + conversions 5-15%
   at `-ub 512`, 2-4% at `-ub 2048`; attention grows with context.
-- A2 Vectorize the dequant-to-F16 kernels for the types in use (Q4_K, Q6_K, Q5_K, Q8_0 already
+- A2 DONE 2026-09-07 (`p100x: 39-convert-vec`, together with A3'; numbers in the Tier 1 table and
+  P100-PATCHES.md 39). The premise below was wrong: block packing alone is a no-op, the kernels are
+  store bound, and the fix is the 8-byte store of each contiguous group (Q4_K, IQ4_XS). Original item:
+  Vectorize the dequant-to-F16 kernels for the types in use (Q4_K, Q6_K, Q5_K, Q8_0 already
   done; later Q4_K_XL types). Pattern: the existing `dequantize_block_q8_0_f16` (shared memory
   staging, `half2` stores). Target: one super block per warp, 8-byte stores (`ggml_cuda_get_max_cpy_bytes`
   is 8 on sm_60). Gain: bounded by A1's dequant share. Effort: small. Risk: low; `test-backend-ops`
   covers `CPY`/`MUL_MAT` for every type. Kill switch: `GGML_CUDA_DISABLE_DEQUANT_VEC`.
-- A3 Skip the F16 -> F32 output pass when the consumer is the next GEMM or a fusable op: not
+- A3 Measured 2026-09-07: `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` gives pp2048 420.9 -> 272.1 t/s (-35%),
+  perplexity 5.4094 against 5.4367; dead as written. What paid is A3' = vectorize the pass itself
+  (DONE as `p100x: 39-convert-vec`: `convert_unary` 165 -> 520 GB/s, +5.55% pp2048). Original item:
+  Skip the F16 -> F32 output pass when the consumer is the next GEMM or a fusable op: not
   possible without a graph rewrite; instead measure `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` (F32
   compute, F32 output directly, no conversion pass, but half the FLOPS). Expected: slower; do it
   once to have the number and to see whether F16 accumulation costs accuracy (perplexity check,
@@ -496,6 +502,9 @@ Items:
   `ggml_cuda_should_fuse_mul_mat_vec_q` removed, `llama-bench -n 64` A/B. Upstream's "not
   universally faster" predates patches 02/07/10 (rows per block and the activation cache change
   the economics). Effort: trivial. Kill switch: `GGML_CUDA_DISABLE_FUSE_MMVQ` if it stays in.
+  Correction 2026-09-07: not trivial any more, see the Tier 1 row: `ggml_cuda_mmvq_k_f16_sm60_supported`
+  returns false when `fusion` is set, so the fused pairs would leave the HFMA2 kernel. Needs a fused
+  GLU epilogue in that kernel first.
 - B3 `[SRV]` MMVQ achieved bandwidth per type with `test-backend-ops -o MUL_MAT perf` at the
   model's real shapes (m = 5120/13824-ish rows, k = 5120, n = 1..8, types q4_K, q6_K, q5_K, q8_0):
   compare against microbenchmark 1.8.3 (copy kernel bandwidth). If MMVQ for Q4_K/Q6_K is under
@@ -676,7 +685,9 @@ Items:
 - E4 `rope.cu` uses `dim3(1, CUDA_ROPE_BLOCK_SIZE, 1)` blocks with `n_blocks_x = ceil(ne00 / (2*BLOCK))`;
   at tg a single token means very few blocks. Only relevant if E1 shows rope > 2% of the step;
   else skip.
-- E5 `rms_norm_f32<1024>` register cache (patch 17) applies when `1024 < ncols <= 4096`; Qwen3.8's
+- E5 DONE 2026-09-07 (`p100x: 40-norm-cache-5120`): `n_embd` is 5120, the cache never fired; `max_cache`
+  5 gives 1.63x per launch in isolation, 1.16x in the model, tg +0.6%. Original item:
+  `rms_norm_f32<1024>` register cache (patch 17) applies when `1024 < ncols <= 4096`; Qwen3.8's
   `n_embd` decides whether it fires (5120 would not: > 4096). Check `n_embd` in the GGUF and, if
   it is 5120, extend `max_cache` to 5 or 6 in a scratch build and measure `test-backend-ops -o
   RMS_NORM perf` at that width. Trivial change if it helps.
@@ -1100,12 +1111,12 @@ Keep mmap.
 | G2 | CUDA graphs on Pascal (remove the `cc < VOLTA` gate), validate with `-sm none` first | +10-30% tg single card if launch-bound | G1 |
 | A4 | chunked dequant + GEMM for huge src0 (LM head) | removes the OOM, frees ~1.3 GB per card | A1 (optional) |
 | F5 | internal allreduce on sm_60 (`__nanosleep` replacement) | A/B vs NCCL at tg; may win 1-3 ms per token | F1 F2 |
-| B2 | re-enable MMVQ gate/up fusion on Pascal | 0-3% tg | B1 |
+| B2 | re-enable MMVQ gate/up fusion on Pascal. Correction 2026-09-07: no longer trivial. The HFMA2 K-quant matvec (patches 32-34) bails out when a fusion is requested, so lifting the `cc <= PASCAL` gate in `ggml_cuda_should_fuse_mul_mat_vec_q` would route the fused gate/up matvecs back onto the int8 path and lose the B4 gains; it needs a fused GLU epilogue in `mmvq-k-f16-sm60.cu` first (Tier 2 effort) | 0-3% tg | B1, B4b |
 | C4 | NO (2026-09-05, C2 measurement): the `parallel_blocks` search already fills exactly one wave at tg (`ntiles_dst` 6, `max_blocks_per_sm` 4, `pb` 37, 222 of 224 block slots, 99% efficiency at every depth from 4k up); forcing 2x costs 6% at 32k and 21% at 4k, 4x costs 83% at 32k. What the search does miss is the ragged last KV tile (`ntiles_KV % pb`), which makes the `ncols2 = 6` packing of C2 non-monotonic between 2k and 8k: see C2b. The C2b sweep confirms the direction: at the model's tg shape every `pb` above the search's value is slower (n_kv 8192: 52 us at 64, 61.5 at 112, 65.7 at 128); what was left on the table was the smaller value with the same round count (patch 38) | - | C1 |
-| E5 | `rms_norm` register cache width for `n_embd` 5120 | < 1% | E1 |
+| E5 | DONE 2026-09-07 as `p100x: 40-norm-cache-5120`: `max_cache` becomes a template parameter with default 5 so a 5120-wide row is cached (patch 17 stopped at 4096 and never fired on this model); 6.33 -> 3.89 us per run at 5120x1 in test-backend-ops perf, 10.2 -> 8.8 us per launch in the model at 129 launches per token per card; tg 31.91 -> 32.11 t/s at d0 (+0.63%) and 30.91 -> 31.10 at d16384 (+0.61%), pp2048 unchanged, output byte-identical; registers unchanged, no spills | left: nothing for this model; 6144-wide rows would need `max_cache` 6, which fits the register budget | E1 |
 | D4 E6 | one or two extra fusion rules from the census | ~0.5% per launch removed | D1 E1 |
 | I1 | prefilter condition vs suppress tokens | up to 2% tg if the prefilter was off | I1 measurement |
-| A2 | vectorized dequant for Q4_K/Q6_K | 2-10% pp at small `-ub`, ~1% at 2048 | A1 |
+| A2 A3 | DONE 2026-09-07 as `p100x: 39-convert-vec`: A3' vectorizes the contiguous F16/BF16 <-> F32 conversion around every cuBLAS GEMM (4 elements per thread, 8-byte transfers, grid covering the data) and A2 issues the contiguous store group of `dequantize_q4_K` and `dequantize_iq4_xs` as one 8-byte transfer with 8 super blocks per 256-thread block; pp2048 420.8 -> 449.4 t/s at `-ub 2048` (+6.8%; A3' +5.55%, A2 +1.22%) and 235.1 -> 248.3 at `-ub 512` (+5.6%; A3' +3.18%, A2 +2.92%), tg unchanged, output byte-identical (perplexity 5.4367 in every arm incl. stock, greedy identical); `convert_unary` 165 -> 520 GB/s (29% -> 93% of the 560 GB/s ceiling), q4_K dequant 168 -> 461 GB/s, iq4_xs 212 -> 330 | left: the plan's A2 premise was wrong (block packing alone is a no-op, the kernels are store bound); q5_K needs a different index assignment inside `dequantize_q5_K` for a 4-element store group, about 0.5% of pp2048; `getrows.cu` could ask for the same vector store; 16-byte transfers and a bounded grid both lose (What not to do); A3 as written (F32 compute) measured dead: -35% pp | A1 |
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
 | A8 | DONE 2026-09-05 as `p100x: 35-mmvq-cols-sm60`: loop the matvec over balanced column chunks (target 7, floor 6) for 9..N columns on GP100, per-type ceiling Q4_K 64, Q5_K 48, Q6_K 32, IQ4_XS 64, int8 32; pp9 3.87x, pp16 2.84x, pp28 2.30x, pp32 1.93x, pp48 1.43x, pp64 1.12x, unchanged at 96 and above; the 25k-chat follow-up prompt phase 710 -> 434 ms and the request 1.34 -> 1.07 s; tg and pp2048 unchanged | the LM head F16 copy is gone at these widths (small-batch half of A4); J4b is now the larger half of a follow-up; verify widths 9-64 are 1.1-3.9x cheaper (J5) | J4 |
 | J4b | DONE 2026-09-06 as `p100x: 37-server-ckpt-save`: recycle the storage of an erased context checkpoint instead of allocating a fresh 149.6 MiB vector per save; checkpoint save 112.4 -> 96.4 ms, follow-up prompt phase 433.3 -> 416.9 ms (-3.8%), wall 1.060 -> 1.057 s (inside the noise), RSS unchanged; checkpoints byte-identical (17/17 against a second save of the same state) | the item's premise was wrong: the 149.6 MiB DtoH costs 30.5 ms (5.14 GB/s), faster than the 36.9 ms HtoD restore; the old 112 ms was 8.5 ms free + 72.8 ms allocate/first-touch + the copy, and the allocation was hiding ~66 ms of decode in flight that `ctx->synchronize()` now waits for. Left: that wait plus 30 ms of copy; only a pinned buffer touches the copy (save 30 -> 16 ms, restore 35 -> 18 ms; needs a pinned allocator and up to `--ctx-checkpoints` (default 32) x 149.6 MiB locked per slot); edit/regenerate requests are not covered (their checkpoint is dropped outside `create_checkpoint`) | J4 |
@@ -1159,6 +1170,25 @@ Keep mmap.
 - Do not force `parallel_blocks` above the search result on Pascal (C4, 2026-09-05): the search fills
   exactly one wave at tg; 2x costs 6-21%, 4x up to 83%. The one thing it misses is the ragged last KV
   tile (C2b).
+- Do not pack the K-quant dequantizers into 256-thread blocks and stop there (A2, 2026-09-07): one
+  super block per warp with 8 warps per block is byte-identical and a no-op on its own (q4_K 151 -> 153
+  GB/s, q5_K 214 -> 214, q6_K 329 -> 331, iq4_xs 177 -> 192, q3_K 189 -> 176). These kernels are store
+  bound, not launch bound. The win is in the store: 4 contiguous elements as one 8-byte transfer takes
+  q4_K to 377 GB/s, and only then does block packing add the rest (460 GB/s). q6_K writes singles at a
+  stride of 32 elements and is already at 58% of the ceiling.
+- Do not use 16-byte transfers for the contiguous convert on GP100 (A3', 2026-09-07): Pascal has
+  `LDG.128`/`STG.128` and `ggml_cuda_get_max_cpy_bytes()` returns 8 for sm_60, but 16 only ties for
+  f32 -> f16 (544 GB/s) and loses 15% for f16 -> f32 (417 against 494). More elements per thread lose
+  in every direction, badly for bf16 (16 elements with 8-byte transfers is 157 GB/s for f32 -> bf16,
+  slower than the scalar kernel). Data point for C5.
+- Do not give the contiguous convert a bounded grid with a grid-stride loop (A3', 2026-09-07): the
+  usual streaming-kernel shape (a few blocks per SM) costs 1% for f32 -> f16 and 11% for f16 -> f32
+  against letting the grid cover the data. What the P100 could not retire was 40960 blocks moving
+  1.5 KB each, not a large block count as such.
+- Do not run the cuBLAS path with `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` for speed or memory (A3,
+  2026-09-07): it drops both conversion passes and the F16 dequant target and still loses 35% of pp2048,
+  because the halved HFMA2 rate costs far more. Its perplexity (5.4094 vs 5.4367) is only the price
+  tag of F16 accumulation.
 
 ## 4. Measurement and validation protocol
 
@@ -1324,6 +1354,13 @@ llama.cpp behavior on this hardware:
 28. Upstream churns `ggml-cuda.cu` (fusion region), `mmvq.cu`, `common/sampling.cpp` and
     `ggml-backend-meta.cpp`; every new patch in those files is rebase cost. Keep patches small
     and behind kill switches.
+29. A copy of `build/bin` is not a frozen base arm: the binaries carry
+    `RUNPATH=<tree>/build/bin`, so after a rebuild they silently load the new `libggml-cuda.so`
+    (found 2026-09-07, A3: the "base" arm reported the new numbers). Export `LD_LIBRARY_PATH` to
+    the copy, or `patchelf --set-rpath '$ORIGIN'` on it, before trusting a number from it.
+30. `test-backend-ops` has no `RMS_NORM` case between 4096 and 5120 columns and none with one row,
+    so a norm change at this model's `n_embd` is invisible to the suite; use the model (greedy and
+    perplexity identity) plus a temporary local case that never enters the patch.
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
@@ -1382,6 +1419,9 @@ Original list:
 | `GGML_CUDA_FATTN_LOG=1` | patch 36: one line per distinct flash-attention launch (kernel, ncols1/ncols2, config, parallel_blocks, grid) |
 | `GGML_CUDA_FATTN_PB_TIEBREAK=0` | patch 38 kill switch: b10758 `parallel_blocks` search (implied by `GGML_CUDA_FATTN_TILE_LEGACY=1`) |
 | `GGML_CUDA_FATTN_GQA6_MIN_KV=<n>` | patch 38: smallest n_kv for the GQA 6 packing (default 2560, 7680 at 2 Q columns; 16384 = patch 36; 0 = always) |
+| `GGML_CUDA_DISABLE_CONVERT_VEC=1` | patch 39 kill switch: scalar `convert_unary` for the contiguous F16/BF16 <-> F32 conversions |
+| `GGML_CUDA_DISABLE_DEQUANT_VEC=1` | patch 39 kill switch: scalar stores and one super block per block for the Q4_K/IQ4_XS dequant |
+| `GGML_CUDA_NORM_CACHE_LEGACY=1` | patch 40 kill switch: `rms_norm` register cache limited to 4096 columns (patch 17) |
 
 ## Appendix B: reading order for a new agent
 
