@@ -150,6 +150,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 38 | fattn-pb-tiebreak | sm_60 (CUDA) | yes (every one-Q-column flash-attention launch; GQA 6 packing now from n_kv 2560) |
 | 39 | convert-vec | CUDA (all archs, measured on sm_60) | yes (every dequant + cuBLAS matmul: pp at every ubatch, the LM head above 64 columns, the BF16 allreduce wire) |
 | 40 | norm-cache-5120 | CUDA | yes (every `rms_norm` of a 4097-5120 wide row: all 129 per-token norms of Qwen3.8-27B) |
+| 41 | mmvq-k-f16-range | sm_60 (CUDA) | yes (every Q6_K matvec at widths 1-8 and IQ4_XS at 4-8; bug fix for 32/33, found on Gemma 4 31B) |
 
 ### 31 server-ckpt-adopt
 
@@ -744,6 +745,65 @@ Perplexity 5.4367, identical to base and stock; 256 greedy tokens byte-identical
 Kill switch `GGML_CUDA_NORM_CACHE_LEGACY=1`: the 4-value limit of patch 17. Rebase note: patches 17,
 19 and 40 all live in the `rms_norm_f32` kernel and its launchers; rebase them as a group.
 
+### 41 mmvq-k-f16-range
+
+`ggml/src/ggml-cuda/mmvq-k-f16-sm60.cu` (+69/-6). Plan item B4d, a correctness fix for patches 32/33:
+on Gemma 4 31B UD-Q4_K_XL the HFMA2 K-quant matvec produced nan logits at every matvec width (C6:
+perplexity nan at `-ub 1`, chat output `<unused49>`, `GGML_CUDA_DISABLE_MMVQ_F16_K=1` needed at
+-19% tg), while the cuBLAS arm was exact and Qwen3.8-27B never showed it.
+
+The kernel's numerics comment justified the F16 accumulation with `a' = a/amax`, so `|q*a'| <= 15`
+and 16 products fit one half2. That bound is a 4-bit one. Q6_K expands to `q` in -32..31 and its
+sub-block scale is an int8 that reaches -128 (`quantize_row_q6_K` sets `iscale = -128/max_scale`, so
+the largest sub-block of nearly every block gets exactly -128), and a Q6_K lane owns 4 sub-blocks,
+i.e. 4 accumulators of 8 products each. So `T = sum_j acc_j*sc_j` reaches 4*8*32*128 = 131072 and
+`hs = T.low + T.high` 262144, against a half maximum of 65504. Q4_K and Q5_K stay inside range
+(240*63*2*2 = 60480, 8% of margin). IQ4_XS is the second type over: its weights come from
+`kvalues_iq4nl` (|v| <= 127), its lane accumulates 16 products and its scale is `ls - 32`, so
+2*16*127*32 = 260096.
+
+Measured, not argued: `GGML_A16K_CHECK=1` names the first call whose dst is not finite, together
+with the non-finite count of src1 and the per-block amax stats, and it points at
+`blk.44.attn_v.weight` (q6_K, k=5376, 21 blocks, 17 columns) with `dst[652]=inf`, `src1_bad=-1`,
+amax between 0.84 and 557, no zero, denormal or out-of-half amax; every offender after it is a Q4_K
+call that already receives a non-finite src1. A temporary per-thread maximum of |hs| in the Q6_K
+epilogue grows layer by layer over the same prompt (blk.0 19504, blk.1 29248, blk.31 34048, blk.36
+41408, blk.42 55808, blk.43 62336) and first crosses 65504 at 71552 on exactly that tensor, so the
+model needs 44 layers of Gemma's growing residual to reach the limit and Qwen's shapes never do.
+That also explains C6's "Q4_K and Q6_K are both needed": the inf is produced by Q6_K but the value
+that overflows depends on the activations the Q4_K matvecs of the layers before it produced.
+
+The fix is 6 lines in the two epilogues that are over the bound: the sub-block scale is multiplied
+by 1/8 (one `__hmul2` per packed pair, so 2 per row per block step) and d by 8 (one `__hmul`). Both
+factors are exact powers of two and they cancel, so the half that `__hmul(hs, d)` produces is bit
+for bit the one the unscaled math produced wherever the unscaled math did not overflow, and the
+intermediates drop to |T| <= 16384 and |hs| <= 32768, half the limit at the worst case. Q4_K and
+Q5_K keep their instruction count. The alternatives were worse: an FP32 epilogue costs ~14 ops per
+row and column per block step instead of 3, and scaling the activations in the quantizer is free but
+pushes small activations into half denormals and loses byte identity.
+
+Cost, Qwen3.8-27B: tg64 d0 32.117 -> 32.090 t/s (-0.08%), pp8 -0.23%, pp32 -0.33% (pp4 inside its
+own 5% arm spread); perplexity 6.2366 at `-ub 1` and 5.4074 at `-ub 8` in both arms to four
+decimals; 256 greedy tokens byte-identical. Gemma 4 31B: nan gone, 64 greedy chat tokens
+byte-identical to stock, perplexity identical to stock on the cuBLAS arm (16907.5661) and finite
+(25324.9381) where the branch was nan, tg64 d0 28.79 -> 28.66 t/s (-0.46%, 1.634x stock against
+1.328x with the kill switch). KL divergence against stock logits saved at `-ub 1` over 4 wikitext
+chunks: mean 0.192, 99th 3.81, top-1 89.49%; the same protocol with the matvec switched off gives
+0.172 and 90.81%, so the F16 accumulation itself is worth 0.020 KLD and 1.3 points on this model
+and 0.000056 KLD and nothing measurable on Qwen (0.000438 against 0.000382, top-1 99.22% against
+99.05%). Full `test-backend-ops` 14675/14675 on CUDA0 and CUDA1, `-o MUL_MAT` 1253/1253. ptxas: no
+spills anywhere, 75 of 534 instantiations move, the shipped Q6_K configs 126 -> 124 (width 1),
+255 -> 252 (width 2) and 149 -> 148 (width 3) registers.
+
+No kill switch of its own: it is a bug fix and the existing `GGML_CUDA_DISABLE_MMVQ_F16_K` and
+`..._TYPES` still turn the whole path off. New debug knob `GGML_A16K_CHECK=1` (off by default):
+after every launch it synchronizes, copies dst, src1 and the per-block amax array to the host and
+prints the first 8 calls whose dst is not finite with the non-finite count of src1 and the amax
+stats. Run it, plus a chat greedy sample, on every model that is new to the branch (plan gotcha 31).
+Not done: the F16 accumulation is still what it is, so a model with wider activation swings than
+Gemma's can lose more top-1 than the 1.3 points measured here; a per-model accuracy gate is not part
+of this patch.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -828,6 +888,7 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_CONVERT_VEC=1` | 39 | kill switch (contiguous F16/BF16 <-> F32 conversion back to the one-element-per-thread `convert_unary`) |
 | `GGML_CUDA_DISABLE_DEQUANT_VEC=1` | 39 | kill switch (Q4_K and IQ4_XS dequant back to per-element stores and one super block per CUDA block) |
 | `GGML_CUDA_NORM_CACHE_LEGACY=1` | 40 | kill switch (`rms_norm_f32` register cache limited to 4 values per thread, `ncols <= 4096`, as in patch 17) |
+| `GGML_A16K_CHECK=1` | 41 | debug: sync after every HFMA2 K-quant launch and print the first 8 calls with a non-finite dst (tensor, type, shape, block count, first bad value, non-finite count of src1, per-block amax stats) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -842,48 +903,11 @@ LCP slot matching in the server.
 
 ## Runtime notes (2x P100, `-sm tensor`)
 
-- KNOWN ISSUE (2026-09-07, plan item C6): on Gemma 4 31B (UD-Q4_K_XL) patches 32/33 produce nan logits
-  at matvec widths (perplexity nan at `-ub 1`, chat output degenerates to a filler token) while the
-  cuBLAS path is exact. `GGML_CUDA_DISABLE_MMVQ_F16_K=1` restores stock output byte for byte at -19% tg;
-  so does `GGML_CUDA_DISABLE_MMVQ_F16_K_TYPES=q4_K` or `=q6_K` alone (q5_K alone does not help), so the
-  failure needs the Q4_K and the Q6_K path together (ffn gate/up feeding ffn down). Qwen3.8-27B is not
-  affected. Fix in progress as plan item B4d; do not serve Gemma 4 from this branch without the switch.
-- Batches wider than 8 columns run quantized matmuls through dequantize-to-F16 + cuBLAS on
-  sm_60 (MMQ is excluded below DP4A for dense `MUL_MAT`, see `ggml_cuda_should_use_mmq`; since
-  #26264 upstream allows it for `MUL_MAT_ID` only). The
-  F16 copy lives in the CUDA temp pool for the call. Prompt processing sizes the pool for
-  the layer matrices, but the LM head only ever runs at width 1 there (logits for the last
-  token), so the first time more than 8 positions need logits - a speculative verify batch
-  with a draft longer than 7 tokens - `output.weight` (~1.3B params on Qwen3.8-27B) gets a
-  ~2.5 GB F16 copy, ~1.3 GB per card. With the cards at ~94% that is
-  `CUDA error: out of memory` in `ggml_cuda_mul_mat_cublas_impl<F16>` on the first draft.
-  Either keep drafts <= 7 (`--spec-draft-n-max 7`, `--spec-ngram-mod-n-max 7`; MTP with
-  `n-max 4` is fine) or free ~1.3 GB per card by lowering `--ctx-size`.
-- `draft-mtp` on this model (head is in the main GGUF, no sidecar needed): acceptance
-  0.78-1.00, but with `--draft-p-min 0.75` the verify width changes every step, graph reuse
-  drops to ~10% and each miss is a meta-backend re-split (15-20 ms). Measured 2026-08-26:
-  short replies 30-38 t/s, long reasoning outputs 23-25 t/s at 15-38k context vs ~27
-  without MTP; prompt processing ~25% slower and ~1 s fixed cost per request. Untested
-  fixes: `--draft-p-min 0` (constant width 5, reuse should recover), patch 22.
-- `ngram-mod` costs nothing when it does not draft; see the first note for the draft length
-  limit. Measured 2026-08-26 with `n-max 7 n-min 4` at 200k ctx: tg 27.1-27.4 t/s flat at
-  25-27k context (= no-speculation baseline), drafts fire on ~1% of reasoning tokens
-  (acceptance 0.64-1.0 when they do). Harmless; only pays on repetitive output.
-- The fixed ~1 s prompt phase per request on short follow-ups (`929 ms / 55 tokens`) was the
-  server's checkpoint logic for recurrent models, not the meta-backend re-splits and not
-  `--cache-ram` (measured identical at 16384 and 0; with `--parallel 1` the slot is always
-  re-selected by prefix similarity, so the host KV save never runs). Patch 31 removes most of it;
-  what remains (~730 ms) is one 150 MiB checkpoint save (~200 ms) and a 28-token decode through
-  the dequant + cuBLAS path (~390 ms), see `P100-OPTIMIZATION-PLAN.md` items J4b and A8.
-- Measured 2026-09-03 with the standard protocol (`P100-OPTIMIZATION-PLAN.md` section 4): branch
-  pp2048 421 t/s, tg 29.3 t/s at depth 0 (stock 417 / 21.6); tg is matvec-bound, `mul_mat_vec_q`
-  is 77% of the step at 315 GB/s of the 603 GB/s the card delivers; GPU busy 97%, so launch
-  overhead and CUDA graphs are not a lever on Pascal. `NCCL_P2P_LEVEL=SYS` is worth +1.5% pp,
-  +0.9% tg (NCCL otherwise bounces through host memory). `--load-mode dio` loads in 70 s from the
-  HDD vs 4 s for mmap; keep mmap.
-- 2026-09-04, same protocol: with patches 32-34 tg is 31.7 t/s at depth 0 and 30.5 at depth
-  16384 (int8 path 29.3 / 28.2). The Q4_K, Q5_K and Q6_K matvecs run on HFMA2; IQ4_XS stays on
-  the int8 path at widths 1-3 (already ~400 GB/s there) and is now the largest tg kernel (21%).
+- FIXED by patch 41 (2026-09-07, plan items C6 and B4d): on Gemma 4 31B (UD-Q4_K_XL) patches 32/33
+  produced nan logits at matvec widths, a half range overflow in the Q6_K epilogue (IQ4_XS had the same
+  defect latent). With 41 the chat output is byte-identical to stock and tg is 1.63x stock. Every model
+  that is new to the branch gets a run with `GGML_A16K_CHECK=1` and a chat greedy sample before it is
+  served (plan gotcha 31).
 
 ## Updating to a new upstream
 
@@ -1074,3 +1098,9 @@ on `qwen35` that the kill switches above do not explain points here first.
   flash-attention regression on 11 launch shapes, the patch 38 tie-break gains 1.094x on the D=512 GQA 8
   launch at n_kv 4096; tg 17.5 -> 28.8 t/s at d0 vs stock (1.645x), pp2048 362 -> 385 (1.063x). Found the
   nan of patches 32/33 on this model (see Runtime notes); patch 40's cache does not fire at n_embd 5376.
+- 2026-09-07: local patch 41 (`p100x: 41-mmvq-k-f16-range`): the Q6_K and IQ4_XS epilogues of the HFMA2
+  K-quant matvec take the sub-block scale times 1/8 and d times 8 (both exact, product unchanged) so the
+  half intermediates stay inside range; the old 4-bit bound let Q6_K reach 2^18 and overflow to inf on
+  Gemma 4 31B (layer 44 attn_v first, nan logits at every matvec width). Gemma chat byte-identical to
+  stock, tg 1.63x stock (-0.46% vs the broken build); Qwen byte-identical, tg -0.08%; full suite
+  14675/14675 on both cards. Debug knob `GGML_A16K_CHECK=1`.
