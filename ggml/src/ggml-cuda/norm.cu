@@ -81,7 +81,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_pre_add = false, int max_cache = 5>
+template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_pre_add = false, int max_cache = 6>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -622,7 +622,7 @@ static void group_norm_f32_cuda(
     }
 }
 
-// max_cache 5 so a 5120-wide row is cached too; GGML_CUDA_NORM_CACHE_LEGACY=1 keeps the old limit of 4
+// max_cache 6 so a 5376-wide row (Gemma 4) is cached too; GGML_CUDA_NORM_CACHE_LEGACY=1 keeps the old limit of 4
 // only the scalar <1024> instantiations have the register cache, every other one is launched as is
 template <int block_size, int vpt, bool do_vec, bool do_multiply, bool do_add, bool do_scale, bool do_pre_add, typename... Args>
 static void rms_norm_f32_launch(const ggml_cuda_kernel_launch_params & launch_params, Args &&... args) {
@@ -632,7 +632,7 @@ static void rms_norm_f32_launch(const ggml_cuda_kernel_launch_params & launch_pa
         if (legacy) {
             ggml_cuda_kernel_launch(rms_norm_f32<block_size, vpt, do_vec, do_multiply, do_add, do_scale, do_pre_add, 4>, launch_params, std::forward<Args>(args)...);
         } else {
-            ggml_cuda_kernel_launch(rms_norm_f32<block_size, vpt, do_vec, do_multiply, do_add, do_scale, do_pre_add, 5>, launch_params, std::forward<Args>(args)...);
+            ggml_cuda_kernel_launch(rms_norm_f32<block_size, vpt, do_vec, do_multiply, do_add, do_scale, do_pre_add, 6>, launch_params, std::forward<Args>(args)...);
         }
     } else {
         ggml_cuda_kernel_launch(rms_norm_f32<block_size, vpt, do_vec, do_multiply, do_add, do_scale, do_pre_add>, launch_params, std::forward<Args>(args)...);
