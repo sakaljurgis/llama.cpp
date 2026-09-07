@@ -88,6 +88,11 @@ Applied without conflict but did not compile: upstream #26276 removed
 takes the vocab now and repeats that condition, so the prefilter stays off whenever a
 logit-bias sampler is in the chain. The clone initializer also copies `pf_nkeep`.
 
+2026-09-07 (plan I1): the prefilter was live for plain chat only. A request that carries `tools`
+with `tool_choice` auto gets a lazy grammar from the chat template, and `common_sampler_sample`
+skipped the prefilter for every token while a grammar was present (with thinking on it ran only
+inside the thinking block). None of the three GGUFs has suppress tokens. Fixed by patch 43.
+
 ### 22 decode-sched-slots
 
 Upstream renamed the sampling copy helpers (`copy_tensor_async_ints/floats/candidates` ->
@@ -152,6 +157,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 40 | norm-cache-5120 | CUDA | yes (every `rms_norm` of a 4097-5120 wide row: all 129 per-token norms of Qwen3.8-27B) |
 | 41 | mmvq-k-f16-range | sm_60 (CUDA) | yes (every Q6_K matvec at widths 1-8 and IQ4_XS at 4-8; bug fix for 32/33, found on Gemma 4 31B) |
 | 42 | norm-cache-5376 | CUDA | yes (every `rms_norm` of a 5121-6144 wide row: Gemma 4 31B's n_embd 5376) |
+| 43 | sampler-prefilter-grammar | host (sampling) | yes (every request that carries `tools` with `tool_choice` auto, the coding-harness shape, where patch 13 was off; the MTP verify step doubles the gain) |
 
 ### 31 server-ckpt-adopt
 
@@ -816,6 +822,34 @@ were already cached and the extra iteration is predicated off), `test-backend-op
 at 32 instead of 31, no spills. `GGML_CUDA_NORM_CACHE_LEGACY=1` still gives the 4-value limit of
 patch 17.
 
+### 43 sampler-prefilter-grammar
+
+`common/sampling.cpp` (+5/-3). Plan item I1: the patch 13 prefilter is gated on
+`!(grammar_first && grammar_should_apply(gsmpl))` instead of `!grammar_should_apply(gsmpl)`; the
+reasoning-budget FORCING clause is unchanged. Any request with `tools` and `tool_choice` auto
+carries a lazy grammar from the chat template, which switched the prefilter off for every token
+(with thinking on: for every token after the thinking block), and that is the production request
+shape of a coding harness, so patch 13 was not running where it matters. Measured on Qwen3.8-27B
+Q4_K_M through the server (temperature 0, 512-token replies, 5 alternated server starts per arm,
+default sampling from the GGUF: top_k 20, penalties off, so `pf_nkeep` 20 of 248320): plain chat
+30.92 vs 31.38 ms per token with the prefilter on vs off (+1.45% tg; +3.42% under `--spec-type
+draft-mtp`, where sampling runs once per draft position); a tools request with thinking off ran
+at 31.44 ms in both arms before this patch (0 of 512 samples prefiltered) and at 30.98 ms after it
+(512 of 512, +1.47%); plain chat unchanged (+0.01%).
+
+Why it is exact: the server (and everything on the branch except the draft-side samplers in
+`common/speculative.cpp`) leaves `grammar_first` false, so the grammar runs after the chain as
+rejection sampling. The prefilter hands the chain a superset of the top-k set, so the same token
+is selected with the same RNG draw; if the grammar rejects it, the resample path rebuilt the whole
+vocabulary before this patch already, so both arms resample from identical candidates. With
+`grammar_first` true the grammar masks tokens before top-k and the prefilter stays off as before.
+Gates: 512-token replies (content and reasoning_content) and two real tool calls (8 coding-tool
+schemas plus `get_weather`) byte-identical between the untouched and the patched library; the
+grammar rejected nothing in any measured request (resample count 0). No switch of its own:
+`LLAMA_SAMPLER_PREFILTER=0` disables the prefilter as a whole. Measured alongside: sampling plus
+server bookkeeping is 0.054 ms per token with the prefilter live (server 30.928 vs llama-bench
+30.874 ms per token at d128), so plan item I2 needs no work.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -878,7 +912,7 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_CPY_ROWS` | 26 | kill switch |
 | `GGML_CUDA_DISABLE_CONCAT_ROWS`, `GGML_CUDA_DISABLE_FUSE_CONCAT_GATHER` | 27 | kill switches |
 | `GGML_CUDA_DISABLE_TOP_K_PARTIAL` | 28 | kill switch (not on the branch) |
-| `LLAMA_SAMPLER_PREFILTER=0` | 13 | kill switch |
+| `LLAMA_SAMPLER_PREFILTER=0` | 13, 43 | kill switch (43 has none of its own) |
 | `LLAMA_DEC_SLOTS=N` (default 4, 0 = off), `LLAMA_DEC_MAX_TOK` (default 4) | 22 | decode slots (not on the branch) |
 | `LLAMA_MTP_DRAFT_VOCAB=<file>` | 15 | enable draft vocab subset |
 | `GGML_A16_*` | 12 | Q4_1 HFMA2 kernel tuning |
@@ -1119,3 +1153,9 @@ on `qwen35` that the kill switches above do not explain points here first.
 - 2026-09-07: local patch 42 (`p100x: 42-norm-cache-5376`): `rms_norm_f32` register cache limit 5 -> 6 values
   per thread so rows up to 6144 columns are cached; Gemma 4 31B (n_embd 5376) tg64 28.63 -> 29.08 t/s (+1.6%),
   Qwen unchanged, registers 30-32, no spills, output byte-identical.
+- 2026-09-07: local patch 43 (`p100x: 43-sampler-prefilter-grammar`): the patch 13 prefilter now runs
+  with a grammar in the chain unless `grammar_first` is set (rejection sampling already rebuilds the
+  vocabulary on a reject, so the token is the same); a request with `tools`, the coding-harness shape,
+  had 0 of 512 samples prefiltered and gains 1.47% tg (31.44 -> 30.98 ms per token; the prefilter is
+  worth 1.45% on plain chat and 3.4% under MTP); replies and tool calls byte-identical, no grammar
+  rejection observed. No new switch (`LLAMA_SAMPLER_PREFILTER=0`).

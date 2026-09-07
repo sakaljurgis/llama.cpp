@@ -765,9 +765,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
     // The prefilter drops everything that top-k would drop anyway, so it is only equivalent while
-    // nothing else needs the full vocabulary: a grammar masks arbitrary tokens, and a reasoning
-    // budget in FORCING state keeps exactly one token that need not be among the highest logits.
-    const bool prefilter = !grammar_should_apply(gsmpl) &&
+    // nothing else needs the full vocabulary before the chain: a grammar applied first, or a
+    // reasoning budget in FORCING state (one forced token that need not be among the highest logits).
+    // With grammar_first false the grammar is rejection sampling and the resample below rebuilds the
+    // whole vocabulary, so the first pass only needs the top-k set.
+    const bool prefilter = !(grammar_first && grammar_should_apply(gsmpl)) &&
         (!rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING);
 
     gsmpl->set_logits(ctx, idx, prefilter);
