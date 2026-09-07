@@ -612,11 +612,23 @@ Items:
   and its reason with `git log -S"ggml_cuda_get_max_cpy_bytes"`). Test 16 in a scratch build with
   `test-backend-ops` (correctness) and C1 (speed). Alignment asserts may fire; that is the answer
   then.
-- C6 Gemma 4 prep: D=256 tile configs are in the same table (C2 covers them; note 2026-09-05: its SWA
-  layers are D=256 GQA 2 and take the retuned `(256, 256, 2)` entry, 1.13x per launch at n_kv 1024;
-  the global layers are D=512 GQA 8, untouched); logit softcap only
-  selects a template. iSWA layers use a small cache (`n_swa`), so their attention cost is flat.
-  Verify `-sm tensor` supports the gemma4 arch (allow-list in `src/llama-model.cpp` ~:351) before
+- C6 DONE 2026-09-07 (measurement only; `~/p100-opt/log/C6-report.md`, `C6-notes.md`, LOG entry):
+  `-sm tensor` is accepted: `llm_arch_supports_sm_tensor` (`src/llama-arch.cpp` ~1116, called from
+  `llama-model.cpp` ~351) is a deny-list and gemma4 is not in it. Confirmed: 50 iSWA layers D=256
+  GQA 2 on a flat n_kv 1280 cache, 10 global layers D=512 GQA 8, n_embd 5376, n_ff 21504, Q4_K 68% /
+  Q6_K 17% / Q5_K 15% by bytes; the softcap is a final logit softcap, no FA launch uses the softcap
+  template; the retuned `(256, 256, 2)` entry is 1.003x at the shipped n_kv 1280 (the 1.13x below was
+  measured at GQA 6). No FA regression on 11 launch shapes; the C2b tie-break gains 1.094x on the
+  previously unmeasured D=512 GQA 8 launch at n_kv 4096. tg 1.58-1.65x stock (17.5 -> 28.8 t/s at
+  d0), pp2048 1.06x. BLOCKER: the branch produces nan logits at matvec widths on this model
+  (perplexity nan at `-ub 1`, chat output degenerates); `GGML_CUDA_DISABLE_MMVQ_F16_K=1`, or
+  disabling only q4_K or only q6_K, restores stock byte for byte at -19% tg; patch 35, FA, convert
+  and norm are not involved. Fix item: B4d. Also: patch 40's norm cache stops at 5120 columns and
+  does not fire at n_embd 5376 (E5b: `max_cache` 6). Original item: Gemma 4 prep: D=256 tile configs
+  are in the same table (C2 covers them; note 2026-09-05: its SWA layers are D=256 GQA 2 and take
+  the retuned `(256, 256, 2)` entry, 1.13x per launch at n_kv 1024; the global layers are D=512
+  GQA 8, untouched); logit softcap only selects a template. iSWA layers use a small cache
+  (`n_swa`), so their attention cost is flat. Verify `-sm tensor` supports the gemma4 arch before
   planning anything else for it; `test-llama-archs` runs every arch through the meta backend.
 - C7 KV quantization under `-sm tensor` (research, tier 3): implementing quantized K/V shards in
   the meta backend would halve KV memory (more context or a second slot) but cost tg through the
@@ -1112,6 +1124,8 @@ Keep mmap.
 | A4 | chunked dequant + GEMM for huge src0 (LM head) | removes the OOM, frees ~1.3 GB per card | A1 (optional) |
 | F5 | internal allreduce on sm_60 (`__nanosleep` replacement) | A/B vs NCCL at tg; may win 1-3 ms per token | F1 F2 |
 | B2 | re-enable MMVQ gate/up fusion on Pascal. Correction 2026-09-07: no longer trivial. The HFMA2 K-quant matvec (patches 32-34) bails out when a fusion is requested, so lifting the `cc <= PASCAL` gate in `ggml_cuda_should_fuse_mul_mat_vec_q` would route the fused gate/up matvecs back onto the int8 path and lose the B4 gains; it needs a fused GLU epilogue in `mmvq-k-f16-sm60.cu` first (Tier 2 effort) | 0-3% tg | B1, B4b |
+| B4d | fix the nan of the HFMA2 K-quant matvec on Gemma 4 31B (C6, 2026-09-07): reproduce on the first non-finite output, decide between an F16 range overflow in the half intermediates and a stale-block / cache-slot read, fix, gate with the KL divergence against stock logits; Qwen numbers must not move | Gemma 4 servable from the branch at 1.6x stock tg | C6 |
+| E5b | `rms_norm` `max_cache` 5 -> 6 so n_embd 5376 (Gemma 4) is cached; measure both models (Qwen must not lose) | ~+0.6% tg on Gemma 4 | E5 |
 | C4 | NO (2026-09-05, C2 measurement): the `parallel_blocks` search already fills exactly one wave at tg (`ntiles_dst` 6, `max_blocks_per_sm` 4, `pb` 37, 222 of 224 block slots, 99% efficiency at every depth from 4k up); forcing 2x costs 6% at 32k and 21% at 4k, 4x costs 83% at 32k. What the search does miss is the ragged last KV tile (`ntiles_KV % pb`), which makes the `ncols2 = 6` packing of C2 non-monotonic between 2k and 8k: see C2b. The C2b sweep confirms the direction: at the model's tg shape every `pb` above the search's value is slower (n_kv 8192: 52 us at 64, 61.5 at 112, 65.7 at 128); what was left on the table was the smaller value with the same round count (patch 38) | - | C1 |
 | E5 | DONE 2026-09-07 as `p100x: 40-norm-cache-5120`: `max_cache` becomes a template parameter with default 5 so a 5120-wide row is cached (patch 17 stopped at 4096 and never fired on this model); 6.33 -> 3.89 us per run at 5120x1 in test-backend-ops perf, 10.2 -> 8.8 us per launch in the model at 129 launches per token per card; tg 31.91 -> 32.11 t/s at d0 (+0.63%) and 30.91 -> 31.10 at d16384 (+0.61%), pp2048 unchanged, output byte-identical; registers unchanged, no spills | left: nothing for this model; 6144-wide rows would need `max_cache` 6, which fits the register budget | E1 |
 | D4 E6 | one or two extra fusion rules from the census | ~0.5% per launch removed | D1 E1 |
@@ -1120,14 +1134,14 @@ Keep mmap.
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
 | A8 | DONE 2026-09-05 as `p100x: 35-mmvq-cols-sm60`: loop the matvec over balanced column chunks (target 7, floor 6) for 9..N columns on GP100, per-type ceiling Q4_K 64, Q5_K 48, Q6_K 32, IQ4_XS 64, int8 32; pp9 3.87x, pp16 2.84x, pp28 2.30x, pp32 1.93x, pp48 1.43x, pp64 1.12x, unchanged at 96 and above; the 25k-chat follow-up prompt phase 710 -> 434 ms and the request 1.34 -> 1.07 s; tg and pp2048 unchanged | the LM head F16 copy is gone at these widths (small-batch half of A4); J4b is now the larger half of a follow-up; verify widths 9-64 are 1.1-3.9x cheaper (J5) | J4 |
 | J4b | DONE 2026-09-06 as `p100x: 37-server-ckpt-save`: recycle the storage of an erased context checkpoint instead of allocating a fresh 149.6 MiB vector per save; checkpoint save 112.4 -> 96.4 ms, follow-up prompt phase 433.3 -> 416.9 ms (-3.8%), wall 1.060 -> 1.057 s (inside the noise), RSS unchanged; checkpoints byte-identical (17/17 against a second save of the same state) | the item's premise was wrong: the 149.6 MiB DtoH costs 30.5 ms (5.14 GB/s), faster than the 36.9 ms HtoD restore; the old 112 ms was 8.5 ms free + 72.8 ms allocate/first-touch + the copy, and the allocation was hiding ~66 ms of decode in flight that `ctx->synchronize()` now waits for. Left: that wait plus 30 ms of copy; only a pinned buffer touches the copy (save 30 -> 16 ms, restore 35 -> 18 ms; needs a pinned allocator and up to `--ctx-checkpoints` (default 32) x 149.6 MiB locked per slot); edit/regenerate requests are not covered (their checkpoint is dropped outside `create_checkpoint`) | J4 |
-| C2b | DONE 2026-09-06 as `p100x: 38-fattn-pb-tiebreak`: after the `parallel_blocks` search take the smallest value with the same number of KV rounds (one Q column, Pascal; the round count had to be the primary key, no wave-efficiency band reaches the winner at 57% fill); per launch 1.18x at n_kv 8192 on the packed path, 1.06x at 4096 unpacked, more than one Q column unchanged; GQA 6 gate 16384 -> 2560 (7680 at 2 Q columns, knob `GGML_CUDA_FATTN_GQA6_MIN_KV`), the shipped launch 1.10-1.21x from 2560 to 12288 against 36; 4 kv heads 0.88x -> 1.14x at 4096; model tg unchanged within 0.3% (about 16 FA launches per token, 5.7 us each) | left: a tie-break for 2 Q columns (that launch loses up to 14% at n_kv 4608-6656, the naive rule costs 4-7%); the one-kv-head clause above 16384 (1.09-1.28x, one line, own protocol); the rule is measured at D=256 only (Gemma D=512 GQA 8 and D=128 take it unmeasured, C6); `nbatch_fa 32` never measured together with `pb` | C2 |
+| C2b | DONE 2026-09-06 as `p100x: 38-fattn-pb-tiebreak`: after the `parallel_blocks` search take the smallest value with the same number of KV rounds (one Q column, Pascal; the round count had to be the primary key, no wave-efficiency band reaches the winner at 57% fill); per launch 1.18x at n_kv 8192 on the packed path, 1.06x at 4096 unpacked, more than one Q column unchanged; GQA 6 gate 16384 -> 2560 (7680 at 2 Q columns, knob `GGML_CUDA_FATTN_GQA6_MIN_KV`), the shipped launch 1.10-1.21x from 2560 to 12288 against 36; 4 kv heads 0.88x -> 1.14x at 4096; model tg unchanged within 0.3% (about 16 FA launches per token, 5.7 us each) | left: a tie-break for 2 Q columns (that launch loses up to 14% at n_kv 4608-6656, the naive rule costs 4-7%); the one-kv-head clause above 16384 (1.09-1.28x, one line, own protocol); the rule is measured at D=256 only (C6 measured D=512 GQA 8: 1.094x at n_kv 4096, 1.006-1.009x above; D=128 still unmeasured); `nbatch_fa 32` never measured together with `pb` | C2 |
 | B4c | DONE 2026-09-04 as `p100x: 34-mmvq-k-shortk`: prefetch mode 2 (header loaded in its own step) per type and width, at width 1 only for Q5_K below 24 blocks; tg +0.5% (31.7 t/s at d0), speculative verify widths 2/4 +4% / +2%; measured with a new any-shape timing tool (`~/p100-opt/b4c/shape.cpp`) that Area B work should use from now on | the gap itself stands: k=5120 runs at 0.74-0.81 of the k=14336 rate, the streaming part is within 3% of the DRAM ceiling and only a fixed 0.38 step per warp is addressable; a shorter warp step is measured out (see What not to do); the LM head was already at its ceiling | B4 B4b |
 
 ### Tier 2: medium changes (design note to the user first, 2-5 days each)
 
 | Item | Change | Expected | Depends on |
 |---|---|---|---|
-| B4b | DONE 2026-09-04 as `p100x: 33-mmvq-k-hfma2`: Q5_K 1.36x and Q6_K 1.40x at width 1 per call (1.14x / 1.30x in-model, short k again), IQ4_XS only from width 4 (its int8 path already runs at 400 GB/s, see What not to do); tg 30.0 -> 31.6 t/s at d0 (+5.2%; +7.8% over the int8 path), 28.8 -> 30.3 at d16384 | left: two-slot `a16k` cache for mixed-type gate/up pairs at widths 4-8 (~1.7% of kernel time), width 6-7 defaults interpolated | B4 |
+| B4b | DONE 2026-09-04 as `p100x: 33-mmvq-k-hfma2`: Q5_K 1.36x and Q6_K 1.40x at width 1 per call (1.14x / 1.30x in-model, short k again), IQ4_XS only from width 4 (its int8 path already runs at 400 GB/s, see What not to do); tg 30.0 -> 31.6 t/s at d0 (+5.2%; +7.8% over the int8 path), 28.8 -> 30.3 at d16384 | left: two-slot `a16k` cache for mixed-type gate/up pairs at widths 4-8 (~1.7% of kernel time), width 6-7 defaults interpolated. CORRECTNESS 2026-09-07 (C6): nan logits on Gemma 4 31B at matvec widths when Q4_K and Q6_K both run this path; `GGML_CUDA_DISABLE_MMVQ_F16_K=1` until B4d | B4 |
 | G3 | per-subgraph CUDA graph cache so `-sm tensor` can use graphs | the bulk of the launch-bound share found in G1 | G2 success |
 | C2 | DONE 2026-09-05 as `p100x: 36-fattn-tile-p100`: FP16 tile table for D=256 (the model is D=256 GQA 6, not D=128): the tg entry had no register budget (255 registers, 4 blocks and 8 warps per SM) and GQA 6 fell onto `ncols2 = 2` with a 3x K/V re-read; new `ncols2 = 6` packing above n_kv 16384 at 1-2 Q columns plus `(128, 4, 64, 64)` for `ncols 2`; attention kernel 1.12x at 16k, 1.31x at 32k, 1.46x at 64k, 1.70x at 128k (92% of the read ceiling); tg +0.7% at d0, +1.6% at d16384, +3.3% at d32768, +7.9% at d65536; pp unchanged (its table entry is already optimal, 14 candidates lost) | left: the 16384 gate (C2b); the same register-budget fix for the D=128 and small-head `ncols 2/4` entries (unmeasured, llama-class shape); C5 has no headroom at 131k any more | C1 |
 | C3 | NO (2026-09-05, C2 measurement): the vector kernel is 1.4-1.8x slower than the tile kernel at every KV length from 4k to 128k on the model's shape; it has no GQA packing at all (6x K/V re-read against the tile kernel's 3x, 1x with patch 36). No KV-length threshold wins | - | C1 |
@@ -1140,7 +1154,7 @@ Keep mmap.
 
 | Item | Change | Why it might pay | Why it might not |
 |---|---|---|---|
-| B4 | DONE 2026-09-03 as `p100x: 32-mmvq-q4k-hfma2` (Q4_K only): 1.49x at width 1 (471 GB/s), up to 2.85x at widths 5-8 per call; tg +2.5% | Q4_K is only 17.7% of the tg kernel time on the UD-Q4_K_M (Q5_K 24.7%, IQ4_XS 19.4%, Q6_K 9.0%): B4b carries the rest | the k=5120 shapes reach 373 GB/s against 459 at k=14336 (B4c) |
+| B4 | DONE 2026-09-03 as `p100x: 32-mmvq-q4k-hfma2` (Q4_K only): 1.49x at width 1 (471 GB/s), up to 2.85x at widths 5-8 per call; tg +2.5% | Q4_K is only 17.7% of the tg kernel time on the UD-Q4_K_M (Q5_K 24.7%, IQ4_XS 19.4%, Q6_K 9.0%): B4b carries the rest | the k=5120 shapes reach 373 GB/s against 459 at k=14336 (B4c); nan on Gemma 4 31B together with the Q6_K path (C6, fix B4d) |
 | A7 | HFMA2 tiled GEMM with in-register dequant | removes the F16 round trip and temporaries | cuBLAS is already at ~68-80% of peak |
 | F7 | P2P direct allreduce kernel for 2 GPUs | < 10 us per collective vs 20-40 | needs stable P2P; Pascal has no `__nanosleep` |
 | G4 | fewer subgraph boundaries in the meta backend | 1 CUDA graph per device per token | deep change in `ggml_backend_meta_graph_compute` |
@@ -1361,12 +1375,19 @@ llama.cpp behavior on this hardware:
 30. `test-backend-ops` has no `RMS_NORM` case between 4096 and 5120 columns and none with one row,
     so a norm change at this model's `n_embd` is invisible to the suite; use the model (greedy and
     perplexity identity) plus a temporary local case that never enters the patch.
+31. A kernel validated on one model is not validated on the branch's other models: patches 32/33
+    passed every Qwen3.8 check and produce nan on Gemma 4 31B (C6, 2026-09-07). Run the second
+    model's perplexity at `-ub 1` (matvec path) and a chat greedy sample before calling a matvec
+    change done. For this GGUF `llama-completion`/`llama-cli` need `--jinja` (chat) or `-no-cnv`
+    (raw) or they abort with "this custom template is not supported"; raw wikitext perplexity is
+    17000-27000 on stock too, so for Gemma 4 use finite/non-finite, chat output and
+    `--kl-divergence` against stock logits as the gates, not the absolute perplexity.
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
 Answered: 1 (ssh krk-lab, paths in 0.1), 2 (no sudo), 3 (production flags in 0.1), 4 (drift allowed
-with the perplexity check), 5 (single stream; `-np 1` in production), 6 (Gemma-4 31B is present;
-`-sm tensor` arch support still to verify), 8 (router mode with `--models-dir` is the production
+with the perplexity check), 5 (single stream; `-np 1` in production), 6 (Gemma-4 31B is present,
+`-sm tensor` accepts gemma4; C6 2026-09-07), 8 (router mode with `--models-dir` is the production
 setup, respawn/load time matters). Open: 7 (P2P/NCCL env in production after tests).
 
 Original list:
@@ -1383,7 +1404,9 @@ Original list:
 5. Priority between tg latency and throughput: is a second concurrent slot (`-np 2`, area H4)
    wanted, or is everything about single-stream speed?
 6. Is Gemma 4 31B available now (C6 needs the GGUF) and is `-sm tensor` confirmed to accept its
-   arch on this build?
+   arch on this build? Answered 2026-09-07 (C6): yes and yes, but the branch produces nan logits
+   on it at matvec widths, so it is not servable until B4d lands (`GGML_CUDA_DISABLE_MMVQ_F16_K=1`
+   is the interim).
 7. May the agent enable `GGML_CUDA_P2P=1` and change NCCL env vars in production after the tests,
    given the documented risk of instability on some boards (P100-PATCHES.md crash history)?
 8. Is the router-mode multi-model setup part of the target (respawn/load times, area K), or is a
