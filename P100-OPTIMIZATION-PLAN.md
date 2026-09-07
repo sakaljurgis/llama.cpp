@@ -914,17 +914,25 @@ the logits are vocab-sharded across the two cards). Patches 11 and 13 cut the tw
 (penalties scan, candidate array build). The prefilter disables itself when a logit-bias sampler
 is in the chain (any per-request `logit_bias`, or vocab suppress tokens), when a non-penalties
 sampler precedes top-k, when `top_k <= 0`, or when `8 * (top_k + penalty_last_n) >= n_vocab`.
+Before patch 43 it also stayed off per token whenever a grammar was in the chain, i.e. for every
+request that carries `tools` (I1, 2026-09-07).
 The default thread count is the number of physical cores (14) with `--poll 50`; with everything
 offloaded those threads mostly spin.
 
 Items:
 
-- I1 `[SRV]` Confirm the prefilter is live for the production sampler settings: temporarily log
+- I1 DONE 2026-09-07 (`p100x: 43-sampler-prefilter-grammar`; numbers in the Tier 1 table and
+  P100-PATCHES.md 43). The premise below was wrong: no GGUF has suppress tokens, the prefilter is live
+  for plain chat and was off for every request that carries `tools` (lazy grammar, every token outside
+  the thinking block). The fix gates it on `grammar_first && grammar_should_apply()`, which the server
+  never sets. Original item: `[SRV]` Confirm the prefilter is live for the production sampler settings: temporarily log
   `pf_nkeep` (or run once with `LLAMA_SAMPLER_PREFILTER=0` and compare server tg). Check whether
   the Qwen3.8 vocab carries suppress tokens (`gguf-py` dump of the tokenizer metadata); if it does,
   the logit-bias sampler is always in the chain and the prefilter never runs, and patch 13's
   condition should be relaxed to "no user biases" (the suppress list is tiny and static).
-- I2 `[SRV]` Sampling share: server `predicted_per_second` vs `llama-bench -n` tg at the same
+- I2 Measured 2026-09-07 with I1: server 30.928 vs llama-bench 30.874 ms per token at d128, i.e.
+  0.054 ms (0.17%) of sampling plus server bookkeeping with the prefilter live, about 0.5 ms with it
+  off; far below the threshold, no work. Original item: `[SRV]` Sampling share: server `predicted_per_second` vs `llama-bench -n` tg at the same
   context. llama-bench does not sample, so the difference is sampling + server bookkeeping. If it
   exceeds ~1.5 ms per token (4%), profile the sampler chain with `perf record` and look at the
   order of samplers in the production request (moving top-k first keeps the prefilter on).
@@ -1129,7 +1137,7 @@ Keep mmap.
 | C4 | NO (2026-09-05, C2 measurement): the `parallel_blocks` search already fills exactly one wave at tg (`ntiles_dst` 6, `max_blocks_per_sm` 4, `pb` 37, 222 of 224 block slots, 99% efficiency at every depth from 4k up); forcing 2x costs 6% at 32k and 21% at 4k, 4x costs 83% at 32k. What the search does miss is the ragged last KV tile (`ntiles_KV % pb`), which makes the `ncols2 = 6` packing of C2 non-monotonic between 2k and 8k: see C2b. The C2b sweep confirms the direction: at the model's tg shape every `pb` above the search's value is slower (n_kv 8192: 52 us at 64, 61.5 at 112, 65.7 at 128); what was left on the table was the smaller value with the same round count (patch 38) | - | C1 |
 | E5 | DONE 2026-09-07 as `p100x: 40-norm-cache-5120`: `max_cache` becomes a template parameter with default 5 so a 5120-wide row is cached (patch 17 stopped at 4096 and never fired on this model); 6.33 -> 3.89 us per run at 5120x1 in test-backend-ops perf, 10.2 -> 8.8 us per launch in the model at 129 launches per token per card; tg 31.91 -> 32.11 t/s at d0 (+0.63%) and 30.91 -> 31.10 at d16384 (+0.61%), pp2048 unchanged, output byte-identical; registers unchanged, no spills | left: nothing; E5b (patch 42) raised the limit to 6 for Gemma 4's 5376 | E1 |
 | D4 E6 | one or two extra fusion rules from the census | ~0.5% per launch removed | D1 E1 |
-| I1 | prefilter condition vs suppress tokens | up to 2% tg if the prefilter was off | I1 measurement |
+| I1 | DONE 2026-09-07 as `p100x: 43-sampler-prefilter-grammar`: the vocab clause was moot (none of the three GGUFs has suppress tokens); what switched the prefilter off was the request-level lazy grammar of a `tools` request with `tool_choice` auto (the coding-harness shape): 0 of 512 samples prefiltered with thinking off, 21 of 48 on a real tool call with thinking on, 512 of 512 for plain chat. Gating the prefilter on `grammar_first && grammar_should_apply()` instead of `grammar_should_apply()` is exact (the server never sets `grammar_first`; a grammar rejection already rebuilds the whole vocabulary) and recovers it: tools request 31.44 -> 30.98 ms per token (+1.47% tg), plain chat unchanged; the prefilter itself is worth 1.45% tg on plain chat (30.92 vs 31.38 ms) and 3.4% under `--spec-type draft-mtp` (one sample per draft position); replies and tool calls byte-identical, resample count 0 | left: a request `logit_bias` still turns it off (`has_logit_bias`), by design; I2 answered at the same time: sampling plus server bookkeeping is 0.054 ms per token with the prefilter live (server 30.928 vs llama-bench 30.874 ms per token at d128), no work needed | I1 measurement |
 | A2 A3 | DONE 2026-09-07 as `p100x: 39-convert-vec`: A3' vectorizes the contiguous F16/BF16 <-> F32 conversion around every cuBLAS GEMM (4 elements per thread, 8-byte transfers, grid covering the data) and A2 issues the contiguous store group of `dequantize_q4_K` and `dequantize_iq4_xs` as one 8-byte transfer with 8 super blocks per 256-thread block; pp2048 420.8 -> 449.4 t/s at `-ub 2048` (+6.8%; A3' +5.55%, A2 +1.22%) and 235.1 -> 248.3 at `-ub 512` (+5.6%; A3' +3.18%, A2 +2.92%), tg unchanged, output byte-identical (perplexity 5.4367 in every arm incl. stock, greedy identical); `convert_unary` 165 -> 520 GB/s (29% -> 93% of the 560 GB/s ceiling), q4_K dequant 168 -> 461 GB/s, iq4_xs 212 -> 330 | left: the plan's A2 premise was wrong (block packing alone is a no-op, the kernels are store bound); q5_K needs a different index assignment inside `dequantize_q5_K` for a 4-element store group, about 0.5% of pp2048; `getrows.cu` could ask for the same vector store; 16-byte transfers and a bounded grid both lose (What not to do); A3 as written (F32 compute) measured dead: -35% pp | A1 |
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
 | A8 | DONE 2026-09-05 as `p100x: 35-mmvq-cols-sm60`: loop the matvec over balanced column chunks (target 7, floor 6) for 9..N columns on GP100, per-type ceiling Q4_K 64, Q5_K 48, Q6_K 32, IQ4_XS 64, int8 32; pp9 3.87x, pp16 2.84x, pp28 2.30x, pp32 1.93x, pp48 1.43x, pp64 1.12x, unchanged at 96 and above; the 25k-chat follow-up prompt phase 710 -> 434 ms and the request 1.34 -> 1.07 s; tg and pp2048 unchanged | the LM head F16 copy is gone at these widths (small-batch half of A4); J4b is now the larger half of a follow-up; verify widths 9-64 are 1.1-3.9x cheaper (J5) | J4 |
@@ -1347,8 +1355,12 @@ llama.cpp behavior on this hardware:
     the single most important fact for tg on this machine.
 12. `-sm row` no longer exists on CUDA; `-sm tensor` needs `-fa on` and F16/BF16/F32 KV only.
 13. Backend (GPU) sampling is refused under `-sm tensor`; CPU sampling patches 11/13 are the relief.
-14. The sampler prefilter (patch 13) turns itself off with any logit-bias sampler in the chain,
-    including vocab suppress tokens; verify it is live.
+14. The sampler prefilter (patch 13) turns itself off with any logit-bias sampler in the chain (a
+    request `logit_bias`; vocab suppress tokens would too, but none of the three GGUFs has any), and
+    until patch 43 with any grammar in the chain, i.e. every request that carries `tools` (I1,
+    2026-09-07). `top_k <= 0`, mirostat, DRY on, or a non-penalties sampler before top-k in a custom
+    `samplers` order also switch it off. Check with a `LLAMA_SAMPLER_PREFILTER=0` A/B through the
+    server; llama-bench does not sample.
 15. FA at tg with F16 KV and GQA uses the TILE kernel, not VEC, and the Pascal FP16 tile table is
     an upstream TODO. Quantized KV at batch > 2 dequantizes the whole cache per call.
 16. `GGML_CUDA_FORCE_MMQ` cannot enable MMQ for dense matmul on sm_60; the DP4A rule returns first.
@@ -1442,7 +1454,7 @@ Original list:
 | `GGML_META_DEBUG=1` | meta backend rebuild/split logging |
 | `GGML_SCHED_DEBUG=1|2`, `GGML_SCHED_DEBUG_REALLOC=1` | scheduler assignments, unexpected reallocs |
 | `LLAMA_GRAPH_REUSE_DISABLE=1` | llama graph reuse off (-27% tg here; diagnostic only) |
-| `LLAMA_SAMPLER_PREFILTER=0` | patch 13 off |
+| `LLAMA_SAMPLER_PREFILTER=0` | patch 13 off (and 43 with it) |
 | `LLAMA_MTP_DRAFT_VOCAB=<file>` | patch 15 draft vocab subset |
 | `LLAMA_SERVER_SLOTS_DEBUG=1`, `LLAMA_TRACE=1` | server slot/trace logging (J1) |
 | `CUDA_SCALE_LAUNCH_QUEUES=4x` | larger CUDA command buffer (G5) |
