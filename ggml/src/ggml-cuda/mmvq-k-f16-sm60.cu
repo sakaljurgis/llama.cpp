@@ -46,6 +46,10 @@
 // 16 products into one half2 without overflow.  sc_j and m_j (6 bit) become exact halves with the same
 // magic trick, sc*sum and m*ysum and the d/dmin multiply happen in half, the subtraction of the two
 // terms and the sum over blocks happen in FP32 (the two terms cancel often, half would lose bits).
+// That bound is a 4 bit one: Q6_K reaches |q| = 32 with an int8 scale of 128 and IQ4_XS |q| = 127
+// with a 6 bit scale, so scale*sum over the sub-blocks of a lane reaches 2^18 and overflows half
+// (B4d: 71552 on one Gemma 4 31B attn_v row against the half limit of 65504).  Those two epilogues
+// take the scale times 1/8 and d times 8, both exact, so the product is the unscaled one.
 //
 // IQ4_XS: block_iq4_xs is only 8 byte aligned (136 = 8 mod 16), so header and qs are LDG.64.  The
 // values come from kvalues_iq4nl, which no magic constant can produce, so the table is held biased by
@@ -72,6 +76,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #define A16K_QK     256 // elements per block
 #define A16K_LPB      4 // lanes per block
@@ -439,6 +444,10 @@ mul_mat_vec_k_a16(
     const half2 magic_lo = a16k_as_half2(0x64006400);
     const half2 magic_hi = a16k_as_half2(0x54005400);
 
+    // Q6_K and IQ4_XS: scale/8 and d*8 (both exact) keep the sub-block terms inside half, see the note at the top
+    const half2 s_dn = a16k_as_half2(0x30003000); // 0.125, 0.125
+    const half  s_up = __ushort_as_half((unsigned short) 0x4800); // 8.0
+
     // kvalues_iq4nl biased by 128, four bytes per register (IQ4_XS only).
     int tab[4] = { 0, 0, 0, 0 };
     if constexpr (a16k_traits<type>::table) {
@@ -586,11 +595,11 @@ mul_mat_vec_k_a16(
         for (int r = 0; r < nrows; ++r) {
             if constexpr (q6t) {
                 // one int8 scale per sub-block, no min term; the -32 is already in the magic constant
-                const half2 S01 = a16k_as_half2(hdr[r].x); // (m0, m2)
-                const half2 S23 = a16k_as_half2(hdr[r].y); // (m1, m3)
+                const half2 S01 = __hmul2(a16k_as_half2(hdr[r].x), s_dn); // (m0, m2)/8
+                const half2 S23 = __hmul2(a16k_as_half2(hdr[r].y), s_dn); // (m1, m3)/8
                 const half2 S0 = __low2half2(S01),  S1 = __high2half2(S01);
                 const half2 S2 = __low2half2(S23),  S3 = __high2half2(S23);
-                const half  d  = __ushort_as_half((unsigned short) hdr[r].z);
+                const half  d  = __hmul(__ushort_as_half((unsigned short) hdr[r].z), s_up);
 #pragma unroll
                 for (int c = 0; c < ncols_dst; ++c) {
                     half2 T = __hmul2(acc[0][r][c], S0);
@@ -612,9 +621,9 @@ mul_mat_vec_k_a16(
                 const unsigned int ls  = l0 | (l1 << 8);
 
                 const half2 magic_ls = a16k_as_half2(0x64206420); // 1024 + 32, so the result is ls - 32
-                const half2 S0 = __hsub2(a16k_as_half2(__byte_perm(ls, 0, 0x4040) | 0x64006400), magic_ls);
-                const half2 S1 = __hsub2(a16k_as_half2(__byte_perm(ls, 0, 0x4141) | 0x64006400), magic_ls);
-                const half  d  = __ushort_as_half((unsigned short) (((unsigned int) hdr[r].x) & 0xffff));
+                const half2 S0 = __hmul2(__hsub2(a16k_as_half2(__byte_perm(ls, 0, 0x4040) | 0x64006400), magic_ls), s_dn);
+                const half2 S1 = __hmul2(__hsub2(a16k_as_half2(__byte_perm(ls, 0, 0x4141) | 0x64006400), magic_ls), s_dn);
+                const half  d  = __hmul(__ushort_as_half((unsigned short) (((unsigned int) hdr[r].x) & 0xffff)), s_up);
 
 #pragma unroll
                 for (int c = 0; c < ncols_dst; ++c) {
@@ -937,6 +946,55 @@ static void launch_a16k(
     }
 }
 
+// GGML_A16K_CHECK=1: sync after every launch and print the first calls whose dst is not finite,
+// with the non-finite count of src1 and the per block amax stats of the same call.  Debug only.
+static void a16k_check(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+        const int nblocks, const float * yd, cudaStream_t stream) {
+    static int nrep = 0;
+    if (nrep >= 8) {
+        return;
+    }
+    const int64_t nd  = src1->ne[1]*src0->ne[1];
+    const int64_t ns  = src1->ne[1]*(int64_t) (src1->nb[1]/sizeof(float));
+    const int64_t ny  = src1->ne[1]*nblocks;
+    std::vector<float> hd(nd), hs(ns), hy(ny);
+    CUDA_CHECK(cudaMemcpyAsync(hd.data(), dst->data,  nd*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(hs.data(), src1->data, ns*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(hy.data(), yd,         ny*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    int64_t bad_d = -1, bad_s = -1;
+    for (int64_t i = 0; i < nd && bad_d < 0; ++i) {
+        bad_d = isfinite(hd[i]) ? -1 : i;
+    }
+    if (bad_d < 0) {
+        return;
+    }
+    for (int64_t i = 0; i < ns && bad_s < 0; ++i) {
+        bad_s = isfinite(hs[i]) ? -1 : i;
+    }
+    float amin = INFINITY, amax = 0.0f;
+    int nzero = 0, ntiny = 0, nhuge = 0, nbad = 0;
+    for (int64_t i = 0; i < ny; ++i) {
+        const float a = hy[i];
+        nbad  += !isfinite(a);
+        nzero += a == 0.0f;
+        ntiny += a > 0.0f && a < 1.0e-30f;
+        nhuge += a > 65504.0f;
+        if (isfinite(a) && a > 0.0f) {
+            amin = fminf(amin, a);
+            amax = fmaxf(amax, a);
+        }
+    }
+    ++nrep;
+    fprintf(stderr, "a16k_check: %s type=%s ne00=%d ne01=%d ne11=%d nb=%d dst[%d]=%g src1_bad=%d "
+                    "amax_min=%g amax_max=%g yd_zero=%d yd_tiny=%d yd_huge=%d yd_bad=%d\n",
+            src0->name, ggml_type_name(src0->type), (int) src0->ne[0], (int) src0->ne[1],
+            (int) src1->ne[1], nblocks, (int) bad_d, hd[bad_d], (int) bad_s,
+            amin, amax, nzero, ntiny, nhuge, nbad);
+}
+
 void ggml_cuda_mmvq_k_f16_sm60(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 
@@ -1056,4 +1114,9 @@ void ggml_cuda_mmvq_k_f16_sm60(
     }
 #undef A16K_CASES
 #undef A16K_CASE
+
+    static const int check = a16k_env_int("GGML_A16K_CHECK", 0);
+    if (check) {
+        a16k_check(src0, src1, dst, nblocks, yd, stream);
+    }
 }
