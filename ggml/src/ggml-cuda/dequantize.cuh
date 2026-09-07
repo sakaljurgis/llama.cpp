@@ -183,7 +183,9 @@ static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t
     }
 }
 
-template<typename dst_t>
+// vec_store keeps the values and the addresses and only replaces the per-element stores of the
+// contiguous groups by one transfer each; 2-byte stores at a stride of 8 bytes cost 3x on GP100.
+template<typename dst_t, bool vec_store = false>
 static __device__ __forceinline__ void dequantize_q4_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
     const block_q4_K * x = (const block_q4_K *) vx;
 
@@ -205,9 +207,22 @@ static __device__ __forceinline__ void dequantize_q4_K(const void * vx, const in
     const float d1 = dall * sc; const float m1 = dmin * m;
     get_scale_min_k4(is + 1, x[ib].scales, sc, m);
     const float d2 = dall * sc; const float m2 = dmin * m;
-    for (int l = 0; l < n; ++l) {
-        y[l + 0] = ggml_cuda_cast<dst_t>(d1 * (q[l] & 0xF) - m1);
-        y[l +32] = ggml_cuda_cast<dst_t>(d2 * (q[l] >>  4) - m2);
+    if constexpr (vec_store) {
+        uint8_t qv[n];
+        ggml_cuda_memcpy_1<n>(qv, q);
+        dst_t v0[n], v1[n];
+#pragma unroll
+        for (int l = 0; l < n; ++l) {
+            v0[l] = ggml_cuda_cast<dst_t>(d1 * (qv[l] & 0xF) - m1);
+            v1[l] = ggml_cuda_cast<dst_t>(d2 * (qv[l] >>  4) - m2);
+        }
+        ggml_cuda_memcpy_n<n*sizeof(dst_t), 8>(y +  0, v0);
+        ggml_cuda_memcpy_n<n*sizeof(dst_t), 8>(y + 32, v1);
+    } else {
+        for (int l = 0; l < n; ++l) {
+            y[l + 0] = ggml_cuda_cast<dst_t>(d1 * (q[l] & 0xF) - m1);
+            y[l +32] = ggml_cuda_cast<dst_t>(d2 * (q[l] >>  4) - m2);
+        }
     }
 }
 
@@ -420,7 +435,7 @@ static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const 
     }
 }
 
-template<typename dst_t>
+template<typename dst_t, bool vec_store = false>
 static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
     const block_iq4_xs * x = (const block_iq4_xs *)vx;
 
@@ -429,9 +444,22 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const 
     dst_t * y = yy + 32*ib + 4*il;
     const uint8_t  * q4 = x[ibs].qs + 16*ib + 4*il;
     const float d = (float)x[ibs].d * ((((x[ibs].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[ibs].scales_h >> 2*ib) & 3) << 4)) - 32);
-    for (int j = 0; j < 4; ++j) {
-        y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
-        y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
+    if constexpr (vec_store) {
+        uint8_t qv[4];
+        ggml_cuda_memcpy_1<4>(qv, q4);
+        dst_t v0[4], v1[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v0[j] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[qv[j] & 0xf]);
+            v1[j] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[qv[j] >>  4]);
+        }
+        ggml_cuda_memcpy_n<4*sizeof(dst_t), 8>(y +  0, v0);
+        ggml_cuda_memcpy_n<4*sizeof(dst_t), 8>(y + 16, v1);
+    } else {
+        for (int j = 0; j < 4; ++j) {
+            y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
+            y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
+        }
     }
 }
 

@@ -152,11 +152,18 @@ static __global__ void dequantize_block_q3_K(const void * __restrict__ vx, dst_t
     dequantize_q3_K(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
-template<typename dst_t>
-static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
+// threadIdx.y picks the super block, so every thread keeps the element mapping and the output of
+// the one-super-block-per-block kernels; only the block packing changes.  The dequantizers want
+// 32 or 64 threads, so blocks of 256 hold 8 or 4 super blocks and the grid shrinks by that much.
+template <typename dst_t, int nthr, void (*dequantize_sb)(const void *, int64_t, dst_t *, int)>
+static __global__ void dequantize_block_sb(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.y + threadIdx.y;
 
-    dequantize_q4_K(vx, i, yy + i*QK_K, threadIdx.x);
+    if (i >= nb) {
+        return;
+    }
+
+    dequantize_sb(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
 template<typename dst_t>
@@ -235,13 +242,6 @@ static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
-
-    dequantize_iq4_xs(vx, i, yy + i*QK_K, threadIdx.x);
-}
-
-template<typename dst_t>
 static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
 
@@ -301,10 +301,27 @@ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k
     dequantize_block_q4_1<<<nb, 32, 0, stream>>>(vx, y, nb32);
 }
 
+// Vector stores and nthr threads per super block; GGML_CUDA_DISABLE_DEQUANT_VEC=1 goes back to the
+// per-element stores and one super block per block, i.e. to the launches of b10758.
+template <typename dst_t, int nthr,
+          void (*dequantize_vec)(const void *, int64_t, dst_t *, int),
+          void (*dequantize_ref)(const void *, int64_t, dst_t *, int)>
+static void dequantize_row_sb_cuda(const void * vx, dst_t * y, const int64_t nb, cudaStream_t stream) {
+    static bool disable_vec = getenv("GGML_CUDA_DISABLE_DEQUANT_VEC") != nullptr &&
+                              std::atoi(getenv("GGML_CUDA_DISABLE_DEQUANT_VEC"));
+    if (disable_vec) {
+        dequantize_block_sb<dst_t, nthr, dequantize_ref><<<nb, dim3(nthr, 1), 0, stream>>>(vx, y, nb);
+        return;
+    }
+
+    constexpr int nsb = CUDA_DEQUANTIZE_BLOCK_SIZE/nthr;
+    dequantize_block_sb<dst_t, nthr, dequantize_vec>
+        <<<(nb + nsb - 1)/nsb, dim3(nthr, nsb), 0, stream>>>(vx, y, nb);
+}
+
 template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = k / QK_K;
-    dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_row_sb_cuda<dst_t, 32, dequantize_q4_K<dst_t, true>, dequantize_q4_K<dst_t, false>>(vx, y, k/QK_K, stream);
 }
 
 template<typename dst_t>
@@ -370,8 +387,7 @@ static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t 
 
 template<typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_row_sb_cuda<dst_t, 32, dequantize_iq4_xs<dst_t, true>, dequantize_iq4_xs<dst_t, false>>(vx, y, (k + QK_K - 1)/QK_K, stream);
 }
 
 template<typename dst_t>
