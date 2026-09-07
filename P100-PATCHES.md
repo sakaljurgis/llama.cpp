@@ -151,6 +151,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 39 | convert-vec | CUDA (all archs, measured on sm_60) | yes (every dequant + cuBLAS matmul: pp at every ubatch, the LM head above 64 columns, the BF16 allreduce wire) |
 | 40 | norm-cache-5120 | CUDA | yes (every `rms_norm` of a 4097-5120 wide row: all 129 per-token norms of Qwen3.8-27B) |
 | 41 | mmvq-k-f16-range | sm_60 (CUDA) | yes (every Q6_K matvec at widths 1-8 and IQ4_XS at 4-8; bug fix for 32/33, found on Gemma 4 31B) |
+| 42 | norm-cache-5376 | CUDA | yes (every `rms_norm` of a 5121-6144 wide row: Gemma 4 31B's n_embd 5376) |
 
 ### 31 server-ckpt-adopt
 
@@ -804,6 +805,17 @@ Not done: the F16 accumulation is still what it is, so a model with wider activa
 Gemma's can lose more top-1 than the 1.3 points measured here; a per-model accuracy gate is not part
 of this patch.
 
+### 42 norm-cache-5376
+
+`ggml/src/ggml-cuda/norm.cu` (+3/-3). Plan item E5b: `max_cache` 5 -> 6 in the template default and
+in the `<1024>` launcher, so a row up to 6144 columns is held in registers and Gemma 4's n_embd 5376
+norms stop reading the row twice (patch 40 stopped at 5120). tg64 d0 28.630 -> 29.075 t/s on Gemma
+(+1.56%, it norms 4 times per layer over 60 layers), unchanged on Qwen (32.08 t/s, its 5120 rows
+were already cached and the extra iteration is predicated off), `test-backend-ops -o RMS_NORM`
+51/51, Qwen greedy 256 tokens byte-identical. Registers 30/31/32 as before with one instantiation
+at 32 instead of 31, no spills. `GGML_CUDA_NORM_CACHE_LEGACY=1` still gives the 4-value limit of
+patch 17.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -887,7 +899,7 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_FATTN_GQA6_MIN_KV=<n>` | 38 | smallest n_kv for the GQA 6 packing: default 2560 (7680 at 2 Q columns), 16384 = patch 36, 0 = always, also with one kv head |
 | `GGML_CUDA_DISABLE_CONVERT_VEC=1` | 39 | kill switch (contiguous F16/BF16 <-> F32 conversion back to the one-element-per-thread `convert_unary`) |
 | `GGML_CUDA_DISABLE_DEQUANT_VEC=1` | 39 | kill switch (Q4_K and IQ4_XS dequant back to per-element stores and one super block per CUDA block) |
-| `GGML_CUDA_NORM_CACHE_LEGACY=1` | 40 | kill switch (`rms_norm_f32` register cache limited to 4 values per thread, `ncols <= 4096`, as in patch 17) |
+| `GGML_CUDA_NORM_CACHE_LEGACY=1` | 40, 42 | kill switch (`rms_norm_f32` register cache limited to 4 values per thread, `ncols <= 4096`, as in patch 17) |
 | `GGML_A16K_CHECK=1` | 41 | debug: sync after every HFMA2 K-quant launch and print the first 8 calls with a non-finite dst (tensor, type, shape, block count, first bad value, non-finite count of src1, per-block amax stats) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
@@ -1104,3 +1116,6 @@ on `qwen35` that the kill switches above do not explain points here first.
   Gemma 4 31B (layer 44 attn_v first, nan logits at every matvec width). Gemma chat byte-identical to
   stock, tg 1.63x stock (-0.46% vs the broken build); Qwen byte-identical, tg -0.08%; full suite
   14675/14675 on both cards. Debug knob `GGML_A16K_CHECK=1`.
+- 2026-09-07: local patch 42 (`p100x: 42-norm-cache-5376`): `rms_norm_f32` register cache limit 5 -> 6 values
+  per thread so rows up to 6144 columns are cached; Gemma 4 31B (n_embd 5376) tg64 28.63 -> 29.08 t/s (+1.6%),
+  Qwen unchanged, registers 30-32, no spills, output byte-identical.

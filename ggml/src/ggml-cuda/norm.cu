@@ -73,7 +73,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_pre_add = false, int max_cache = 5>
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_pre_add = false, int max_cache = 6>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -534,7 +534,7 @@ static void group_norm_f32_cuda(
     }
 }
 
-// max_cache 5 so a 5120-wide row is cached too; GGML_CUDA_NORM_CACHE_LEGACY=1 keeps the old limit of 4
+// max_cache 6 so a 5376-wide row (Gemma 4) is cached too; GGML_CUDA_NORM_CACHE_LEGACY=1 keeps the old limit of 4
 template <bool do_multiply, bool do_add, bool do_pre_add, typename... Args>
 static void rms_norm_f32_launch_1024(const ggml_cuda_kernel_launch_params & launch_params, Args &&... args) {
     static bool legacy = getenv("GGML_CUDA_NORM_CACHE_LEGACY") != nullptr &&
@@ -542,7 +542,7 @@ static void rms_norm_f32_launch_1024(const ggml_cuda_kernel_launch_params & laun
     if (legacy) {
         ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_pre_add, 4>, launch_params, std::forward<Args>(args)...);
     } else {
-        ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_pre_add, 5>, launch_params, std::forward<Args>(args)...);
+        ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_pre_add, 6>, launch_params, std::forward<Args>(args)...);
     }
 }
 
