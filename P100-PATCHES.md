@@ -842,6 +842,12 @@ LCP slot matching in the server.
 
 ## Runtime notes (2x P100, `-sm tensor`)
 
+- KNOWN ISSUE (2026-09-07, plan item C6): on Gemma 4 31B (UD-Q4_K_XL) patches 32/33 produce nan logits
+  at matvec widths (perplexity nan at `-ub 1`, chat output degenerates to a filler token) while the
+  cuBLAS path is exact. `GGML_CUDA_DISABLE_MMVQ_F16_K=1` restores stock output byte for byte at -19% tg;
+  so does `GGML_CUDA_DISABLE_MMVQ_F16_K_TYPES=q4_K` or `=q6_K` alone (q5_K alone does not help), so the
+  failure needs the Q4_K and the Q6_K path together (ffn gate/up feeding ffn down). Qwen3.8-27B is not
+  affected. Fix in progress as plan item B4d; do not serve Gemma 4 from this branch without the switch.
 - Batches wider than 8 columns run quantized matmuls through dequantize-to-F16 + cuBLAS on
   sm_60 (MMQ is excluded below DP4A for dense `MUL_MAT`, see `ggml_cuda_should_use_mmq`; since
   #26264 upstream allows it for `MUL_MAT_ID` only). The
@@ -1064,3 +1070,7 @@ on `qwen35` that the kill switches above do not explain points here first.
   per launch in the model (129 per token per card); tg 31.91 -> 32.11 t/s at d0 (+0.6%), 30.91 -> 31.10 at
   d16384, pp unchanged; registers unchanged, no spills; output byte-identical, perplexity identical. Kill switch
   `GGML_CUDA_NORM_CACHE_LEGACY=1`.
+- 2026-09-07: C6 Gemma 4 31B measurement pass (no patch): `-sm tensor` accepts gemma4 (deny-list); no
+  flash-attention regression on 11 launch shapes, the patch 38 tie-break gains 1.094x on the D=512 GQA 8
+  launch at n_kv 4096; tg 17.5 -> 28.8 t/s at d0 vs stock (1.645x), pp2048 362 -> 385 (1.063x). Found the
+  nan of patches 32/33 on this model (see Runtime notes); patch 40's cache does not fire at n_embd 5376.
