@@ -73,7 +73,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_pre_add = false>
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_pre_add = false, int max_cache = 5>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -153,7 +153,6 @@ static __global__ void rms_norm_f32(const float * x,
     // The <1024> instantiation is the only one launched with a row wide enough to need more than
     // one value per thread (rms_norm_f32_cuda picks <256> when ncols < 1024), and adding the
     // branch to the narrow one COST ~6% on the 128/256-wide norms, so gate it at compile time.
-    constexpr int  max_cache = 4;
     constexpr bool do_cache  = block_size >= 1024;
     const bool cached = do_cache && ncols > block_size && ncols <= max_cache*block_size;
     float xv[max_cache];
@@ -539,6 +538,18 @@ static void group_norm_f32_cuda(
     }
 }
 
+// max_cache 5 so a 5120-wide row is cached too; GGML_CUDA_NORM_CACHE_LEGACY=1 keeps the old limit of 4
+template <bool do_multiply, bool do_add, bool do_scale, bool do_pre_add, typename... Args>
+static void rms_norm_f32_launch_1024(const ggml_cuda_kernel_launch_params & launch_params, Args &&... args) {
+    static bool legacy = getenv("GGML_CUDA_NORM_CACHE_LEGACY") != nullptr &&
+                         std::atoi(getenv("GGML_CUDA_NORM_CACHE_LEGACY"));
+    if (legacy) {
+        ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_scale, do_pre_add, 4>, launch_params, std::forward<Args>(args)...);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_scale, do_pre_add, 5>, launch_params, std::forward<Args>(args)...);
+    }
+}
+
 template <bool do_scale = false>
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
@@ -556,7 +567,7 @@ static void rms_norm_f32_cuda(
     } else {
         const dim3 block_dims(1024, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-        ggml_cuda_kernel_launch(rms_norm_f32<1024, false, false, do_scale>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+        rms_norm_f32_launch_1024<false, false, do_scale, false>(launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
         // underlying cudaLaunchKernelEx does not support default params
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), scale_out, nullptr, nullptr, nullptr);
@@ -611,7 +622,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                 nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), 1.0f,
                 pre_a, pre_b, pre_dst);
         } else {
-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, false, false, true>, launch_params,
+            rms_norm_f32_launch_1024<true, false, false, true>(launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row,
                 mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed,
                 mul_nchannels_packed, mul_nsamples_packed,
@@ -640,7 +651,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true>, launch_params,
+            rms_norm_f32_launch_1024<true, false, false, false>(launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
@@ -667,7 +678,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, true>, launch_params,
+            rms_norm_f32_launch_1024<true, true, false, false>(launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
