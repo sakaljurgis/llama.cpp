@@ -148,6 +148,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 36 | fattn-tile-p100 | sm_60 (CUDA) | yes (every flash-attention launch of the model: retuned tg entry for D=256; GQA 6 packing at 1-2 Q columns above n_kv 16384) |
 | 37 | server-ckpt-save | host (server) | yes (hybrid/recurrent models, every context checkpoint save on a follow-up) |
 | 38 | fattn-pb-tiebreak | sm_60 (CUDA) | yes (every one-Q-column flash-attention launch; GQA 6 packing now from n_kv 2560) |
+| 39 | convert-vec | CUDA (all archs, measured on sm_60) | yes (every dequant + cuBLAS matmul: pp at every ubatch, the LM head above 64 columns, the BF16 allreduce wire) |
 
 ### 31 server-ckpt-adopt
 
@@ -608,6 +609,96 @@ tie-break is one block at the end of the `else` (non-stream-k) branch of `launch
 gate is the `gqa6_ok` lines of `launch_fattn_tile_switch_ncols2`; both files are upstream-churned,
 and 36 and 38 touch the same lines (rebase them as a pair).
 
+### 39 convert-vec
+
+`ggml/src/ggml-cuda/convert.cu` (+76/-15), `dequantize.cuh` (+36/-8) and `common.cuh` (+10/-0). Plan
+items A3' and A2. Two kernels around every cuBLAS call on GP100 ran at a third of the copy ceiling.
+nsys at `-ub 2048` (Qwen3.8-27B UD-Q4_K_M, per graph evaluation per card, 4910 ms of kernel time):
+`convert_unary` 463.6 ms in 1248 launches (9.4% of pp) moving 76.5 GB at 165 GB/s, and
+`dequantize_block_*` 159.0 ms in 496 launches (3.2%) moving 31.0 GB at 195 GB/s, against the
+560 GB/s device copy ceiling of `P100-HARDWARE.md`.
+
+A3' replaces the one-element-per-thread kernel behind the contiguous entry point
+(`convert_unary_cont_cuda`) with `convert_unary_vec<src_t, dst_t, nelem, cpy>`: `nelem` contiguous
+elements per thread moved with `cpy`-byte transfers through the new `ggml_cuda_memcpy_n` in
+`common.cuh` (the loop that `ggml_cuda_memcpy_1`'s own assert message asks for), a scalar tail loop
+for `k % nelem` in the same launch, and a grid that covers the data instead of one block per 256
+elements. The element expression is the unchanged `ggml_cuda_cast<dst_t>(x[i])`, so no rounding
+moves. 4 elements per thread with 8-byte transfers won the sweep below; the host gate falls back to
+the old kernel when either pointer is not 8-byte aligned (pool buffers always are). The
+non-contiguous `convert_unary_cuda` and the `_nc` variants are untouched. All six instantiations of
+the entry point take the new kernel, so the BF16 allreduce wire (`ggml-cuda.cu`, 99.5 ms per
+evaluation per card) is covered for free.
+
+A2 turned out not to be the item the plan described. One super block per warp with 8 warps per
+block, byte-identical by construction (`threadIdx.y` selects the super block, every thread keeps
+its element mapping), is a no-op on its own: q4_K 151 -> 153 GB/s, q5_K 214 -> 214, q6_K 329 -> 331,
+iq4_xs 177 -> 192, q3_K 189 -> 176. What costs is the store: `dequantize_q4_K` has each of 32 threads
+write `y[l]` and `y[l+32]` for l = 0..3 as eight 2-byte stores, so one store instruction writes
+2 bytes every 8 across the warp. Issuing each contiguous group of 4 as one 8-byte transfer (same
+values, same addresses; new `bool vec_store` template parameter on `dequantize_q4_K` and
+`dequantize_iq4_xs`, default `false` so `getrows.cu` is unchanged) gives q4_K 151 -> 377 GB/s and
+iq4_xs 177 -> 323, and the block packing then adds the rest: 460 and 341 GB/s, 3.04x and 1.93x per
+call. q5_K only has 2 contiguous elements per thread and gains 1.04x, q6_K writes singles at a
+stride of 32 and is already at 329 GB/s, q3_K loses from packing; all three keep their launchers.
+
+Per-call sweep (standalone harness on the in-tree `convert.cu`, k = 10485760 = 5120x2048, GB/s
+counting both directions):
+
+    config                     f32->f16  f32->bf16  f16->f32  bf16->f32
+    old, 1 element per thread    173         162        192       192
+    nelem 4, cpy 8               544         536        494       494    <- shipped
+    nelem 8, cpy 8               522         399        285       247
+    nelem 8, cpy 16              544         540        417       418
+    nelem 16, cpy 8              407         157          -         -
+    nelem 4, cpy 8, 448 blocks   540         525        440       440
+
+16-byte transfers (Pascal has `LDG.128`; `ggml_cuda_get_max_cpy_bytes()` returns 8 on sm_60) tie in
+one direction and lose 15% in the other, so the tree's 8-byte convention stands and plan item C5
+gets a data point. A bounded grid with a grid-stride loop, the usual shape for a streaming kernel,
+loses 1-11%: the P100 retires 10240 blocks without trouble; what it could not do was retire 40960
+blocks that move 1.5 KB each. Block size is flat from 64 to 1024 threads.
+
+In the model (Qwen3.8-27B UD-Q4_K_M, 2x P100, `-sm tensor -fa on`, arms alternated, median of `-r 5`,
+the f80d6db61 binaries as the base arm):
+
+    pp2048 -ub 2048   base 420.82 (420.34-421.69) -> new 449.36 (449.17-449.70) t/s   +6.8%
+                      A3' alone +5.55% (new against GGML_CUDA_DISABLE_CONVERT_VEC=1, 425.75)
+                      A2  alone +1.22% (new against GGML_CUDA_DISABLE_DEQUANT_VEC=1, 443.93)
+                      both switches set on the new binary: 420.06, i.e. base within the spread
+    pp2048 -ub 512    base 235.06 (234.92-235.17) -> new 248.30 (248.19-248.34) t/s   +5.6%
+                      A3' alone +3.18%, A2 alone +2.92% (the dequant work does not shrink with the ubatch)
+    tg64 d0 / d16384  unchanged (31.92 -> 31.91 and 30.92 -> 30.91 with patch 40 off in both arms)
+
+nsys per graph evaluation per card: kernel time 4909.8 -> 4560.1 ms (-7.1%); `convert_unary`
+463.6 ms at 165 GB/s -> `convert_unary_vec` 147.2 ms at 520 GB/s (29% -> 93% of the ceiling,
+547-551 GB/s = 98% on the f32 -> f16 direction); dequant 159.0 -> 109.9 ms at 195 -> 282 GB/s, which
+is q4_K 458.3 -> 167.5 us per launch (168 -> 461 GB/s, 2.74x) and iq4_xs 457.9 -> 293.4 us
+(212 -> 330 GB/s, 1.56x) with q5_K, q6_K, q3_K and iq4_nl unchanged as designed. The old
+`convert_unary` does not appear in the capture at all, so the alignment gate passes on every call
+of this model.
+
+Perplexity 5.4367 in every arm (new, both kill switches, base and stock: identical to the last
+digit) and 256 greedy tokens byte-identical to base at `-ub 2048` and `-ub 512`. Full
+`test-backend-ops` 14675/14675 on CUDA0 and on CUDA1 (and on CUDA0 with both switches set); the
+harness memcmps both new kernels against the old ones over 25 widths (every tail case), 6 type
+pairs and 5 vector configurations plus the misaligned fallback: 0 mismatches. No new registers and
+no spills (`convert_unary_vec` 17-29 registers against 23-24; `dequantize_block_sb` 22-30 against
+23-28). Compute buffer sizes unchanged.
+
+The plan's A3 one-off, measured the same day: `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` (F32 compute, no
+conversion pass, no F16 dequant target) gives pp2048 420.90 -> 272.13 t/s (-35.3%) and perplexity
+5.4094 against 5.4367, so the halved HFMA2 rate costs far more than the passes it removes, and F16
+accumulation in the shipped path prices at 0.50% perplexity.
+
+Kill switches: `GGML_CUDA_DISABLE_CONVERT_VEC=1` (the old `convert_unary` for the contiguous entry)
+and `GGML_CUDA_DISABLE_DEQUANT_VEC=1` (per-element stores and one super block per block, i.e. the
+launches of b10758). Not done, with numbers: q5_K needs a different index assignment inside
+`dequantize_q5_K` for a 4-element store group, about 0.5% of pp2048 left there; `getrows.cu` could
+ask for `vec_store = true` and get the same 1.9-3.0x on quantized get_rows, which this model does
+not use. Rebase note: one kernel and one launcher template in `convert.cu`, two `if constexpr`
+branches in `dequantize.cuh`; both files are upstream's with modest churn.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -689,6 +780,8 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `LLAMA_SERVER_CKPT_SAVE_LEGACY=1` | 37 | kill switch (a freshly allocated buffer for every context checkpoint) |
 | `GGML_CUDA_FATTN_PB_TIEBREAK=0` | 38 | kill switch (b10758 `parallel_blocks` search; `GGML_CUDA_FATTN_TILE_LEGACY=1` implies it) |
 | `GGML_CUDA_FATTN_GQA6_MIN_KV=<n>` | 38 | smallest n_kv for the GQA 6 packing: default 2560 (7680 at 2 Q columns), 16384 = patch 36, 0 = always, also with one kv head |
+| `GGML_CUDA_DISABLE_CONVERT_VEC=1` | 39 | kill switch (contiguous F16/BF16 <-> F32 conversion back to the one-element-per-thread `convert_unary`) |
+| `GGML_CUDA_DISABLE_DEQUANT_VEC=1` | 39 | kill switch (Q4_K and IQ4_XS dequant back to per-element stores and one super block per CUDA block) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -911,3 +1004,11 @@ on `qwen35` that the kill switches above do not explain points here first.
   clean on CUDA1 and one unrelated flaky iq1_s case on CUDA0; check6 22 shapes; perplexity identical;
   greedy byte-identical to stock with the packed kernel running. Kill switches
   `GGML_CUDA_FATTN_PB_TIEBREAK=0`, `GGML_CUDA_FATTN_TILE_LEGACY=1`.
+- 2026-09-07: local patch 39 (`p100x: 39-convert-vec`): the contiguous F16/BF16 <-> F32 conversion around
+  every cuBLAS call moves 4 elements per thread in 8-byte transfers (`convert_unary` 165 -> 520 GB/s, 29% -> 93%
+  of the copy ceiling), and the Q4_K / IQ4_XS dequant-to-F16 kernels store each contiguous group of 4 as one
+  8-byte transfer with 8 super blocks per block (q4_K 168 -> 461 GB/s, iq4_xs 212 -> 330). pp2048 420.8 -> 449.4
+  t/s at `-ub 2048` (+6.8%; conversion +5.55%, dequant +1.22%), 235.1 -> 248.3 at `-ub 512` (+5.6%); tg unchanged.
+  Output byte-identical: perplexity 5.4367 in every arm including stock, greedy identical, full suite
+  14675/14675 on both cards. The plan's A2 premise was wrong: block packing alone is a no-op, these kernels are
+  store bound. Kill switches `GGML_CUDA_DISABLE_CONVERT_VEC=1`, `GGML_CUDA_DISABLE_DEQUANT_VEC=1`.
