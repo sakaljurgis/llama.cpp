@@ -149,6 +149,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 37 | server-ckpt-save | host (server) | yes (hybrid/recurrent models, every context checkpoint save on a follow-up) |
 | 38 | fattn-pb-tiebreak | sm_60 (CUDA) | yes (every one-Q-column flash-attention launch; GQA 6 packing now from n_kv 2560) |
 | 39 | convert-vec | CUDA (all archs, measured on sm_60) | yes (every dequant + cuBLAS matmul: pp at every ubatch, the LM head above 64 columns, the BF16 allreduce wire) |
+| 40 | norm-cache-5120 | CUDA | yes (every `rms_norm` of a 4097-5120 wide row: all 129 per-token norms of Qwen3.8-27B) |
 
 ### 31 server-ckpt-adopt
 
@@ -699,6 +700,50 @@ ask for `vec_store = true` and get the same 1.9-3.0x on quantized get_rows, whic
 not use. Rebase note: one kernel and one launcher template in `convert.cu`, two `if constexpr`
 branches in `dequantize.cuh`; both files are upstream's with modest churn.
 
+### 40 norm-cache-5120
+
+`ggml/src/ggml-cuda/norm.cu` (+17/-6). Plan item E5. Patch 17's register cache in `rms_norm_f32`
+drops the second read of the row when the row fits in `max_cache` values per thread, and its limit
+was 4, i.e. `ncols <= 4096` for the `<1024>` instantiations. Qwen3.8-27B is n_embd 5120, so on this
+model the cache never fired: nsys at tg shows `rms_norm_f32<1024, true, false, true>` (the patch 19
+pre-add form) 129 times per token per card at 10.2 us, 4.3% of the token's kernel time.
+
+`max_cache` becomes the last template parameter with default 5, so every existing reference
+(`rms_norm_f32<256, true>` and friends) still compiles, and one 12-line launch helper picks between
+`<..., 5>` and `<..., 4>` from a single static env read; the four `<1024>` launch sites become
+one-line calls to it, none is duplicated. `l2_norm_f32` keeps its own limit of 4: it runs at
+block_size 32 and ncols 128 on this model, exactly 4*32, so its cache already fires.
+
+Registers are unchanged, 30/31/31/32 for the four `<1024>` instantiations before and after, no
+spills (1024 threads leave 64 registers for one block per SM, so 6 or 8 would also fit; 5 is what
+5120 needs, and a larger limit makes the unrolled prologue run predicated-off iterations on every
+narrower cached row).
+
+    test-backend-ops perf -b CUDA0 (us per run, legacy -> new)
+    RMS_NORM       4097 x 1     5.12 -> 3.86  1.33x      4097 x 2048  149.59 -> 131.56  1.14x
+    RMS_NORM       5120 x 1     6.33 -> 3.89  1.63x      5120 x 2048  201.47 -> 162.24  1.24x
+    RMS_NORM       6144 x 1     6.67 -> 6.66  1.00x      6144 x 2048  254.20 -> 252.65  1.01x
+    ADD_RMS_NORM   5120 x 1     6.34 -> 3.88  1.63x      5120 x 2048  202.27 -> 162.82  1.24x
+
+4097 gains too (it was above 4*1024, so patch 17 never cached it either); 6144 is above 5*1024 and
+does not move in either arm. Upstream `test-backend-ops` covers RMS_NORM at n = 64, 1025, 33, 132
+and 260 only, so nothing between 4096 and 5120 was tested; the widths above were measured with
+temporary local cases (eval and perf) that are not part of the patch.
+
+In the model: nsys at tg has the kernel at 10.2 -> 8.8 us per launch, 129 launches per token per
+card, 1.31 -> 1.14 ms of the token's 30 ms of kernel time (4.34% -> 3.81%); rms_norm over all shapes
+1.59 -> 1.41 ms. llama-bench, arms alternated, two passes each:
+
+    tg64 d0       31.91/31.90 -> 32.11/32.09 t/s   +0.63%   (f80d6db61 binaries 31.92)
+    tg64 d16384   30.91/30.93 -> 31.10        t/s   +0.61%   (f80d6db61 binaries 30.92)
+    pp2048        unchanged (the pp shape gains 1.24x on the kernel, which is 0.9% of pp kernel time)
+
+Perplexity 5.4367, identical to base and stock; 256 greedy tokens byte-identical at `-ub 2048` and
+`-ub 512`; full `test-backend-ops` 14675/14675 on CUDA0 and on CUDA1.
+
+Kill switch `GGML_CUDA_NORM_CACHE_LEGACY=1`: the 4-value limit of patch 17. Rebase note: patches 17,
+19 and 40 all live in the `rms_norm_f32` kernel and its launchers; rebase them as a group.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -782,6 +827,7 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_FATTN_GQA6_MIN_KV=<n>` | 38 | smallest n_kv for the GQA 6 packing: default 2560 (7680 at 2 Q columns), 16384 = patch 36, 0 = always, also with one kv head |
 | `GGML_CUDA_DISABLE_CONVERT_VEC=1` | 39 | kill switch (contiguous F16/BF16 <-> F32 conversion back to the one-element-per-thread `convert_unary`) |
 | `GGML_CUDA_DISABLE_DEQUANT_VEC=1` | 39 | kill switch (Q4_K and IQ4_XS dequant back to per-element stores and one super block per CUDA block) |
+| `GGML_CUDA_NORM_CACHE_LEGACY=1` | 40 | kill switch (`rms_norm_f32` register cache limited to 4 values per thread, `ncols <= 4096`, as in patch 17) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -1012,3 +1058,9 @@ on `qwen35` that the kill switches above do not explain points here first.
   Output byte-identical: perplexity 5.4367 in every arm including stock, greedy identical, full suite
   14675/14675 on both cards. The plan's A2 premise was wrong: block packing alone is a no-op, these kernels are
   store bound. Kill switches `GGML_CUDA_DISABLE_CONVERT_VEC=1`, `GGML_CUDA_DISABLE_DEQUANT_VEC=1`.
+- 2026-09-07: local patch 40 (`p100x: 40-norm-cache-5120`): the `rms_norm_f32` register cache of patch 17 now
+  covers rows up to 5*1024 columns (`max_cache` is a template parameter, default 5), so Qwen3.8-27B's 5120-wide
+  norms stop reading the row twice: 6.33 -> 3.89 us per run at 5120x1 in test-backend-ops perf, 10.2 -> 8.8 us
+  per launch in the model (129 per token per card); tg 31.91 -> 32.11 t/s at d0 (+0.6%), 30.91 -> 31.10 at
+  d16384, pp unchanged; registers unchanged, no spills; output byte-identical, perplexity identical. Kill switch
+  `GGML_CUDA_NORM_CACHE_LEGACY=1`.
