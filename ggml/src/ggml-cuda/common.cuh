@@ -831,6 +831,16 @@ static __device__ __forceinline__ void ggml_cuda_memcpy_1(void * __restrict__ ds
     }
 }
 
+// nbytes as a loop of cpy-byte transfers, the loop ggml_cuda_memcpy_1 asks for above its limit
+template <int nbytes, int cpy>
+static __device__ __forceinline__ void ggml_cuda_memcpy_n(void * __restrict__ dst, const void * __restrict__ src) {
+    static_assert(nbytes % cpy == 0, "bad transfer width");
+#pragma unroll
+    for (int c = 0; c < nbytes/cpy; ++c) {
+        ggml_cuda_memcpy_1<cpy>((char *) dst + c*cpy, (const char *) src + c*cpy);
+    }
+}
+
 static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #if CUDART_VERSION >= 12080
     const nv_bfloat16 e = __nv_cvt_e8m0_to_bf16raw(x);
