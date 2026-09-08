@@ -1411,6 +1411,31 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+// A4: the compute-type copy of src0 is a pool allocation of the whole matrix and the VMM pool never
+// returns memory, so one wide LM-head GEMM raises the high-water mark for the rest of the process.
+// Above this size the copy runs in row chunks, the M dimension of the GEMM, so every output element
+// is still one full k-length dot product. Keep it above every other weight: splitting a matrix with
+// few rows costs more than the split saves. 0 = one chunk, upstream behavior.
+#define GGML_CUDA_CUBLAS_CHUNK_MB_DEFAULT 256
+
+static int64_t ggml_cuda_cublas_chunk_bytes() {
+    static const char *  env = getenv("GGML_CUDA_CUBLAS_CHUNK_MB");
+    static const int64_t mb  = env ? atoll(env) : GGML_CUDA_CUBLAS_CHUNK_MB_DEFAULT;
+    return mb > 0 ? mb*1024*1024 : 0;
+}
+
+// Test knob: force this many rows per chunk whatever the size of src0 (0 = use the MiB rule).
+static int64_t ggml_cuda_cublas_chunk_rows() {
+    static const char *  env  = getenv("GGML_CUDA_CUBLAS_CHUNK_ROWS");
+    static const int64_t rows = env ? atoll(env) : 0;
+    return rows;
+}
+
+static bool ggml_cuda_cublas_chunk_log() {
+    static const bool enabled = getenv("GGML_CUDA_CUBLAS_CHUNK_LOG") != nullptr;
+    return enabled;
+}
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1450,8 +1475,45 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
+    // A4: rows of src0 per convert + GEMM step, ne01 = one step = upstream.  Only the two
+    // non-batched branches below are split; there ne12 == ne13 == 1 and the asserts further down
+    // make ne02 == ne03 == 1, so src0 is a single 2D matrix and a row chunk is one byte range.
+    int64_t nrows_chunk = ne01;
+    {
+        const int64_t chunk_bytes = ggml_cuda_cublas_chunk_bytes();
+        const int64_t chunk_rows  = ggml_cuda_cublas_chunk_rows();
+        if ((chunk_bytes > 0 || chunk_rows > 0) && ne12 == 1 && ne13 == 1 && src0->type != compute_type &&
+            ggml_is_contiguously_allocated(src0) && s01*(int64_t) ggml_blck_size(src0->type) == ne00) {
+            if (chunk_rows > 0) {
+                nrows_chunk = chunk_rows;
+            } else if (ggml_nelements(src0)*(int64_t) sizeof(cuda_t) > chunk_bytes) {
+                nrows_chunk = std::max<int64_t>(1, chunk_bytes/(ne00*(int64_t) sizeof(cuda_t)));
+            }
+        }
+    }
+    const bool src0_chunked = nrows_chunk < ne01;
+
+    to_t_cuda_t<cuda_t> convert_chunk = nullptr;
+
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
+    } else if (src0_chunked) {
+        convert_chunk = traits::convert(src0->type);
+        GGML_ASSERT(convert_chunk != nullptr);
+        src0_ptr = src0_alloc.alloc(nrows_chunk*ne00);
+
+        const size_t src0_bs = ggml_blck_size(src0->type);
+        s01 *= src0_bs;
+        s02 *= src0_bs;
+        s03 *= src0_bs;
+
+        if (ggml_cuda_cublas_chunk_log()) {
+            fprintf(stderr, "CUBLASCHUNK %s %s %ld x %ld cols %ld: %ld chunks of %ld rows (%.1f MiB)\n",
+                    src0->name, ggml_type_name(src0->type), (long) ne00, (long) ne01, (long) ne11,
+                    (long) ((ne01 + nrows_chunk - 1)/nrows_chunk), (long) nrows_chunk,
+                    nrows_chunk*ne00*sizeof(cuda_t)/(1024.0*1024.0));
+            fflush(stderr);
+        }
     } else {
         src0_alloc.alloc(ggml_nelements(src0));
 
@@ -1543,25 +1605,42 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int64_t r2 = ne12/ne02;
     const int64_t r3 = ne13/ne03;
 
+    // A4: with src0_chunked the loop converts one row chunk of src0 and multiplies it into the
+    // matching rows of dst; nrows_chunk == ne01 is the single upstream call.
+    auto convert_rows = [&](int64_t i01, int64_t nrows) {
+        if (src0_chunked) {
+            convert_chunk((const char *) src0->data + i01*nb01, src0_alloc.get(), nrows*ne00, main_stream);
+        }
+    };
+
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
     if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
-        CUBLAS_CHECK(
-            cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
-                    ne01, ne11, ne10,
-                    (const float *) alpha, (const float *) src0_ptr, s01,
-                                           (const float *) src1_ptr, s11,
-                    (const float *) beta,  (float       *)  dst_ptr, ne0));
+        for (int64_t i01 = 0; i01 < ne01; i01 += nrows_chunk) {
+            const int64_t nrows = std::min(nrows_chunk, ne01 - i01);
+            convert_rows(i01, nrows);
+            CUBLAS_CHECK(
+                cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nrows, ne11, ne10,
+                        (const float *) alpha, (const float *) src0_ptr, s01,
+                                               (const float *) src1_ptr, s11,
+                        (const float *) beta,  (float       *)  dst_ptr + i01, ne0));
+        }
     } else if (ne12 == 1 && ne13 == 1) {
-        CUBLAS_CHECK(
-            cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
-                    ne01, ne11, ne10,
-                    alpha, src0_ptr, cu_data_type_a, s01,
-                           src1_ptr, cu_data_type_b, s11,
-                    beta,   dst_ptr, cu_data_type,   ne0,
-                    cu_compute_type,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        const size_t dst_ts = cu_data_type == CUDA_R_32F ? sizeof(float) : sizeof(cuda_t);
+        for (int64_t i01 = 0; i01 < ne01; i01 += nrows_chunk) {
+            const int64_t nrows = std::min(nrows_chunk, ne01 - i01);
+            convert_rows(i01, nrows);
+            CUBLAS_CHECK(
+                cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nrows, ne11, ne10,
+                        alpha, src0_ptr, cu_data_type_a, s01,
+                               src1_ptr, cu_data_type_b, s11,
+                        beta,   dst_ptr + i01*dst_ts, cu_data_type, ne0,
+                        cu_compute_type,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
