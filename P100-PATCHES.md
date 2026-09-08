@@ -158,6 +158,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 41 | mmvq-k-f16-range | sm_60 (CUDA) | yes (every Q6_K matvec at widths 1-8 and IQ4_XS at 4-8; bug fix for 32/33, found on Gemma 4 31B) |
 | 42 | norm-cache-5376 | CUDA | yes (every `rms_norm` of a 5121-6144 wide row: Gemma 4 31B's n_embd 5376) |
 | 43 | sampler-prefilter-grammar | host (sampling) | yes (every request that carries `tools` with `tool_choice` auto, the coding-harness shape, where patch 13 was off; the MTP verify step doubles the gain) |
+| 44 | cublas-src0-chunk | CUDA (all archs, measured on sm_60) | only above 256 MiB of converted src0, which on these models is exactly the LM head: `ngram-mod` verify batches (default 48-64), MTP only if the draft is raised past the patch 35 per-type ceiling (the default `--spec-draft-n-max 3` gives width 4 and never leaves MMVQ), every all-logits pass, and Gemma 4 31B, whose tied LM head is not row-split |
 
 ### 31 server-ckpt-adopt
 
@@ -850,6 +851,62 @@ grammar rejected nothing in any measured request (resample count 0). No switch o
 server bookkeeping is 0.054 ms per token with the prefilter live (server 30.928 vs llama-bench
 30.874 ms per token at d128), so plan item I2 needs no work.
 
+### 44 cublas-src0-chunk
+
+`ggml/src/ggml-cuda/ggml-cuda.cu` (+93/-14). Plan item A4 (and H2): in
+`ggml_cuda_mul_mat_cublas_impl` a quantized src0 is converted to a compute-type copy of the whole
+matrix in the CUDA pool. The VMM pool never returns physical memory, so one wide LM-head GEMM
+raises the high-water mark for the rest of the process (plan gotcha 17). Above
+`GGML_CUDA_CUBLAS_CHUNK_MB` (default 256) the copy is now done in row chunks of src0, which is the
+M dimension of the GEMM: one pool buffer of that size is reused, and each step converts its rows
+and multiplies them into rows `[i01, i01+nrows)` of every dst column (`dst_ptr + i01`, ld `ne0`).
+Only the two non-batched branches are split, only when a conversion happens at all, only for a
+contiguously allocated src0 whose row stride is `ne00`; there `ne12 == ne13 == 1` and the asserts
+make `ne02 == ne03 == 1`, so src0 is a single 2D matrix and a row chunk is one byte range. The
+batched branches, the `convert_nc` path and `mul_mat_id` keep the whole-matrix copy. `dst_temp`
+stays full size with one closing `to_fp32` pass. `nrows_chunk == ne01` is the single upstream call,
+so the kill switch is exact.
+
+Measured on the server (both cards, `-sm tensor -fa on -b 2048 -ub 2048`, A/B by env var on one
+build). The pool high-water at a 65-column verify batch drops 1280 -> 324 MiB per card on
+Qwen3.8-27B Q4_K_M (-956) and 2774 -> 342 MiB on Gemma 4 31B (-2432; its LM head is the tied
+`token_embd.weight`, which the meta backend does not row-split, so each card converts all 2688
+MiB). The `cuMemCreate: out of memory` abort inside this function (Qwen at `-c 200000`, Gemma at
+`-c 65536`, both on a 65-column `--spec-type ngram-mod` verify batch) is gone, and the largest
+`-c` that survives such a call goes 190000 -> 215000 (+25000 tokens, at 351 MiB per card per
+10000 tokens). It aborted the whole server, not the request.
+
+When it does not fire (2026-09-08): the recorded production line (`--spec-type draft-mtp
+--draft-p-min 0`, draft `n_max` 3 by default, so a verify width of 4) never sends the LM head to
+cuBLAS at all - 0 chunked calls at `-c 160000`, memory identical in both arms (15917 MiB per card
+after a wide request), no OOM either way. MTP itself costs 1642 MiB per card for its second
+context (13873 -> 15515 after load), which leaves 467 MiB free and is why raising the draft width
+past the Q6_K ceiling of 32 needs this patch.
+
+Speed: pp512/pp2048/tg64 unchanged at d0 and d16384 (largest delta 0.13%, inside the 0.28%
+pass-to-pass spread of the off arm), because nothing else on these models is above the threshold.
+Where it does fire the split is faster, not slower - cuBLAS picks a better kernel for tens of
+thousands of rows than for 124160: the LM head at 65 columns 38.8 -> 36.4 ms per card, at 2048
+columns 253.9 -> 227.4 ms, perplexity 5.27 -> 5.24 s per pass. The threshold must stay above the
+largest other weight: 64 MiB costs 3.3% of pp2048 and 32 MiB 10.9%, and per call 3.5-5.4% on the
+ffn_gate/up orientation and 1.6-2.6x on `ffn_down` (long k, few rows: M per chunk falls to
+1560-3120 and cuBLAS loses more on the kernel than the split saves). 256 is the smallest round
+value that leaves every non-LM-head weight of the three branch models unsplit in both split modes
+(largest 220.5 MiB, one Gemma ffn matrix on one card).
+
+Gates: `test-backend-ops -o MUL_MAT` 1253/1253 on both cards with the default and with
+`GGML_CUDA_CUBLAS_CHUNK_ROWS` 8/32/128/512/1440 combined with `GGML_CUDA_MMVQ_MAX_COLS_SM60=8`
+(45 split calls over 23 quantized types, remainder chunks included); `MUL_MAT_ID` 880/880 with 0
+split calls. Per-chunk perplexity identical in both arms (`Final estimate PPL = 5.0730 +/-
+0.12923`). Greedy server text through 37-65 column split LM heads byte-identical on both models
+(1412 and 1432 bytes), draft acceptance identical. Not bit exact: KL divergence of the chunked
+arm against the kill-switch arm is mean -1.2e-5 / max 1e-6 with the same top-1 token for 100% of
+positions and PPL(Q)-PPL(base) -0.000081, because cuBLAS selects a different kernel for the
+smaller M. That is the F16 rounding floor, not an index error: the forced-chunk suite covers the
+indexing directly, and at `CHUNK_ROWS=1` (M=1 per GEMM) cuBLAS degrades far enough that
+`MUL_MAT(mxfp4, m=2880, n=32, k=2880)` misses the 5e-4 tolerance at 3.8e-3 - chunks must keep M
+in the thousands, which the MiB rule does.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -935,6 +992,8 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_DEQUANT_VEC=1` | 39 | kill switch (Q4_K and IQ4_XS dequant back to per-element stores and one super block per CUDA block) |
 | `GGML_CUDA_NORM_CACHE_LEGACY=1` | 40, 42 | kill switch (`rms_norm_f32` register cache limited to 4 values per thread, `ncols <= 4096`, as in patch 17) |
 | `GGML_A16K_CHECK=1` | 41 | debug: sync after every HFMA2 K-quant launch and print the first 8 calls with a non-finite dst (tensor, type, shape, block count, first bad value, non-finite count of src1, per-block amax stats) |
+| `GGML_CUDA_CUBLAS_CHUNK_MB=N` (default 256, 0 = off) | 44 | kill switch and threshold: a converted src0 copy above N MiB is converted and multiplied in row chunks of N MiB; 0 restores the single whole-matrix copy. Values below the largest ffn weight cost pp (64 MiB -3.3%, 32 MiB -10.9% on pp2048) |
+| `GGML_CUDA_CUBLAS_CHUNK_ROWS=N`, `GGML_CUDA_CUBLAS_CHUNK_LOG=1` | 44 | test knobs: force N rows per chunk whatever the size of src0 (N=1 makes cuBLAS pick another kernel and moves results past the test tolerance); one stderr line per split call |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30 (and the MoE-only 07, 08).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -1159,3 +1218,10 @@ on `qwen35` that the kill switches above do not explain points here first.
   had 0 of 512 samples prefiltered and gains 1.47% tg (31.44 -> 30.98 ms per token; the prefilter is
   worth 1.45% on plain chat and 3.4% under MTP); replies and tool calls byte-identical, no grammar
   rejection observed. No new switch (`LLAMA_SAMPLER_PREFILTER=0`).
+- 2026-09-08: local patch 44 (`p100x: 44-cublas-src0-chunk`): the compute-type copy of a huge src0 is
+  converted and multiplied in 256 MiB row chunks (the M dimension of the GEMM), one buffer reused, so the
+  VMM pool no longer has to hold the whole F16 LM head. Pool high-water at a wide verify batch 1280 -> 324
+  MiB per card on Qwen3.8-27B and 2774 -> 342 on Gemma 4 31B; the `cuMemCreate: out of memory` abort is
+  gone and the largest `-c` that survives such a call goes 190000 -> 215000. pp and tg unchanged (the split
+  is faster per call: LM head 38.8 -> 36.4 ms at 65 columns); greedy output byte-identical on both models,
+  KLD 1e-5 with top-1 identical everywhere. Kill switch `GGML_CUDA_CUBLAS_CHUNK_MB=0`.
