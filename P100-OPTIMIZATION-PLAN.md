@@ -1011,19 +1011,31 @@ Items:
   defaults to 32 on this branch, not 8. After patches 35 and 37 a follow-up prompt phase is ~417 ms =
   restore 37 + 28-token decode ~200 (+ its ~66 ms tail) + copy 30 + 4-token decode ~82: the two small
   decodes are now the largest pieces (J5 / Area A / Area G).
-- J5 Speculative decoding. Note 2026-09-08 (after A4/patch 44): the LM-head OOM no longer bounds the draft
-  width, so `ngram-mod` is unrestricted at its default 48-64. MTP still drafts 3 by default (verify width 4),
-  which is below every patch 35 ceiling, so the first J5 question is what draft width MTP should use; its
-  second context costs 1642 MiB per card at `-c 160000` and bounds how far the width can go (gotcha 32). Note 2026-09-05: with A8 verify widths 9-64 cost 1.1-3.9x less
-  (a draft of 15 runs at 107 t/s instead of 37), widths 2-8 unchanged;
-  - MTP (`draft-mtp`): the untested `--draft-p-min 0` (constant verify width 5 keeps graph reuse
-    at ~100%; measured today ~10% reuse with p-min 0.75 and 15-20 ms per miss). Keep the verify
-    width <= 8 (`--spec-draft-n-max 7` or less) until A4 lands, or the LM head F16 copy OOMs.
-  - ngram-mod is free when idle; keep `n-max 7` for the same reason.
-  - Patch 22 (`decode-sched-slots`) only pays with alternating shapes; measure with MTP on,
-    `LLAMA_DEC_SLOTS=0` vs `4`, as `P100-PATCHES.md` says.
+- J5 DONE 2026-09-08 (measurement only, no code change; scripts in `~/p100-opt/j5/`, numbers in
+  `~/p100-opt/j5/J5-notes.md`). `--spec-type draft-mtp` at the default `--spec-draft-n-max 3` is the
+  right setting and `--draft-p-min 0` is already the default (`p_min = 0.0f` in `common/common.h`),
+  so the recorded production line needs no change. Fresh prose, 512 tokens, 6 reps at `-c 16384`:
+  no spec 32.26 t/s, ngram-mod 35.37, MTP 1/2/3/4/5/6/7/15/31/63 = 41.93 / 39.02 / 40.15 / 37.55 /
+  33.03 / 30.71 / 26.79 / 13.90 / 7.23 / 3.92. On the realistic 25k chat with follow-ups and a tool
+  call the ordering flips, because acceptance rises from 47% to 68%: no spec 30.65, ngram-mod 29.03
+  (a loss), MTP 1/2/3/4/5 = 40.48 / 42.12 / 45.75 / 43.45 / 41.75, and the tool call alone runs at
+  54.57 t/s (1.81x). Break-even between width 1 and width 3 is ~55-60% acceptance; the chat arms each
+  generate their own text, so the controlled check is a fixed verbatim-echo prompt with byte-identical
+  output in every arm (main session, 2026-09-08, 300 tokens at `-c 60000`): no spec 32.4 t/s, width
+  1/2/3/4 = 44.4 / 47.6 / 50.8 / 51.2 at 86.9 / 76.3 / 68.4 / 63.1% acceptance, i.e. wider is better
+  exactly where acceptance is high, and 3 vs 4 is a tie that 4 pays for in memory. Per-position
+  acceptance is (0.857, 0.667, 0.476) and one draft position costs ~11 ms in total, which is why
+  nothing above 4 pays. Depth is not what flips the ranking, the content is: the same fresh-prose
+  request at 140 and 23600 tokens gives the same 46-47% acceptance and the same width-1 win. MTP also
+  costs 4.5% of prompt processing (the draft context runs over the prompt too).
+- J5 leftovers: `ngram-mod` is a net loss on this workload (-5.3% tg, 8.3% acceptance) and is not
+  reproducible (gotcha 34); memory bounds the width through `n_rs_seq`, not through the LM head
+  (gotcha 32), so patch 44 does not help MTP at any width that loads; patch 22's premise is dead
+  (graph reuse is already at 99% of verify steps with MTP on, see `P100-PATCHES.md` 22). If the
+  workload were mostly fresh prose rather than tool calls and quoted code, `--spec-draft-n-max 1`
+  would be 4-5% faster there and save 150 MiB per card; for a coding harness it is the wrong way round.
 - J6 Request hygiene that keeps the fast paths on: no per-request `logit_bias` (kills the
-  prefilter), `n_probs = 0`, `-fa on` explicitly, `--temp` etc. fixed in the preset rather than
+  prefilter, even with a bias of 0.0; `n_probs` turned out to be a non-issue, see J5), `-fa on` explicitly, `--temp` etc. fixed in the preset rather than
   per request (a changed sampler set does not break graph reuse, but a changed `n_outputs` does).
 - J7 Router respawn: a child crash loses the host prompt cache and reprocesses the whole
   conversation. The gist fixed the known crash; keep the soak test (4.2 step 5) in the routine
@@ -1238,6 +1250,21 @@ Keep mmap.
 - Do not add a two-buffer ping-pong for the A4 convert/GEMM serialization (2026-09-08): the
   single-buffer split is already faster than the unsplit call at every LM-head width measured, so
   there is nothing to hide behind the convert.
+- Do not widen the MTP draft to make use of the patch 35 column loop or patch 44 (J5, 2026-09-08):
+  the accepted length saturates at ~2.7 tokens per step by width 7 while each draft position costs
+  ~11 ms, so `--spec-draft-n-max` 7 / 15 / 31 / 63 run at 26.8 / 13.9 / 7.2 / 3.9 t/s against 40.2 at
+  the default 3 and 32.3 with no speculation at all. Widths above 10 do not survive a decode at
+  `-c 160000`. The wide-verify machinery pays for `ngram-mod` and all-logits passes, not for MTP.
+- Do not add `--spec-type ngram-mod` to the MTP line (J5, 2026-09-08): on the 25k chat it is -5.3%
+  against no speculation at all (8.3% acceptance over 48-64 token drafts), and because
+  `need_n_rs_seq()` returns 0 for the ngram types every ngram draft of this hybrid model takes the
+  full `update_tgt` path - a 149.6 MiB recurrent-state checkpoint per draft plus a restore on partial
+  acceptance, where MTP at width 3 creates none. Combined it loses even on the verbatim-echo shape it
+  is built for (42.7 vs 53.5 t/s), because the ngram implementation has priority and pre-empts the
+  MTP draft.
+- Do not chase `n_probs` in the request hygiene list (J5, 2026-09-08): the OAI endpoint ignores the
+  field, and the flag it stands for (`logprobs: true` with `top_logprobs` 5 or 20) costs nothing
+  measurable (24.81-24.86 vs 24.83-24.92 ms per token).
 
 ## 4. Measurement and validation protocol
 
@@ -1377,7 +1404,11 @@ llama.cpp behavior on this hardware:
     until patch 43 with any grammar in the chain, i.e. every request that carries `tools` (I1,
     2026-09-07). `top_k <= 0`, mirostat, DRY on, or a non-penalties sampler before top-k in a custom
     `samplers` order also switch it off. Check with a `LLAMA_SAMPLER_PREFILTER=0` A/B through the
-    server; llama-bench does not sample.
+    server; llama-bench does not sample. With MTP the prefilter runs once per draft position as
+    well as on the target samples, so it is worth 3.69% there against 1.45-1.50% without
+    speculation; a request `logit_bias` only reaches the target sampler (0.80% under MTP 3). A bias
+    value of 0.0 still counts: `tools/server/server-schema.cpp` pushes the entry whatever the value
+    and `common_sampler_prefilter_nkeep` only tests `!logit_bias.empty()` (J5, 2026-09-08).
 15. FA at tg with F16 KV and GQA uses the TILE kernel, not VEC, and the Pascal FP16 tile table is
     an upstream TODO. Quantized KV at batch > 2 dequantizes the whole cache per call.
 16. `GGML_CUDA_FORCE_MMQ` cannot enable MMQ for dense matmul on sm_60; the DP4A rule returns first.
@@ -1423,20 +1454,33 @@ llama.cpp behavior on this hardware:
     (raw) or they abort with "this custom template is not supported"; raw wikitext perplexity is
     17000-27000 on stock too, so for Gemma 4 use finite/non-finite, chat output and
     `--kl-divergence` against stock logits as the gates, not the absolute perplexity.
-32. `--spec-type draft-mtp` builds a second `llama_context` sized at the target `n_ctx`
-    (`common/speculative.cpp`), which costs 1642 MiB per card at `-c 160000` here and must fit at
-    load time. With the default draft (`--spec-draft-n-max 3`) that still loads at `-c 160000` and
-    leaves 467 MiB free; with `--spec-draft-n-max 40` the larger `n_outputs_max` pushes the main
-    context's own reserve over the edge at `-c 160000` (1116.30 MiB `cudaMalloc` fails) and the
-    draft context over it at `-c 131072` (256 MiB fails). Both are load-time walls, which A4 does
-    not move - the pool only grows at run time. `--spec-type ngram-mod` needs no second context
-    and drafts 48-64 by default, which is why it is the vehicle for wide-verify tests
-    (found 2026-09-08, A4).
+32. `--spec-type draft-mtp` costs two things per card: a second `llama_context` (1417 MiB at
+    `-c 160000`, 695 MiB at `-c 16384`) and, through `common_params_speculative::need_n_rs_seq()`
+    -> `cparams.n_rs_seq` of the *target* context, one extra copy of the GDN recurrent state per
+    unit of `--spec-draft-n-max` (74.75 MiB per card, 149.6 MiB total; `llama_memory_recurrent`
+    allocates `mem_size * (1 + n_rs_seq)` rows). At `-c 160000` that gives three walls: widths 1-10
+    load and run, 11-13 load and then abort the whole server on the first decode with
+    `cuMemCreate: out of memory` from the VMM pool, and 14+ fail at load with a 897 MiB `cudaMalloc`
+    for the MTP context's compute reserve. At width 3 the largest `-c` that loads and runs is 168000
+    (176128 loads and then aborts on the first decode); at width 1, 176128 runs and 184000 fails at
+    load. One unit of draft width is worth about 1800 tokens of `-c`. None of this is moved by patch
+    44: with MTP the LM head only reaches cuBLAS at 32 draft tokens, which does not load (J5,
+    2026-09-08; supersedes the earlier A4 note that put the wall at 40).
 33. `test-backend-ops -o MUL_MAT` cannot reach the cuBLAS dense path on this branch: its quantized
     cases are 16 rows x k=256 with n <= 9, which patch 35 routes through the MMVQ column loop, so 0
     of 1253 cases exercise the src0 conversion. Forcing it needs
     `GGML_CUDA_MMVQ_MAX_COLS_SM60=8` together with `GGML_CUDA_CUBLAS_CHUNK_ROWS=N` (A4,
     2026-09-08). Same blind-spot class as gotcha 30.
+34. Speculative decoding is only bit-exact if the target logits at batch n equal the logits at
+    batch 1, which they do not on this backend: `--spec-type draft-mtp` at widths 3-31 gives one
+    byte-identical greedy reply, widths 1-2 give another, 47/63 give two more (the Q6_K MMVQ ceiling
+    of 32, gotcha 24) and no speculation gives a fifth. Each MTP width is exactly reproducible with
+    itself. `--spec-type ngram-mod` is not reproducible at all: its draft length varies with the
+    match, so the verify batch shape varies, and three identical greedy requests in one server
+    process produced three different replies. Any greedy A/B must hold the speculation configuration
+    fixed (J5, 2026-09-08). On an easy prompt the flips do not appear at all - a verbatim-echo request
+    is byte-identical across every width and no speculation - so absence of drift on one prompt is
+    not evidence of bit-exactness.
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
