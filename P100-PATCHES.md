@@ -104,8 +104,13 @@ Deferred 2026-08-26. The patch only pays off when the decode graph shape changes
 single cached graph is reused ~14% of the time. Without speculative decoding every decode
 step has the same shape and upstream reuse already hits, so the measured +0.97% (4 slots,
 +72 MiB VRAM) does not apply. It also adds four `ggml_backend_sched` instances with their own
-compute buffers, which is more surface for `-sm tensor`. Revisit when MTP is switched on, and
-then measure `LLAMA_DEC_SLOTS=0` vs `4` on the real workload instead of trusting the number.
+compute buffers, which is more surface for `-sm tensor`.
+
+Re-measured 2026-09-08 with MTP on (plan item J5): the premise is gone. The MTP draft runs in its
+own `llama_context`, so with `p_min = 0` both contexts see a constant ubatch shape and upstream
+graph reuse already hits 286 of 289 verify steps at `--spec-draft-n-max 1` and 209 of 211 at 3
+(99%), the same rate as without speculation (508 of 512). `LLAMA_GRAPH_REUSE_DISABLE=1` costs
+-21.1% / -17.2% with MTP and -25.3% without, i.e. reuse is live in every arm. Leave 22 deferred.
 
 ### 03 topk-moe-multirow and 06 mmq-mul-mat-id-sm60 (dropped)
 
@@ -158,7 +163,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 41 | mmvq-k-f16-range | sm_60 (CUDA) | yes (every Q6_K matvec at widths 1-8 and IQ4_XS at 4-8; bug fix for 32/33, found on Gemma 4 31B) |
 | 42 | norm-cache-5376 | CUDA | yes (every `rms_norm` of a 5121-6144 wide row: Gemma 4 31B's n_embd 5376) |
 | 43 | sampler-prefilter-grammar | host (sampling) | yes (every request that carries `tools` with `tool_choice` auto, the coding-harness shape, where patch 13 was off; the MTP verify step doubles the gain) |
-| 44 | cublas-src0-chunk | CUDA (all archs, measured on sm_60) | only above 256 MiB of converted src0, which on these models is exactly the LM head: `ngram-mod` verify batches (default 48-64), MTP only if the draft is raised past the patch 35 per-type ceiling (the default `--spec-draft-n-max 3` gives width 4 and never leaves MMVQ), every all-logits pass, and Gemma 4 31B, whose tied LM head is not row-split |
+| 44 | cublas-src0-chunk | CUDA (all archs, measured on sm_60) | only above 256 MiB of converted src0, which on these models is exactly the LM head: `ngram-mod` verify batches (default 48-64), never for MTP in a configuration that runs (it would need `--spec-draft-n-max 32`, and J5 measured that widths above 10 do not survive a decode at `-c 160000`), every all-logits pass, and Gemma 4 31B, whose tied LM head is not row-split |
 
 ### 31 server-ckpt-adopt
 
@@ -1225,3 +1230,10 @@ on `qwen35` that the kill switches above do not explain points here first.
   gone and the largest `-c` that survives such a call goes 190000 -> 215000. pp and tg unchanged (the split
   is faster per call: LM head 38.8 -> 36.4 ms at 65 columns); greedy output byte-identical on both models,
   KLD 1e-5 with top-1 identical everywhere. Kill switch `GGML_CUDA_CUBLAS_CHUNK_MB=0`.
+- 2026-09-08: plan item J5 (measurement, no patch): `--spec-type draft-mtp` at the default
+  `--spec-draft-n-max 3` is the right production setting (`--draft-p-min 0` is already the default on
+  this base). 25k chat follow-ups 30.65 -> 45.75 t/s (+49%), a tool call 54.57 (1.81x), a fixed
+  verbatim-echo prompt 32.4 -> 50.8 with byte-identical output; `ngram-mod` is -5.3% and not
+  reproducible. Draft width is bounded by `n_rs_seq` (74.75 MiB per card per unit), not by the LM
+  head, so patch 44 never fires for MTP. Patch 22's premise is dead (graph reuse already 99% with MTP
+  on). Details in `~/p100-opt/j5/J5-notes.md`.
