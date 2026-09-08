@@ -427,7 +427,8 @@ Items:
   compute, F32 output directly, no conversion pass, but half the FLOPS). Expected: slower; do it
   once to have the number and to see whether F16 accumulation costs accuracy (perplexity check,
   section 4.2). No code.
-- A4 Bounded-memory GEMM for huge matrices (fixes the LM head OOM documented in
+- A4 DONE 2026-09-08 (`p100x: 44-cublas-src0-chunk`, numbers in the Tier 1 table and P100-PATCHES.md 44).
+  Original item: Bounded-memory GEMM for huge matrices (fixes the LM head OOM documented in
   `P100-PATCHES.md` runtime notes: the ~2.5 GB F16 copy of `output.weight` on the first 9+ column
   verify batch). In `ggml_cuda_mul_mat_cublas_impl`, when `ggml_nelements(src0) * 2` exceeds a
   threshold (env `GGML_CUDA_CUBLAS_CHUNK_MB`, default e.g. 512), loop over row chunks of src0:
@@ -890,8 +891,10 @@ Items:
   weights per device, KV, compute buffer, pool) into the log. Then `nvidia-smi` after a 2048-token
   prompt and after a 9+ column verify batch (if speculative decoding is on) to see the pool
   high-water mark move.
-- H2 A4 (chunked cuBLAS) is the memory fix with the largest payoff: it removes the need to hold
-  back ~1.3 GB per card. Do it early.
+- H2 DONE 2026-09-08 with A4 (patch 44): the pool high-water at a wide LM-head call drops 956 MiB
+  per card on Qwen3.8-27B and 2432 MiB on Gemma 4 31B, and `-c` can go 190000 -> 215000. Left in this
+  area: Gemma's tied `token_embd` LM head is not row-split by the meta backend (each card converts the
+  whole 2688 MiB copy), and a wide all-logits pass still allocates the full F16 `dst_temp`.
 - H3 `-ub` vs compute buffer size: record the compute buffer at `-ub 512/1024/2048` (H1); if
   `-ub 1024` costs < 3% pp (A1) and frees hundreds of MB, that memory buys context or a second
   slot. Decide with numbers.
@@ -1008,7 +1011,10 @@ Items:
   defaults to 32 on this branch, not 8. After patches 35 and 37 a follow-up prompt phase is ~417 ms =
   restore 37 + 28-token decode ~200 (+ its ~66 ms tail) + copy 30 + 4-token decode ~82: the two small
   decodes are now the largest pieces (J5 / Area A / Area G).
-- J5 Speculative decoding (revisit after A4 and G): note 2026-09-05: with A8 verify widths 9-64 cost 1.1-3.9x less
+- J5 Speculative decoding. Note 2026-09-08 (after A4/patch 44): the LM-head OOM no longer bounds the draft
+  width, so `ngram-mod` is unrestricted at its default 48-64. MTP still drafts 3 by default (verify width 4),
+  which is below every patch 35 ceiling, so the first J5 question is what draft width MTP should use; its
+  second context costs 1642 MiB per card at `-c 160000` and bounds how far the width can go (gotcha 32). Note 2026-09-05: with A8 verify widths 9-64 cost 1.1-3.9x less
   (a draft of 15 runs at 107 t/s instead of 37), widths 2-8 unchanged;
   - MTP (`draft-mtp`): the untested `--draft-p-min 0` (constant verify width 5 keeps graph reuse
     at ~100%; measured today ~10% reuse with p-min 0.75 and 15-20 ms per miss). Keep the verify
@@ -1129,7 +1135,7 @@ Keep mmap.
 | Item | Change | Expected | Depends on |
 |---|---|---|---|
 | G2 | CUDA graphs on Pascal (remove the `cc < VOLTA` gate), validate with `-sm none` first | +10-30% tg single card if launch-bound | G1 |
-| A4 | chunked dequant + GEMM for huge src0 (LM head) | removes the OOM, frees ~1.3 GB per card | A1 (optional) |
+| A4 | DONE 2026-09-08 as `p100x: 44-cublas-src0-chunk`: convert and multiply src0 in 256 MiB row chunks (the M dimension of the GEMM) when its compute-type copy would be larger, one pool buffer reused for every chunk. The VMM pool high-water at a wide LM-head call drops 1280 -> 324 MiB per card on Qwen3.8-27B (-956) and 2774 -> 342 MiB on Gemma 4 31B (-2432; its tied `token_embd` LM head is not row-split by the meta backend, so each card converts all 2688 MiB); the `cuMemCreate: out of memory` abort inside `ggml_cuda_mul_mat_cublas_impl` (Qwen at `-c 200000`, Gemma at `-c 65536`, both on a 65-column `ngram-mod` verify batch, and it kills the server rather than the request) is gone, and the largest `-c` that survives such a call goes 190000 -> 215000 (+25000 tokens at 351 MiB per card per 10000). pp512/pp2048/tg64 unchanged at d0 and d16384 (<= 0.13%, inside the spread) because nothing else on these models is above the threshold; where it fires the split is faster, not slower (LM head 65 columns 38.8 -> 36.4 ms per card, 2048 columns 253.9 -> 227.4 ms), so no ping-pong buffer is needed. Not bit exact (cuBLAS picks another kernel for the smaller M): mean KLD -1.2e-5, top-1 identical for 100% of positions, per-chunk perplexity identical to 4 decimals, greedy output of both models byte-identical | left: it does not fire for the recorded production line, whose MTP draft is `n_max` 3 (verify width 4, under the patch 35 Q6_K ceiling of 32): 0 chunked calls at `-c 160000` and identical memory in both arms, so the item pays for `ngram-mod`, for a raised MTP draft width, for all-logits passes and for Gemma; the threshold must stay above the largest ffn weight (see What not to do); `mul_mat_id`, the batched branches and the `convert_nc` path keep the whole-matrix copy; the wide LM head would be cheaper still through the MMVQ column loop (A8 with a higher per-type ceiling, no F16 copy at all: 36.4 ms per card at 65 columns today); splitting Gemma's tied LM head across cards is an Area H meta-backend question; A4b: the split is 0.59x per call at 128 MiB but the byte rule cannot go there, so a rule keyed on rows (keep M per GEMM in the tens of thousands) instead of bytes may be worth 1.6x on every wide LM-head call - measure across widths first, the 128 MiB point is non-monotonic | A1 (optional) |
 | F5 | internal allreduce on sm_60 (`__nanosleep` replacement) | A/B vs NCCL at tg; may win 1-3 ms per token | F1 F2 |
 | B2 | re-enable MMVQ gate/up fusion on Pascal. Correction 2026-09-07: no longer trivial. The HFMA2 K-quant matvec (patches 32-34) bails out when a fusion is requested, so lifting the `cc <= PASCAL` gate in `ggml_cuda_should_fuse_mul_mat_vec_q` would route the fused gate/up matvecs back onto the int8 path and lose the B4 gains; it needs a fused GLU epilogue in `mmvq-k-f16-sm60.cu` first (Tier 2 effort) | 0-3% tg | B1, B4b |
 | B4d | DONE 2026-09-07 as `p100x: 41-mmvq-k-f16-range`: the Q6_K (and latently the IQ4_XS) epilogue of the HFMA2 K-quant matvec summed an int8 sub-block scale of -128 times a lane accumulator of 8 products of |q*a'| <= 32 over 4 sub-blocks, which reaches 2^18 against half's 65504; measured peak 71552 on `blk.44.attn_v.weight` of Gemma 4 31B, below the limit on every other tensor of the prompt and on every Qwen shape. Fix: the scale times 1/8 and d times 8, both exact, product unchanged bit for bit. Gemma nan gone, chat byte-identical to stock, tg 28.66 t/s (1.634x stock, -0.46% against the broken build), Qwen byte-identical at -0.08% tg and -0.2/-0.3% pp8/pp32, test-backend-ops 14675/14675 on both cards | left: the F16 accumulation itself costs 0.020 mean KLD and 1.3 points of top-1 on Gemma against the branch's own 0.172 / 90.8% floor (nothing measurable on Qwen), so a model with wider activation swings needs its own KLD check before it is served; new debug knob `GGML_A16K_CHECK=1` | C6 |
@@ -1221,6 +1227,17 @@ Keep mmap.
 - Do not justify half accumulation with the 4-bit bound (B4d, 2026-09-07): Q6_K values reach 32
   with an int8 scale of 128 and IQ4_XS values reach 127, so any new type on the HFMA2 path needs its
   own worst-case product against 65504, and a run with `GGML_A16K_CHECK=1` on every model.
+- Do not lower `GGML_CUDA_CUBLAS_CHUNK_MB` below the largest non-LM-head weight (A4, 2026-09-08):
+  64 MiB costs 3.3% of pp2048 and 32 MiB costs 10.9%. Per call the split costs 3.5-5.4% on the
+  ffn_gate/up orientation and 1.6-2.6x on `ffn_down` (long k, few rows: M per chunk falls to
+  1560-3120 rows and cuBLAS loses far more on the kernel than the split saves). The LM head is a
+  wide-M matrix that likes being split; `ffn_down` is a narrow-M matrix that does not.
+- Do not chunk a cuBLAS GEMM by a fixed small row count (A4, 2026-09-08): at M=1 cuBLAS changes
+  kernel and `MUL_MAT(mxfp4, m=2880, n=32, k=2880)` misses the suite tolerance (3.8e-3 against
+  5e-4). `GGML_CUDA_CUBLAS_CHUNK_ROWS` is a test knob; chunks must keep M in the thousands.
+- Do not add a two-buffer ping-pong for the A4 convert/GEMM serialization (2026-09-08): the
+  single-buffer split is already faster than the unsplit call at every LM-head width measured, so
+  there is nothing to hide behind the convert.
 
 ## 4. Measurement and validation protocol
 
@@ -1378,8 +1395,10 @@ llama.cpp behavior on this hardware:
     (`--cache-idle-slots`, `--cache-ram 8192`); at long context that is gigabytes over PCIe per
     request. `--cache-ram 0` disables it.
 23. `--cache-reuse` needs a shiftable memory; recurrent/hybrid models do not qualify.
-24. Speculative verify batches wider than 8 leave MMVQ for cuBLAS and trigger the LM-head F16
-    copy; keep drafts <= 7 until A4 lands.
+24. Speculative verify batches leave MMVQ for cuBLAS at the patch 35 per-type ceiling, not at 8:
+    Q4_K 64, Q5_K 48, Q6_K 32, so the Qwen LM head (Q6_K) goes to cuBLAS at 33 columns and the Gemma
+    one (Q5_K) at 49. Patch 44 chunks that copy, so the draft-width restriction is gone and
+    `--spec-type ngram-mod` runs at its default 48-64 token drafts. What still limits MTP is gotcha 32.
 25. Graph reuse breaks on any ubatch shape change (MTP with variable draft length), costing a
     rebuild plus a 15-20 ms meta re-split; `--draft-p-min 0` keeps the shape constant.
 26. The pinned async model upload exists only without mmap (`--load-mode dio`); mmap and the 8 GB
@@ -1404,6 +1423,20 @@ llama.cpp behavior on this hardware:
     (raw) or they abort with "this custom template is not supported"; raw wikitext perplexity is
     17000-27000 on stock too, so for Gemma 4 use finite/non-finite, chat output and
     `--kl-divergence` against stock logits as the gates, not the absolute perplexity.
+32. `--spec-type draft-mtp` builds a second `llama_context` sized at the target `n_ctx`
+    (`common/speculative.cpp`), which costs 1642 MiB per card at `-c 160000` here and must fit at
+    load time. With the default draft (`--spec-draft-n-max 3`) that still loads at `-c 160000` and
+    leaves 467 MiB free; with `--spec-draft-n-max 40` the larger `n_outputs_max` pushes the main
+    context's own reserve over the edge at `-c 160000` (1116.30 MiB `cudaMalloc` fails) and the
+    draft context over it at `-c 131072` (256 MiB fails). Both are load-time walls, which A4 does
+    not move - the pool only grows at run time. `--spec-type ngram-mod` needs no second context
+    and drafts 48-64 by default, which is why it is the vehicle for wide-verify tests
+    (found 2026-09-08, A4).
+33. `test-backend-ops -o MUL_MAT` cannot reach the cuBLAS dense path on this branch: its quantized
+    cases are 16 rows x k=256 with n <= 9, which patch 35 routes through the MMVQ column loop, so 0
+    of 1253 cases exercise the src0 conversion. Forcing it needs
+    `GGML_CUDA_MMVQ_MAX_COLS_SM60=8` together with `GGML_CUDA_CUBLAS_CHUNK_ROWS=N` (A4,
+    2026-09-08). Same blind-spot class as gotcha 30.
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
@@ -1467,6 +1500,8 @@ Original list:
 | `GGML_CUDA_DISABLE_DEQUANT_VEC=1` | patch 39 kill switch: scalar stores and one super block per block for the Q4_K/IQ4_XS dequant |
 | `GGML_CUDA_NORM_CACHE_LEGACY=1` | patch 40/42 kill switch: `rms_norm` register cache limited to 4096 columns (patch 17) |
 | `GGML_A16K_CHECK=1` | patch 41 debug: sync after every HFMA2 K-quant matvec and print the first launches with a non-finite output |
+| `GGML_CUDA_CUBLAS_CHUNK_MB=N` (default 256, 0 = off) | patch 44 kill switch and threshold: convert and multiply a src0 copy above N MiB in row chunks |
+| `GGML_CUDA_CUBLAS_CHUNK_ROWS=N`, `GGML_CUDA_CUBLAS_CHUNK_LOG=1` | patch 44 test knobs: force N rows per chunk; one stderr line per split call |
 
 ## Appendix B: reading order for a new agent
 
