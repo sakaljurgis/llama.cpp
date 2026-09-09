@@ -1019,6 +1019,21 @@ LCP slot matching in the server.
   that is new to the branch gets a run with `GGML_A16K_CHECK=1` and a chat greedy sample before it is
   served (plan gotcha 31).
 
+## Rejected after measurement, no patch number (plan rule 0.2)
+
+Both are written up in P100-OPTIMIZATION-PLAN.md (Tier 1 rows, gotchas 37-40, What not to do) and kept as
+uncommitted diffs plus reports on the server so nobody rebuilds them from scratch.
+
+- E7 (2026-09-09, `~/p100-opt/e7/`): multi-block `rms_norm_f32` for the single-row tg case with a redundant,
+  bit-exact reduction. The patch 19 pre-add form writes into one of its own inputs (in-place ADD), so several
+  blocks per row race; where it applies, redundant reads make the launch 1.22x slower. Any multi-block norm
+  needs a disjoint two-phase split, which costs a launch and bit-exactness.
+- E8 (2026-09-09, `~/p100-opt/e8/`): the GLU / gated-MUL kernel writes the following matvec's a16k or q8_1
+  activation into the patch 10/32 single-slot caches, so the matvec's quantize launch is skipped (335 -> 207
+  per token per card, bit-exact, self-checked). Qwen tg +0.4-0.55%, Gemma 4 -0.4% because its a16k layout 2
+  halves the transaction size of the fused elementwise part; rejected as too little for 680 lines in
+  `mmvq.cu`, `mmvq-k-f16-sm60.cu`, `unary.cu`, `quantize.cu`, `ggml-cuda.cu`.
+
 ## Updating to a new upstream
 
 The branch is a linear commit series, so updating is one rebase:
@@ -1237,3 +1252,9 @@ on `qwen35` that the kill switches above do not explain points here first.
   reproducible. Draft width is bounded by `n_rs_seq` (74.75 MiB per card per unit), not by the LM
   head, so patch 44 never fires for MTP. Patch 22's premise is dead (graph reuse already 99% with MTP
   on). Details in `~/p100-opt/j5/J5-notes.md`.
+- 2026-09-09: measurement day, no patch. D4/E6 fusion census on 5b8bc7dd7 (tg step 31.30 ms, 1698
+  launches, 18 distinct kernels, every adjacent-node pattern already fuses; glue 11.5%: the single-block
+  5120-wide rms_norm 3.6% and the 335 quantize helpers 2.6%). B2 closed by design note (fusion only for
+  1-column matvecs, 0.5% ceiling). E7 (multi-block rms_norm) and E8 (GLU writes the matvec activation)
+  built, measured and rejected, see the section above. Plan gains items E7/E8 (closed), PL1-PL3 (power
+  limit sweep and root-only host/GPU state knobs, scheduled last) and gotchas 35-40.
