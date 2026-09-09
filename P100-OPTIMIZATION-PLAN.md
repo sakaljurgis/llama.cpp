@@ -257,6 +257,39 @@ Gotchas:
 - Memory clock is fixed at 715 MHz on HBM2; only the graphics clock moves.
 - Record idle and load temperatures. P100 slowdown threshold is in the `TEMPERATURE` query.
 
+State found 2026-09-09 (read-only, both P100s): persistence mode Disabled (the `nvidia-persistenced`
+service is active but does not manage these GPUs), compute mode Default, application clock 1189 MHz
+default / 1328 max (steady-state benchmarks already average 1319, so `-ac 715,1328` only shortens the
+ramp after idle), ECC on (native HBM2, keep), PCIe Gen3 x16 on both, IOMMU off (0 groups, nothing to
+do for P2P), ASPM policy `default` (BIOS setting; link L1 state needs root to read), CPU governor
+`schedutil`, C-states C3/C6 disabled and C1/C1E enabled, THP madvise. Do NOT set compute mode
+EXCLUSIVE_PROCESS: the router spawns one child process per model, and exclusive mode allows one
+context per GPU. What is worth doing sits in the Final roadmap table as PL1-PL3.
+
+Item PL1 (added 2026-09-09 at the user's request; scheduled LAST, after every code item of Tiers 1-3):
+power-limit sweep to find the sweet spot for pp and tg. The cards report `Min Power Limit` 125 W,
+`Default/Max` 250 W (2026-09-09), and a full pp run sits at 165-231 W per card on a 700 W PSU with a
+135 W CPU. tg is bandwidth-bound (HBM2 stays at 715 MHz whatever the limit) so it should barely move;
+pp is HFMA2-bound and follows the graphics clock, so it should fall with the limit; the production
+MTP verify step (width 4) sits between. Protocol (`[SRV]`, no code, ~2 h of GPU time):
+
+- Arms: 250 (default), 225, 200, 175, 150, 125 W on BOTH cards, run 250 first and again last (drift
+  check). `nvidia-smi -pl` needs root and agents may not change GPU state (0.1, `SUDO=no`), so either
+  the user runs `sudo nvidia-smi -i <uuid> -pl N` between arms on the agent's request, or grants a
+  sudoers line limited to `/usr/bin/nvidia-smi -pl *` for that session (open question 9). The default
+  250 W is restored at the end in either case; with persistence mode off the setting also resets when
+  the driver unloads, so re-check `Current Power Limit` before every arm.
+- Per arm, after a 60 s warm-up: `llama-bench -m $MODEL_Q4 -ngl 99 -sm tensor -fa on -b 2048 -ub 2048`
+  with `-p 2048 -n 0 -r 3` (pp), `-p 0 -n 64 -d 0,16384 -r 5` (tg), `-p 4 -n 0 -r 5` (verify width),
+  then one production-shape run with the J5 harness (`~/p100-opt/j5`, MTP `n_max` 3, 25k chat, 512
+  tokens) for the real t/s. `nvidia-smi dmon -s pucvmet -d 1` for the whole sweep; per arm record the
+  mean and max board power per card, mean graphics clock, `SW Power Cap` violation time, temperature.
+- Table: limit W | pp2048 t/s | tg d0 | tg d16384 | pp4 | MTP chat t/s | mean W both cards | mean MHz |
+  cap time | tokens per joule for tg and pp (t/s divided by the summed board power). Sweet spot = the
+  lowest limit where tg and the MTP chat lose < 1% against 250 W, with the pp loss stated next to it;
+  the user picks. Deliverable: the table in the log and a one-line recommendation for
+  `~/llama-serve.sh` (a `sudo nvidia-smi -pl N` step needs root at boot: recommend, do not install).
+
 ### 1.6 Host settings to record and fix
 
 ```sh
@@ -666,9 +699,16 @@ Items:
   Kill switch via a template/env `GGML_CUDA_GDN_LEGACY`.
 - D3 `SSM_CONV` + `SILU` are already fusable upstream (`{SSM_CONV,(ADD),UNARY(SILU)}`); confirm it
   fires here (D1). If not, find the shape condition that blocks it.
+  Census 2026-09-09: fires. One `ssm_conv_f32` per delta-net layer (48 per token per card, 3.0 us), no
+  standalone silu kernel anywhere in the profile.
 - D4 The `L2_NORM` pair (q and k) fuses as a sibling run (patch 18); confirm. The `RMS_NORM +
   SILU + MUL` gated norm at the layer output may have no rule: check D1's log, and if it is 3
   launches, add a rule modeled on patch 20 (`ADD -> UNARY -> MUL`), `GGML_CUDA_DISABLE_FUSE_RMS_GATE`.
+  Census 2026-09-09: the L2_NORM pair fuses (patch 18, `l2_norm_f32_fused` 48 per token). The gated norm
+  is 2 launches, not 3: `{RMS_NORM,MUL}` -> `rms_norm_f32` (24,1,1) 3.5 us and `{UNARY(SILU),MUL}` ->
+  `unary_gated_op_kernel` (12,1,1) 2.6 us both fire upstream. 2 -> 1 is worth 0.12 ms per token (0.4%);
+  the blocker is the z MUL_MAT (node #51) between #50 and #53, which makes `ggml_cuda_collect_ops` bail,
+  so it needs a patch 23 style defer, not a chain rule. Ranked 5th in the census; below E7 and E8.
 - D5 State writeback copies (`ggml_cpy` into cache views) fuse up to 8 per launch (patch 26). With
   `n_rs_seq > 0` (rollback slots) it is `n_rs_seq + 1` copies per layer; the server's checkpoint
   settings decide `n_rs_seq` (see area J). Fewer checkpoints = fewer copies.
@@ -692,9 +732,16 @@ Items:
 - E2 For the attention layers: confirm `RMS_NORM + MUL + ROPE` fusion fires for q and k (MRoPE
   `ggml_rope_multi` may block the rule: check the op-params condition in `ggml_cuda_can_fuse`).
   Confirm the gate `SIGMOID + MUL` after attention fuses (`{UNARY,MUL}` rule needs same shapes).
+  Census 2026-09-09: `RMS_NORM + MUL + ROPE` does NOT fire. The node order already matches (the K side even
+  matches the 5-op `VIEW + SET_ROWS` form); `ggml_cuda_should_fuse_rms_norm_mul_rope` rejects
+  `mode != NORMAL && mode != NEOX` at ggml-cuda.cu ~2811 and qwen35 uses `ggml_rope_multi` (MROPE = 8).
+  32 `rope_multi` + 32 `k_set_rows` per token; fixing it needs a 4-section MRoPE variant of the fused
+  kernel, worth 0.12 ms (0.4%). The `SIGMOID + MUL` gate fuses; the `ggml_cont_2d` in front of it does
+  not (`cpy_scalar_fastdiv` (48,1,1), 16 per token, 3.2 us).
 - E3 `binbcast` residual `ADD` + the next `RMS_NORM`: patch 19 folds the pre-add; verify it fires
   for both the attention and the ffn residual in every layer (count in E1 should be 2 x 64 fused
   launches, not 4 x 64).
+  Census 2026-09-09: fires in every layer (128 pre-add `rms_norm_f32` launches per token per card).
 - E4 `rope.cu` uses `dim3(1, CUDA_ROPE_BLOCK_SIZE, 1)` blocks with `n_blocks_x = ceil(ne00 / (2*BLOCK))`;
   at tg a single token means very few blocks. Only relevant if E1 shows rope > 2% of the step;
   else skip.
@@ -706,6 +753,38 @@ Items:
   RMS_NORM perf` at that width. Trivial change if it helps.
 - E6 Anything else E1 surfaces with count >= 64 per token and < 5 us each: candidates for a
   sibling-run fusion (patch 18 infrastructure `ggml_cuda_collect_same_op`), with a kill switch.
+  Census 2026-09-09: everything at count >= 64 and < 5 us is `quantize_a16k` 197, `quantize_q8_1` 138,
+  `unary_gated_op_kernel` 128, `cpy_scalar_fastdiv` 64 and the narrow rms_norms (80). None is an unfused
+  graph-node pattern; the quantize helpers are not graph nodes at all (gotcha 36). Outcome: E7 and E8.
+- E7 Multi-block rms_norm for the single-row tg case (from the D4/E6 census, 2026-09-09; approved).
+  `rms_norm_f32_cuda` maps one row to one block, grid (nrows, nchannels, nsamples), so at tg the 129
+  5120-wide norms per token (attn_norm, post_attn_norm, output norm) each run as one 1024-thread block on
+  1 of 56 SMs: 8.84 us in the model, 1.14 ms per token = 3.6% of the step, against 3.89 us in isolation.
+  Design: split a cached row across ceil(ncols/1024) blocks with a redundant reduction (every block
+  computes the identical sum of squares over the whole row, then stores only its chunk; the pre-add form
+  writes `pre_dst` for its chunk only), so the result is bit-identical; split only when the total block
+  count is small so pp (nrows 2048) is untouched. Env `GGML_CUDA_NORM_SPLIT` (0 = off, N = block-count
+  threshold). Expected 0.4-0.7 ms per token (1.3-2.2% tg). Files: `norm.cu` only (patches 17/19/40/42
+  live in the same kernel; rebase them as one group). Brief: `~/p100-opt/e7/BRIEF.md`.
+  Result 2026-09-09: NEGATIVE, see the Tier 1 row and gotchas 37/38. The pre-add form aliases its output
+  with an input (any multi-block norm that reads the whole row races), and the redundant split is 1.22x
+  slower per launch because the per-block latency chain is unchanged. Diff kept in `~/p100-opt/e7/`.
+- E8 Producer writes the matvec's quantized activation (from the D4/E6 census, 2026-09-09; approved as
+  the item after E7). 256 of the 335 quantize launches per token directly follow the kernel that produced
+  their input: `unary_gated_op_kernel` (128: FFN SwiGLU 64, delta-net gated norm 48, attention gate 16)
+  and `rms_norm_f32` (128: attn_norm, post_attn_norm). Let the producer emit the consumer's block format
+  (a16k for Q4_K/Q5_K/Q6_K and IQ4_XS at width >= 4, q8_1 otherwise; both when a mixed-type gate/up pair
+  follows) into the existing single-slot activation cache and set the cache key, so the consumer's lookup
+  hits and its quantize launch disappears. The producer learns the consumer type from the graph in
+  `ggml_cuda_try_fuse` (the GLU node's consumers). q8_1 needs a per-32 amax (one warp), a16k a per-256
+  amax plus per-32 sums (one 256-thread block), both fit the GLU kernel's block shape. Bit-exact. Kill
+  switch `GGML_CUDA_DISABLE_FUSE_QUANT_GLU`; the rms_norm half is a follow-up as `..._QUANT_NORM`.
+  Expected 0.33 ms per token (1.0% tg) for the GLU half. Files: `unary.cu` (GLU dispatch at
+  ggml-cuda.cu ~4738), `quantize.cu`, `mmvq.cu` / `mmvq-k-f16-sm60.cu` cache lookups, `ggml-cuda.cu`.
+  Result 2026-09-09: NEGATIVE after two iterations (shared-memory epilogue, then register-only on the
+  quantizer's grid). Correct and bit-exact, 335 -> 207 quantize launches, Qwen tg +0.4-0.55% but Gemma 4
+  -0.4% because its a16k layout 2 halves the transaction size of the elementwise part (gotcha 40). See
+  the Tier 1 row. Diff and report kept in `~/p100-opt/e8/`, tree reverted, nothing committed.
 
 ### Area F: multi-GPU communication over PCIe
 
@@ -1149,12 +1228,14 @@ Keep mmap.
 | G2 | CUDA graphs on Pascal (remove the `cc < VOLTA` gate), validate with `-sm none` first | +10-30% tg single card if launch-bound | G1 |
 | A4 | DONE 2026-09-08 as `p100x: 44-cublas-src0-chunk`: convert and multiply src0 in 256 MiB row chunks (the M dimension of the GEMM) when its compute-type copy would be larger, one pool buffer reused for every chunk. The VMM pool high-water at a wide LM-head call drops 1280 -> 324 MiB per card on Qwen3.8-27B (-956) and 2774 -> 342 MiB on Gemma 4 31B (-2432; its tied `token_embd` LM head is not row-split by the meta backend, so each card converts all 2688 MiB); the `cuMemCreate: out of memory` abort inside `ggml_cuda_mul_mat_cublas_impl` (Qwen at `-c 200000`, Gemma at `-c 65536`, both on a 65-column `ngram-mod` verify batch, and it kills the server rather than the request) is gone, and the largest `-c` that survives such a call goes 190000 -> 215000 (+25000 tokens at 351 MiB per card per 10000). pp512/pp2048/tg64 unchanged at d0 and d16384 (<= 0.13%, inside the spread) because nothing else on these models is above the threshold; where it fires the split is faster, not slower (LM head 65 columns 38.8 -> 36.4 ms per card, 2048 columns 253.9 -> 227.4 ms), so no ping-pong buffer is needed. Not bit exact (cuBLAS picks another kernel for the smaller M): mean KLD -1.2e-5, top-1 identical for 100% of positions, per-chunk perplexity identical to 4 decimals, greedy output of both models byte-identical | left: it does not fire for the recorded production line, whose MTP draft is `n_max` 3 (verify width 4, under the patch 35 Q6_K ceiling of 32): 0 chunked calls at `-c 160000` and identical memory in both arms, so the item pays for `ngram-mod`, for a raised MTP draft width, for all-logits passes and for Gemma; the threshold must stay above the largest ffn weight (see What not to do); `mul_mat_id`, the batched branches and the `convert_nc` path keep the whole-matrix copy; the wide LM head would be cheaper still through the MMVQ column loop (A8 with a higher per-type ceiling, no F16 copy at all: 36.4 ms per card at 65 columns today); splitting Gemma's tied LM head across cards is an Area H meta-backend question; A4b: the split is 0.59x per call at 128 MiB but the byte rule cannot go there, so a rule keyed on rows (keep M per GEMM in the tens of thousands) instead of bytes may be worth 1.6x on every wide LM-head call - measure across widths first, the 128 MiB point is non-monotonic | A1 (optional) |
 | F5 | internal allreduce on sm_60 (`__nanosleep` replacement) | A/B vs NCCL at tg; may win 1-3 ms per token | F1 F2 |
-| B2 | re-enable MMVQ gate/up fusion on Pascal. Correction 2026-09-07: no longer trivial. The HFMA2 K-quant matvec (patches 32-34) bails out when a fusion is requested, so lifting the `cc <= PASCAL` gate in `ggml_cuda_should_fuse_mul_mat_vec_q` would route the fused gate/up matvecs back onto the int8 path and lose the B4 gains; it needs a fused GLU epilogue in `mmvq-k-f16-sm60.cu` first (Tier 2 effort) | 0-3% tg | B1, B4b |
+| B2 | CLOSED 2026-09-09 (design note, no code). The fused MMVQ path exists only for 1-column matvecs (host gate `dst->ne[1] != 1`, and `mul_mat_vec_q_switch_fusion` asserts `ncols_dst == 1`), so it never fires on the production 4-column MTP verify step. At width 1 it can remove only the FFN GLU launch: 64 x 2.7 us = 0.17 ms = 0.5% of the step; the intermediates are 70 KB per card, and gate/up already share one activation conversion (patch 10 / a16k cache), so no quantize launch goes away - the Tier 0 remark tying `quantize_q8_1` to B2 was wrong. `ggml_cuda_should_fuse_mul_mat` also requires the same src0 type for gate and up, true in 37 of 65 layers of the UD-Q4_K_M (22 of them on the int8 path at width 1, 15 on the HFMA2 path, which refuses fusion). A GLU epilogue in `mmvq-k-f16-sm60.cu` (sequential gate then up, `up * silu(gate_in)` in the store) would cover all widths for 150-250 lines and reach 0.3% per production step. E8 takes more out of the same spot without touching the matvec kernel. The correction of 2026-09-07 stands: lifting the `cc <= PASCAL` gate alone routes the HFMA2 layers back to the int8 kernel | ceiling 0.5% at width 1, 0.3% per production step: below the bench spread | - |
 | B4d | DONE 2026-09-07 as `p100x: 41-mmvq-k-f16-range`: the Q6_K (and latently the IQ4_XS) epilogue of the HFMA2 K-quant matvec summed an int8 sub-block scale of -128 times a lane accumulator of 8 products of |q*a'| <= 32 over 4 sub-blocks, which reaches 2^18 against half's 65504; measured peak 71552 on `blk.44.attn_v.weight` of Gemma 4 31B, below the limit on every other tensor of the prompt and on every Qwen shape. Fix: the scale times 1/8 and d times 8, both exact, product unchanged bit for bit. Gemma nan gone, chat byte-identical to stock, tg 28.66 t/s (1.634x stock, -0.46% against the broken build), Qwen byte-identical at -0.08% tg and -0.2/-0.3% pp8/pp32, test-backend-ops 14675/14675 on both cards | left: the F16 accumulation itself costs 0.020 mean KLD and 1.3 points of top-1 on Gemma against the branch's own 0.172 / 90.8% floor (nothing measurable on Qwen), so a model with wider activation swings needs its own KLD check before it is served; new debug knob `GGML_A16K_CHECK=1` | C6 |
 | E5b | DONE 2026-09-07 as `p100x: 42-norm-cache-5376`: `max_cache` 5 -> 6 (template default and the `<1024>` launcher), so a row up to 6144 columns is cached; Gemma 4 tg64 d0 28.630 -> 29.075 t/s (+1.56%, four norms per layer over 60 layers at ncols 5376), Qwen unchanged, RMS_NORM 51/51, Qwen greedy byte-identical, registers 30-32 with no spills | left: 7168-wide rows would need `max_cache` 7; the register budget still has room | E5 |
 | C4 | NO (2026-09-05, C2 measurement): the `parallel_blocks` search already fills exactly one wave at tg (`ntiles_dst` 6, `max_blocks_per_sm` 4, `pb` 37, 222 of 224 block slots, 99% efficiency at every depth from 4k up); forcing 2x costs 6% at 32k and 21% at 4k, 4x costs 83% at 32k. What the search does miss is the ragged last KV tile (`ntiles_KV % pb`), which makes the `ncols2 = 6` packing of C2 non-monotonic between 2k and 8k: see C2b. The C2b sweep confirms the direction: at the model's tg shape every `pb` above the search's value is slower (n_kv 8192: 52 us at 64, 61.5 at 112, 65.7 at 128); what was left on the table was the smaller value with the same round count (patch 38) | - | C1 |
 | E5 | DONE 2026-09-07 as `p100x: 40-norm-cache-5120`: `max_cache` becomes a template parameter with default 5 so a 5120-wide row is cached (patch 17 stopped at 4096 and never fired on this model); 6.33 -> 3.89 us per run at 5120x1 in test-backend-ops perf, 10.2 -> 8.8 us per launch in the model at 129 launches per token per card; tg 31.91 -> 32.11 t/s at d0 (+0.63%) and 30.91 -> 31.10 at d16384 (+0.61%), pp2048 unchanged, output byte-identical; registers unchanged, no spills | left: nothing; E5b (patch 42) raised the limit to 6 for Gemma 4's 5376 | E1 |
-| D4 E6 | one or two extra fusion rules from the census | ~0.5% per launch removed | D1 E1 |
+| D4 E6 | DONE 2026-09-09 as a measurement (census in `~/p100-opt/d4e6/D4E6-census.md`, log entry 2026-09-09): on 5b8bc7dd7 the tg step is 31.30 ms with 1698 launches and only 18 distinct kernels per card per token, and every adjacent-node pattern in both layer types already fuses (26 launches per layer: 18 + 8 for the FFN). Glue is 993 launches / 3.59 ms / 11.5% of the step, of which the single-block 5120-wide rms_norm is 129 / 1.14 ms / 3.6% and the quantize helpers (not graph nodes) 335 / 0.83 ms / 2.6%. D3 fires, the L2_NORM pair fires, the gated norm is 2 launches not 3 (its halves are separated by the z MUL_MAT, so a defer is needed, not a chain rule), E2 does not fire because `ggml_cuda_should_fuse_rms_norm_mul_rope` rejects MROPE mode (ggml-cuda.cu ~2811). Ranked candidates (estimate = bytes / 450 GB/s + 2.5 us per launch removed): E8 GLU/gated-MUL writes the matvec's quantized activation 0.33 ms (1.0%), the same for the rms_norm producers 0.33 on paper (~0.18 until E7), the conv chain 0.26, conv-state CPY into concat_rows_gather 0.13, D4 gated norm 0.12, E2 MRoPE fused rope 0.12 | no fusion rule written: the largest item is not a fusion (E7), the second is E8 | - |
+| E7 | NO (2026-09-09, measured; diff kept in `~/p100-opt/e7/e7.patch`, not committed, tree reverted): multi-block rms_norm for the single-row tg case with a redundant (bit-exact) reduction. Two independent blockers. (1) It cannot be applied to 128 of the 129 target launches: the residual ADD that patch 19 folds into the norm writes into one of its own inputs (`ggml_gallocr` in-place: over 512 pre-add launches `pre_dst == pre_a` 320 times, `== pre_b` 192 times, and `dst` is the other of the same two buffers), so several blocks per row race; forcing it changes the greedy output. (2) Where it applies it is slower: every block still reads the whole row, so the per-block latency chain is unchanged and only the fire-and-forget stores are split: 5120x1 RMS_NORM 4.3 -> 5.2 us in isolation (1.22x slower), in the model 9.32 -> 10.04 us per launch when forced, tg -0.3-0.5%; at pp unchanged by construction. Only a disjoint split with a cross-block reduction (two launches, not bit-exact) could still help, uncertain 0.4-1.3%, not planned | 0 | - |
+| E8 | producer writes the matvec's quantized activation: 256 of the 335 quantize launches per token (`quantize_a16k` 197, `quantize_q8_1` 138, 2.3-2.9 us each) directly follow the kernel that produced their input (`unary_gated_op_kernel` 128, `rms_norm_f32` 128). Let the GLU / gated-MUL kernel (later also rms_norm) emit the a16k or q8_1 block format its consumer needs, handed over through the existing single-slot activation cache (the producer fills the cache and sets its key, the consumer's lookup hits); the producer learns the consumer's src0 type from the graph in `ggml_cuda_try_fuse`. Bit-exact (the same F32 value quantizes to the same block). Kill switch `GGML_CUDA_DISABLE_FUSE_QUANT_GLU`. Approved 2026-09-09 as the item after E7. First build measured 2026-09-09 (uncommitted, `~/p100-opt/e8/e8.patch`, report `E8-report.md`, log entry): mechanism correct, self-check 0 mismatching bytes over 8000+ launches in both formats and all three a16k layouts, greedy byte-identical, perplexity identical, 14675/14675 twice; quantize launches 335 -> 207 per token per card exactly as predicted and all 512 folds fire at the width-4 verify shape too (IQ4_XS follows into layout 1). But the a16k epilogue as written stages 256 values in shared memory, syncs, and converts in warp 0 while 7 warps wait: +1.85 us on a 12-block GLU against a 2.59 us quantize removed, so the net is 0.135 ms per token per card (0.43%) in kernel time and tg +0.31/+0.34% at d0, +0.35/+0.23% at d16384 on Qwen, pp unchanged, but -0.41% on Gemma 4 (all of whose folds are a16k layout 2). Not committed. NO (2026-09-09, iteration 2 measured, not committed, tree reverted; diff `~/p100-opt/e8/e8.patch`, report `E8-report.md`): the register-only a16k epilogue (one warp per 256-element block on the quantizer's grid, no shared memory, no sync) brings the fused launch to 3.84-3.86 us against 5.24-5.81 for GLU + quantize on Qwen (saving 0.196 ms per token per card, 0.62% of kernel time) and tg to +0.53/+0.40% at d0 and +0.55/+0.55% at d16384, but Gemma 4 stays at -0.34 to -0.41% over three pairs: all of its folds are a16k layout 2 (Q6_K `ffn_down`), whose lane map (`p0 = 128*(g>>1) + 16*(g&1) + 32*(i>>2) + 4*(i&3)`) makes a warp's run 8 chunks of 64 B instead of layout 0's 4 chunks of 128 B, so the fused kernel is 6.79 us against 3.07 + 2.60 separate, and the elementwise work runs on 11 blocks of 128 threads where the plain kernel had 42 of 256. Structural: the fused kernel must run on the quantizer's narrow grid while the elementwise part wants the wide one. A layout gate would leave Gemma at 0 and Qwen at ~+0.4% for a 680-line diff in upstream-churned files; rejected | first build Qwen +0.3% / Gemma -0.4%; iteration 2 Qwen +0.4-0.55% / Gemma -0.4% | - |
 | I1 | DONE 2026-09-07 as `p100x: 43-sampler-prefilter-grammar`: the vocab clause was moot (none of the three GGUFs has suppress tokens); what switched the prefilter off was the request-level lazy grammar of a `tools` request with `tool_choice` auto (the coding-harness shape): 0 of 512 samples prefiltered with thinking off, 21 of 48 on a real tool call with thinking on, 512 of 512 for plain chat. Gating the prefilter on `grammar_first && grammar_should_apply()` instead of `grammar_should_apply()` is exact (the server never sets `grammar_first`; a grammar rejection already rebuilds the whole vocabulary) and recovers it: tools request 31.44 -> 30.98 ms per token (+1.47% tg), plain chat unchanged; the prefilter itself is worth 1.45% tg on plain chat (30.92 vs 31.38 ms) and 3.4% under `--spec-type draft-mtp` (one sample per draft position); replies and tool calls byte-identical, resample count 0 | left: a request `logit_bias` still turns it off (`has_logit_bias`), by design; I2 answered at the same time: sampling plus server bookkeeping is 0.054 ms per token with the prefilter live (server 30.928 vs llama-bench 30.874 ms per token at d128), no work needed | I1 measurement |
 | A2 A3 | DONE 2026-09-07 as `p100x: 39-convert-vec`: A3' vectorizes the contiguous F16/BF16 <-> F32 conversion around every cuBLAS GEMM (4 elements per thread, 8-byte transfers, grid covering the data) and A2 issues the contiguous store group of `dequantize_q4_K` and `dequantize_iq4_xs` as one 8-byte transfer with 8 super blocks per 256-thread block; pp2048 420.8 -> 449.4 t/s at `-ub 2048` (+6.8%; A3' +5.55%, A2 +1.22%) and 235.1 -> 248.3 at `-ub 512` (+5.6%; A3' +3.18%, A2 +2.92%), tg unchanged, output byte-identical (perplexity 5.4367 in every arm incl. stock, greedy identical); `convert_unary` 165 -> 520 GB/s (29% -> 93% of the 560 GB/s ceiling), q4_K dequant 168 -> 461 GB/s, iq4_xs 212 -> 330 | left: the plan's A2 premise was wrong (block packing alone is a no-op, the kernels are store bound); q5_K needs a different index assignment inside `dequantize_q5_K` for a 4-element store group, about 0.5% of pp2048; `getrows.cu` could ask for the same vector store; 16-byte transfers and a bounded grid both lose (What not to do); A3 as written (F32 compute) measured dead: -35% pp | A1 |
 | J4 | DONE 2026-09-03 (`p100x: 31-server-ckpt-adopt`, worktree wt-j4): adopt the just-restored checkpoint, no forced break at the last user message; `LLAMA_SERVER_CKPT_LEGACY=1` restores upstream | follow-up 1.98 -> 1.41 s wall, prompt phase 1302 -> 732 ms | - |
@@ -1187,6 +1268,14 @@ Keep mmap.
 | C7 | quantized KV shards in the meta backend | context or slots | TILE dequantizes the whole cache per call; only with VEC |
 | I3 | backend sampling with vocab-sharded logits | removes 1 MB D2H + CPU sort per token | small share; needs meta-aware gather |
 | F8 | fewer collectives per layer (sequence parallel) | halves PCIe traffic | model-graph rewrite |
+
+### Final: configuration sweeps (after all Tier 1-3 items; added 2026-09-09)
+
+| Item | Change | Expected | Depends on |
+|---|---|---|---|
+| PL1 | GPU power-limit sweep 250 -> 125 W on both cards, pp2048 / tg d0,d16384 / pp4 / MTP chat per arm, watts, clocks, cap time, tokens per joule (section 1.5). Needs the user for `nvidia-smi -pl` (root); 250 W restored at the end | a lower limit at ~0 tg cost and a stated pp cost; less PSU stress, less heat in a passive chassis | every code item done, so the sweep measures the final binary; open question 9 |
+| PL2 | persistence mode: `persistence_mode` is Disabled on both P100s although `nvidia-persistenced` is active (2026-09-09), so the driver tears the GPUs down whenever the last CUDA process exits (router-mode respawns pay the init again, and a power limit set by PL1 does not survive an idle period). `sudo nvidia-smi -pm 1` now, and fix the daemon unit so it manages the P100s at boot. Measure the child start time with and without | seconds per model respawn (area K); PL1's setting sticks | root; run in the PL1 session |
+| PL3 | host and link latency knobs, each on its own, reverted after: PCIe ASPM policy `performance` (`/sys/module/pcie_aspm/parameters/policy` is `default`, i.e. whatever the BIOS set; the P100 links' L1 state is only readable as root with `lspci -vv`), CPU governor `performance` (today `schedutil` on `intel_cpufreq`), `/dev/cpu_dma_latency` held at 0 for the server's lifetime (C3/C6 are already disabled, C1E with 10 us exit latency is not). Measure tg d0 (-r 5, two passes) and the J5 chat per knob | 0-2% tg from the 128 latency-bound collectives (7.5% of the step) and the 2.8% host/cross-GPU idle; may be 0 | root; run in the PL1 session |
 
 ### What not to do
 
@@ -1262,6 +1351,17 @@ Keep mmap.
   acceptance, where MTP at width 3 creates none. Combined it loses even on the verbatim-echo shape it
   is built for (42.7 vs 53.5 t/s), because the ngram implementation has priority and pre-empts the
   MTP draft.
+- Do not build B2 as the upstream fused gate/up MMVQ (2026-09-09): fusion exists only for 1-column
+  matvecs, so it never fires on the 4-column production verify step, and at width 1 its whole gain is
+  the FFN GLU launch, 0.5% of the step. The B2 row in the Tier 1 table has the numbers; E8 covers the spot.
+- Do not split a single-row rms_norm across blocks with redundant reads (E7, 2026-09-09): 1.22x slower per
+  launch in isolation, -0.3-0.5% tg when forced in the model, and the pre-add form races (gotcha 37). A
+  disjoint two-phase split would cost a second launch and bit-exactness for an uncertain 0.4-1.3%.
+- Do not fold the matvec's activation quantization into the GLU / gated-MUL kernel (E8, 2026-09-09, two
+  iterations): the mechanism works and is bit-exact, but the per-fold saving is 1.4-1.9 us and Gemma's
+  a16k layout 2 turns it into a loss (gotcha 40); +0.4-0.55% Qwen / -0.4% Gemma for 680 lines in
+  `mmvq.cu` and friends is not worth the rebase cost. The 207 remaining quantize launches per token
+  (0.5 ms, 1.6% of the step) are only reachable by a change to the matvec kernels' input format itself.
 - Do not chase `n_probs` in the request hygiene list (J5, 2026-09-08): the OAI endpoint ignores the
   field, and the flag it stands for (`logprobs: true` with `top_logprobs` 5 or 20) costs nothing
   measurable (24.81-24.86 vs 24.83-24.92 ms per token).
@@ -1481,13 +1581,53 @@ llama.cpp behavior on this hardware:
     fixed (J5, 2026-09-08). On an easy prompt the flips do not appear at all - a verbatim-echo request
     is byte-identical across every width and no speculation - so absence of drift on one prompt is
     not evidence of bit-exactness.
+35. At tg every 5120-wide rms_norm (attn_norm, post_attn_norm, output norm: 129 launches per token per
+    card) runs as ONE 1024-thread block on one of 56 SMs, because `rms_norm_f32_cuda` maps one row to one
+    block (grid = (nrows, nchannels, nsamples)). It costs 8.84 us in the model against 3.89 us for the same
+    op in isolation with a warm L2: the launch is latency-bound on cold reads (weights, residual stream,
+    x), not bandwidth-bound, and `test-backend-ops perf` undercounts such single-block launches by 2x.
+    `rope.cu` has the same grid shape at tg (E4). The limit is one SM's load/store path (~100 KB per launch
+    at ~11 GB/s), so extra blocks that read the same bytes again do not help (E7 negative, gotcha 37); only
+    a disjoint split with a cross-block reduction could, at the price of a launch and bit-exactness
+    (D4/E6 census and E7, 2026-09-09).
+36. The quantize helpers of the matvec (`quantize_q8_1`, `quantize_a16k`) are not graph nodes: no fusion
+    rule can see them, `GGML_CUDA_FUSE_LOG` never lists them, and only a launch census counts them. Since
+    patches 32-34 an activation that feeds a mixed-type gate/up pair is converted twice (once per format),
+    so B4 added 78 quantize launches per token (257 -> 335, 0.83 ms = 2.6% of the step) while removing
+    2.9 ms of matvec time. Fix: E8 (D4/E6 census, 2026-09-09).
+37. The residual ADD that patch 19 folds into `rms_norm_f32` writes into one of its own inputs: `ggml_gallocr`
+    allocates ADD/MUL/RMS_NORM in place when the parent has one child, and over 512 pre-add launches at tg
+    `pre_dst == pre_a` 320 times and `pre_dst == pre_b` 192 times, never anything else, with `dst` the other
+    of the same two buffers (the whole tg graph ping-pongs between two 5120-float buffers). One block per
+    row makes that safe, so the pre-add predicate has no non-aliasing check; any multi-block norm that
+    reads the whole row races, and forcing it changes the greedy output (E7, 2026-09-09).
+38. `test-backend-ops perf` has no norm case at all in `make_test_cases_perf`: `perf -o RMS_NORM` measures
+    nothing on a stock tree. E5 and E7 used temporary local cases (never committed). The 5120x1 norm runs at
+    4.3 us warm in that harness and 9.3 us cold in the model, so isolation numbers for single-block launches
+    understate the in-model cost by ~2x (E5, E7, 2026-09-09).
+39. A GLU's rows are not its consumer's rows: the delta-net gate `{SILU, MUL}` writes 128-wide rows
+    (per head) that the `ssm_out` matvec reads as one 3072-wide row, so any producer-side quantization
+    must take the row width from the consumer's `src1`, not from the GLU's own shape (E8's first version
+    keyed on the GLU shape and silently folded 80 of 128 launches). Also: a saving of ~0.13 ms per token
+    is invisible in the summed nsys kernel time (NCCL run-to-run noise is larger) and only shows in the
+    paired wall-clock A/B, so judge sub-0.5% items by alternating llama-bench passes, not by kernel sums
+    (E8, 2026-09-09).
+40. Folding a quantization into the kernel that produces the activation is decided by the target FORMAT's
+    lane map, not by the launch count: on the a16k layout 0/1 map (`64g + 4i`) a warp's 256-element block
+    is 4 runs of 128 B and the fused GLU runs at 3.85 us against 5.2-5.8 for GLU + quantize, on layout 2
+    (Q6_K: `128*(g>>1) + 16*(g&1) + 32*(i>>2) + 4*(i&3)`) it is 8 runs of 64 B and the fused kernel is
+    6.8 us against 5.7 separate. And the fused kernel must run on the quantizer's narrow grid (3-11 blocks
+    of 128 threads) where the elementwise kernel wanted 12-42 blocks of 256. Both together capped E8 at
+    +0.5% on Qwen and -0.4% on Gemma (E8, 2026-09-09). Any future producer-side fold must be gated per
+    layout and measured on the model whose weights select the bad layout.
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
 Answered: 1 (ssh krk-lab, paths in 0.1), 2 (no sudo), 3 (production flags in 0.1), 4 (drift allowed
 with the perplexity check), 5 (single stream; `-np 1` in production), 6 (Gemma-4 31B is present,
 `-sm tensor` accepts gemma4; C6 2026-09-07), 8 (router mode with `--models-dir` is the production
-setup, respawn/load time matters). Open: 7 (P2P/NCCL env in production after tests).
+setup, respawn/load time matters). Open: 7 (P2P/NCCL env in production after tests), 9 (how the
+power limit gets set for PL1, added 2026-09-09).
 
 Original list:
 
@@ -1509,6 +1649,10 @@ Original list:
    given the documented risk of instability on some boards (P100-PATCHES.md crash history)?
 8. Is the router-mode multi-model setup part of the target (respawn/load times, area K), or is a
    single long-lived instance the only case that matters?
+9. Root actions for the final session (PL1-PL3, section 1.5 and the Final table): how will they be
+   run, since `nvidia-smi -pl`, `-pm`, the ASPM policy, the governor and `/dev/cpu_dma_latency` all
+   need root: the user runs each command on request, or grants a sudoers line limited to those
+   commands for that session? Everything is restored at the end except what the user decides to keep. Asked 2026-09-09.
 
 ## Appendix A: environment variables worth knowing (this tree)
 
