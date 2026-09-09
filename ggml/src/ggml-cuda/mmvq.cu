@@ -1,4 +1,6 @@
 #include "mmvq.cuh"
+#include "mmvq-f16-sm60.cuh"
+#include "mmvq-k-f16-sm60.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -119,28 +121,49 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
 // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
 
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(ggml_type type) {
+    // This table is keyed on cc < VOLTA, which lumps sm_60 (P100) in with
+    // sm_61 (1080 / P40).  Those two differ in the one thing that decides where the crossover
+    // belongs: the caller falls back to MMQ once ne2 exceeds the ceiling, and sm_61 has native
+    // DP4A so that is a fine place to land, while sm_60 has none.  There MMQ is unavailable and
+    // MUL_MAT_ID drops all the way to the sorted-gather path, which launches one matvec per
+    // (expert, token) -- 41 layers x 8 experts x 5 tokens per decode step on a Qwen3.5-MoE.
+    //
+    // So the ceiling costs sm_60 far more than it saves.  Only IQ2_XS and IQ3_XXS were measured
+    // (those are the types of that model's ffn_gate/up_exps and ffn_down_exps), but the reason does not depend
+    // on the type -- on sm_60 the fallback is the slow path for every quantization -- so the whole
+    // table is raised to match the reason rather than the sample.  Note this removes the ceiling
+    // for every pre-Volta NVIDIA, including sm_61, which the argument above does not cover.
+    //
+    // With --spec-draft-n-max 4 (ne2 = 5, one past the old IQ3_XXS ceiling) the geometric mean over
+    // three prompts goes 89.89 -> 91.90 t/s, +2.2%, with no workload regressing.  Prefill is
+    // untouched: it runs at ne2 = 2048, far past every entry here.  Measured with a realistic
+    // sampler, the baseline arm interleaved between candidates, and a wait for the GPU to drop below
+    // 62 C before each run -- a P100 sheds 17% of its boost clock over a long benchmark, which is
+    // larger than the effect being measured, and an earlier sequential sweep concluded the opposite
+    // because of it.
+
     switch (type) {
-        case GGML_TYPE_IQ1_S:   return 6;
-        case GGML_TYPE_IQ1_M:   return 6;
-        case GGML_TYPE_IQ2_S:   return 4;
-        case GGML_TYPE_IQ2_XS:  return 5;
-        case GGML_TYPE_IQ2_XXS: return 5;
-        case GGML_TYPE_IQ3_S:   return 4;
-        case GGML_TYPE_IQ3_XXS: return 4;
-        case GGML_TYPE_IQ4_NL:  return 6;
-        case GGML_TYPE_IQ4_XS:  return 5;
-        case GGML_TYPE_MXFP4:   return 4;
-        case GGML_TYPE_NVFP4:   return 4;
-        case GGML_TYPE_Q2_K:    return 4;
-        case GGML_TYPE_Q3_K:    return 4;
-        case GGML_TYPE_Q4_0:    return 6;
-        case GGML_TYPE_Q4_1:    return 6;
-        case GGML_TYPE_Q4_K:    return 5;
-        case GGML_TYPE_Q5_0:    return 6;
-        case GGML_TYPE_Q5_1:    return 6;
-        case GGML_TYPE_Q5_K:    return 5;
-        case GGML_TYPE_Q6_K:    return 4;
-        case GGML_TYPE_Q8_0:    return 4;
+        case GGML_TYPE_IQ1_S:   return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_IQ1_M:   return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_IQ2_S:   return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_IQ2_XS:  return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_IQ2_XXS: return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_IQ3_S:   return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_IQ3_XXS: return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_IQ4_NL:  return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_IQ4_XS:  return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_MXFP4:   return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_NVFP4:   return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q2_K:    return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q3_K:    return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q4_0:    return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q4_1:    return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q4_K:    return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q5_0:    return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q5_1:    return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q5_K:    return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q6_K:    return MMVQ_MAX_BATCH_SIZE;
+        case GGML_TYPE_Q8_0:    return MMVQ_MAX_BATCH_SIZE;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -286,6 +309,65 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// A8.  Per-type column ceiling for MMVQ on GP100: the chunk loop costs a fixed amount per column
+// while dequant + cuBLAS costs a nearly width-independent constant (at 9 columns Q4_K 5120x8704
+// takes 1409 us against 176 us for the width-8 matvec), so there is a crossover and it is type
+// dependent.  Each value below is the largest width at which the loop still won on every shape of
+// the model measured for that type (~/p100-opt/a8/table.sh, per-GPU row counts; the crossovers
+// themselves are 105-133 for Q4_K, 89-113 for Q5_K, 60-104 for Q6_K, 94-120 for IQ4_XS and 43-51
+// for the int8 path), cross-checked with llama-bench on the model.  The int8 value is measured on
+// Q3_K, where 32 is a wash per call but 5% faster than cuBLAS in the model.
+#define A8_COLS_CHUNK        7 // target columns per chunk; a chunk is never narrower than this - 1
+#define A8_MAX_COLS_Q4_K    64
+#define A8_MAX_COLS_Q5_K    48
+#define A8_MAX_COLS_Q6_K    32
+#define A8_MAX_COLS_IQ4_XS  64
+#define A8_MAX_COLS_INT8    32
+
+static int mmvq_max_cols_sm60_default(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:   return A8_MAX_COLS_Q4_K;
+        case GGML_TYPE_Q5_K:   return A8_MAX_COLS_Q5_K;
+        case GGML_TYPE_Q6_K:   return A8_MAX_COLS_Q6_K;
+        case GGML_TYPE_IQ4_XS: return A8_MAX_COLS_IQ4_XS;
+        default:               return A8_MAX_COLS_INT8;
+    }
+}
+
+int ggml_cuda_mmvq_max_cols_sm60(const enum ggml_type type, const int cc) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc != GGML_CUDA_CC_PASCAL) {
+        return MMVQ_MAX_BATCH_SIZE;
+    }
+    static const char * env     = getenv("GGML_CUDA_MMVQ_MAX_COLS_SM60");
+    static const int    env_max = env ? atoi(env) : -1;
+
+    const int max_cols = env_max >= 0 ? env_max : mmvq_max_cols_sm60_default(type);
+    return max_cols < MMVQ_MAX_BATCH_SIZE ? MMVQ_MAX_BATCH_SIZE : max_cols;
+}
+
+// A8.  The kernel's cost per column is not monotonic in the width: the width-8 configuration needs
+// the most registers per row, so a chunk of A8_COLS_CHUNK columns is the cheapest way to move a
+// column and ceil(ncols/A8_COLS_CHUNK) nearly equal chunks beat 8 columns until the remainder (28
+// columns as 7+7+7+7 cost 552 us against 624 us as 8+8+8+4 on Q4_K 5120x8704).  Chunks narrower
+// than that are the other way round, and by more than the per-call time of the kernels says: at 16
+// columns 8+8 costs 8% less matvec kernel time in the model than 6+5+5 (nsys, A8 notes), so when
+// the split would go below A8_COLS_CHUNK-1 columns, take the fewest chunks instead.
+int ggml_cuda_mmvq_cols_nchunks(const int64_t ncols) {
+    if (ncols <= MMVQ_MAX_BATCH_SIZE) {
+        return 1;
+    }
+    static const char * env       = getenv("GGML_CUDA_MMVQ_COLS_CHUNK");
+    static const int    env_chunk = env ? atoi(env) : 0;
+
+    const int chunk = env_chunk >= 2 && env_chunk <= MMVQ_MAX_BATCH_SIZE ? env_chunk : A8_COLS_CHUNK;
+
+    const int64_t nmin  = (ncols + MMVQ_MAX_BATCH_SIZE - 1)/MMVQ_MAX_BATCH_SIZE; // widest chunks
+    const int64_t nwant = (ncols + chunk - 1)/chunk;
+    const int64_t nkeep = ncols/(chunk - 1); // more chunks than this would go below chunk-1 columns
+
+    return (int) std::max(nmin, std::min(nwant, nkeep));
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -368,6 +450,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_PASCAL) {
+        // A8: GP100 has no MMQ, so above 8 columns the alternative is dequant + cuBLAS, not MMQ.
+        return ne11 <= ggml_cuda_mmvq_max_cols_sm60(type, cc);
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
@@ -525,10 +611,27 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                if (small_k) {
+                    return nwarps;
+                }
+                // One output row per block re-reads the q8_1 activation row from L2 once per
+                // output row.  On pre-Turing NVIDIA (measured on GP100/sm_60) MMVQ is limited by
+                // those loads, not by DRAM bandwidth (32-34% of peak) or by instruction count,
+                // so several rows per block pay off.  Decode sweep (9B Q4_0, llama-bench tg32):
+                // 1 -> 46.9 / 2 -> 54.1 (+15.4%) / 4 -> 57.7 (+23.0%) / 8 -> 57.2 t/s.
+                // Turing+ / GCN are not measured here and keep the upstream value.
+                return table_id == MMVQ_PARAMETERS_GENERIC ? 4 : 1;
             case 2:
             case 3:
             case 4:
+                // Same for the speculative-decoding verify batch (ncols_dst = n_draft + 1):
+                // +3.6% on top of the above.
+                return table_id == MMVQ_PARAMETERS_GENERIC ? 4 : 2;
+                // ncols_dst >= 5 keeps the upstream value of 2.  Raising it to 4 there measured
+                // -0.11% end to end: for the same 247 matmuls the per-launch cost steps
+                // 16.57 / 21.78 / 25.95 / 27.89 us across widths 2/3/4/5, so 4->5 (+1.94) is a
+                // smaller step than 3->4 (+4.17) even at half the row reuse -- two rows per block
+                // is already the right choice at that width.
             case 5:
             case 6:
             case 7:
@@ -566,6 +669,15 @@ static __global__ void mul_mat_vec_q(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
+
+    if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        iq3xxs_grid_smem_init(tid, blockDim.x*blockDim.y);
+    }
+    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS ||
+                  type == GGML_TYPE_IQ2_XS) {
+        ksigns_smem_init(tid, blockDim.x*blockDim.y);
+    }
+
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
@@ -818,6 +930,16 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     const uint32_t token_idx   = threadIdx.y;
+
+    // Must precede the early return below (contains a __syncthreads()).
+    if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        iq3xxs_grid_smem_init(warp_size*threadIdx.y + threadIdx.x, blockDim.x*blockDim.y);
+    }
+    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS ||
+                  type == GGML_TYPE_IQ2_XS) {
+        ksigns_smem_init(warp_size*threadIdx.y + threadIdx.x, blockDim.x*blockDim.y);
+    }
+
     const int      row0        = c_rows_per_block*blockIdx.x;
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
@@ -973,7 +1095,20 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+    // This constant is hardcoded and architecture-independent, and the
+    // tuning behind "2 gives best perf" was not done on a GPU without native DP4A.  On sm_60
+    // the same knob in the non-MoE MMVQ kernel was worth +23% when raised from 1 to 4, and
+    // this kernel is 20.1% of a Qwen3.5-MoE decode step (nvprof, GP100).  Raising it to 4 is
+    // worth +1.9% end-to-end decode with the output unchanged bit for bit, and leaves prefill
+    // untouched (661.2 -> 660.9 t/s) because prefill uses MMQ rather than this kernel.
+    //
+    // Note this constant is NOT architecture-gated: every GPU gets 4, and upstream's 2 is not
+    // preserved anywhere.  Only sm_60 was measured.
+    //
+    // Measured with the baseline arm interleaved between candidates and a wait for the GPU to drop
+    // below 62 C before each run: a P100's boost clock sags from 1328 to 1101 MHz over a long
+    // benchmark, which is larger than the effect being measured.
+    constexpr int rows_per_block = 4;
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst);
     const dim3 block_dims(warp_size, ncols_dst);
@@ -1422,13 +1557,78 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+    // sm_60 has no DP4A but full-rate HFMA2, so for Q4_1 a dedicated kernel that expands the
+    // nibbles to half2 with LOP3 magic constants beats the generic path.
+    if (ggml_cuda_mmvq_f16_sm60_supported(src0, src1, ids, dst, fusion)) {
+        ggml_cuda_mmvq_f16_sm60(ctx, src0, src1, dst);
+        return;
+    }
+    // Same for the K-quants (Q4_K, Q5_K, IQ4_XS, Q6_K), widths 1..8 (kill switch GGML_CUDA_DISABLE_MMVQ_F16_K=1).
+    if (ggml_cuda_mmvq_k_f16_sm60_supported(src0, src1, ids, dst, fusion)) {
+        ggml_cuda_mmvq_k_f16_sm60(ctx, src0, src1, dst);
+        return;
+    }
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1_scoped(ctx.pool());
+    char * src1_q8_1_d = nullptr;
     {
+        const size_t  q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+        // The key includes src1->data, not just the tensor pointer: ggml_cuda_mul_mat_id's
+        // sorted-gather path declares its ggml_tensor inside the per-expert loop, so every expert
+        // reuses the same stack address while data advances.  Without the data check, two experts
+        // with the same token count key-match and the second silently reuses the first one's
+        // activations.
+        //
+        // The gate and up matmuls of an FFN share src1, and quantize_row_q8_1_cuda
+        // ignores src0->type, so the second quantization is bit-for-bit the first one.  Reuse it
+        // when the stream matches too -- a buffer written on another stream would need an event.
+        // The cache buffer is shared, so it may only be written on the stream that owns it for
+        // this graph.  When a second stream runs concurrently, fall back to upstream's per-call
+        // pool allocation, which is scoped and therefore leaves the pool's LIFO order intact.
+        const bool cacheable = ctx.q8_1_cache_stream == nullptr || ctx.q8_1_cache_stream == stream;
+
+        const bool hit = cacheable &&
+                         ctx.q8_1_cache_mem != nullptr &&
+                         ctx.q8_1_cache_src1   == src1 &&
+                         ctx.q8_1_cache_data   == src1->data &&
+                         ctx.q8_1_cache_stream == stream &&
+                         ctx.q8_1_cache_size   == q8_1_size &&
+                         ctx.q8_1_cache_s[0]   == ne10_padded &&
+                         ctx.q8_1_cache_s[1]   == s11 &&
+                         ctx.q8_1_cache_s[2]   == s12 &&
+                         ctx.q8_1_cache_s[3]   == s13;
+
+        if (hit) {
+            src1_q8_1_d = ctx.q8_1_cache_mem;
+        } else if (!cacheable) {
+            src1_q8_1_d = src1_q8_1_scoped.alloc(q8_1_size);
+
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            if (q8_1_size > ctx.q8_1_cache_cap) {
+                ctx.q8_1_cache_free();
+                ggml_cuda_set_device(ctx.device);
+                CUDA_CHECK(cudaMalloc((void **) &ctx.q8_1_cache_mem, q8_1_size));
+                ctx.q8_1_cache_cap = q8_1_size;
+            }
+            src1_q8_1_d = ctx.q8_1_cache_mem;
+
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+            ctx.q8_1_cache_src1   = src1;
+            ctx.q8_1_cache_data   = src1->data;
+            ctx.q8_1_cache_stream = stream;
+            ctx.q8_1_cache_size   = q8_1_size;
+            ctx.q8_1_cache_s[0]   = ne10_padded;
+            ctx.q8_1_cache_s[1]   = s11;
+            ctx.q8_1_cache_s[2]   = s12;
+            ctx.q8_1_cache_s[3]   = s13;
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1453,11 +1653,36 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
-        ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
-        ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    // A8: at most MMVQ_MAX_BATCH_SIZE columns per launch.  Only sm_60 lets a wider MUL_MAT in
+    // (ggml_cuda_should_use_mmvq); there the matvec runs once per column chunk over the
+    // activations quantized above, which beats dequantize-to-F16 + cuBLAS up to the per-type
+    // ceiling.  stride_col_y is the q8_1 column stride and the channel stride spans all ne11
+    // columns, so an offset of c0*stride_col_y selects the chunk in every channel.  MUL_MAT_ID is
+    // out of scope: its width is bounded by get_mmvq_mmid_max_batch and the column offsets do not
+    // apply to its layout, so the body then runs exactly once with no offset.
+    const int nchunks = ids ? 1 : ggml_cuda_mmvq_cols_nchunks(ncols_dst);
+
+    static const int cols_log = getenv("GGML_CUDA_MMVQ_COLS_LOG") ? atoi(getenv("GGML_CUDA_MMVQ_COLS_LOG")) : 0;
+    if (cols_log > 0 && nchunks > 1) {
+        static int nlog = 0;
+        if (nlog < 32) {
+            ++nlog;
+            fprintf(stderr, "mmvq-cols: type=%s ne00=%d ne01=%d ncols=%d chunks=%d\n",
+                    ggml_type_name(src0->type), (int) ne00, (int) ne01, (int) ncols_dst, nchunks);
+        }
+    }
+
+    int64_t c0 = 0;
+    for (int i = 0; i < nchunks; ++i) {
+        const int cols = nchunks == 1 ? (int) ncols_dst : ggml_cuda_mmvq_cols_chunk(ncols_dst, nchunks, i);
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, (const block_q8_1 *) src1_q8_1_d + c0*stride_col_y, ids_d, fusion_local,
+            dst_d + c0*stride_col_dst, ne00,
+            ne01,              cols,          s01, stride_col_y,     stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+        c0 += cols;
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

@@ -909,6 +909,8 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+    int ckpt_legacy  = 0; // env: LLAMA_SERVER_CKPT_LEGACY, 1 = upstream checkpoint placement
+    int ckpt_save_legacy = 0; // env: LLAMA_SERVER_CKPT_SAVE_LEGACY, 1 = a fresh buffer for every checkpoint
 
     int n_empty_consecutive = 0;
 
@@ -1337,6 +1339,24 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_CKPT_LEGACY = getenv("LLAMA_SERVER_CKPT_LEGACY");
+            ckpt_legacy = LLAMA_SERVER_CKPT_LEGACY ? atoi(LLAMA_SERVER_CKPT_LEGACY) : 0;
+
+            if (ckpt_legacy) {
+                SRV_WRN("LLAMA_SERVER_CKPT_LEGACY = %d\n", ckpt_legacy);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_CKPT_SAVE_LEGACY = getenv("LLAMA_SERVER_CKPT_SAVE_LEGACY");
+            ckpt_save_legacy = LLAMA_SERVER_CKPT_SAVE_LEGACY ? atoi(LLAMA_SERVER_CKPT_SAVE_LEGACY) : 0;
+
+            if (ckpt_save_legacy) {
+                SRV_WRN("LLAMA_SERVER_CKPT_SAVE_LEGACY = %d\n", ckpt_save_legacy);
             }
         }
 
@@ -2294,9 +2314,36 @@ private:
         return true;
     }
 
+    // take the host storage of a checkpoint that is about to be dropped, so the next one can write into it
+    static void checkpoint_recycle(common_prompt_checkpoint & spare, common_prompt_checkpoint & old) {
+        if (old.data_tgt.size() > spare.data_tgt.size()) {
+            spare.data_tgt = std::move(old.data_tgt);
+        }
+        if (old.data_dft.size() > spare.data_dft.size()) {
+            spare.data_dft = std::move(old.data_dft);
+        }
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+
+        // the newest checkpoint already holds this exact state (usually the one just restored): reuse it instead of copying it again
+        if (!ckpt_legacy && !slot.prompt.checkpoints.empty()) {
+            auto & cur = slot.prompt.checkpoints.back();
+
+            if (cur.n_tokens == slot.prompt.n_tokens() - n_tokens_cur && cur.pos_min == pos_min && cur.pos_max == pos_max) {
+                cur.id_task = id_task;
+
+                SLT_TRC(slot, "reusing context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                return;
+            }
+        }
+
+        // the checkpoints dropped below hand their buffer to the new one: allocating and first-touching
+        // a fresh buffer of this size costs more than the device-to-host copy that fills it
+        common_prompt_checkpoint spare;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2305,6 +2352,10 @@ private:
             if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+
+                if (!ckpt_save_legacy) {
+                    checkpoint_recycle(spare, *it);
+                }
 
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
@@ -2321,10 +2372,28 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            if (!ckpt_save_legacy) {
+                checkpoint_recycle(spare, slot.prompt.checkpoints.front());
+            }
+
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
+
+        // reuse the storage taken above: update_tgt / update_dft then resize to the size it already has,
+        // which neither allocates nor zero-fills, and every byte is overwritten by the state copy
+        if (!ckpt_save_legacy) {
+            // only for the parts that are refilled below, so a checkpoint never keeps another one's bytes
+            if (ctx_tgt) {
+                cur.data_tgt = std::move(spare.data_tgt);
+            }
+            if (ctx_dft) {
+                cur.data_dft = std::move(spare.data_dft);
+            }
+        }
+
+        const int64_t t_save_start = ggml_time_us();
 
         cur.id_task = id_task;
 
@@ -2339,9 +2408,10 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
+                1e-3f * (ggml_time_us() - t_save_start));
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3519,12 +3589,12 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
+                        // break at user messages at least min step past the last checkpoint (legacy: also at the last user message)
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if ((ckpt_legacy && pos == last_user_pos) || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -3594,10 +3664,10 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // no need to create checkpoints that are too close together, unless near the prompt end (legacy: or at the last user message)
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            (ckpt_legacy && is_last_user_message) || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
