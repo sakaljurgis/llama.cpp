@@ -1258,3 +1258,7 @@ on `qwen35` that the kill switches above do not explain points here first.
   1-column matvecs, 0.5% ceiling). E7 (multi-block rms_norm) and E8 (GLU writes the matvec activation)
   built, measured and rejected, see the section above. Plan gains items E7/E8 (closed), PL1-PL3 (power
   limit sweep and root-only host/GPU state knobs, scheduled last) and gotchas 35-40.
+- 2026-09-09 (later): all remaining code items deferred (plan section 'Deferred code items'). Root session
+  PL1-PL3 measured: power limit only clips pp (tg flat to 175 W, cards draw ~155 W at tg), persistence
+  mode is a no-op on this host (display card keeps the driver loaded), governor and C1E knobs are zero.
+  Plan section 7 holds the recommended production configuration (deliverable 4); gotchas 41-44.
