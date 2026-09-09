@@ -266,6 +266,13 @@ do for P2P), ASPM policy `default` (BIOS setting; link L1 state needs root to re
 EXCLUSIVE_PROCESS: the router spawns one child process per model, and exclusive mode allows one
 context per GPU. What is worth doing sits in the Final roadmap table as PL1-PL3.
 
+Update 2026-09-09 afternoon: the user enabled persistence mode permanently (the daemon unit's
+`--no-persistence-mode` removed) and installed the root helper `/usr/local/sbin/p100-root.sh` (draft and
+install notes in `~/p100-opt/root/`; sudoers `/etc/sudoers.d/p100-root`, to be removed after the session).
+`p100-root.sh link` read the P100 links as root: `ASPM not supported`, `ASPM Disabled` on both, so the
+ASPM knob of PL3 is moot and only the governor and the C1E hold remain. Answer to open question 9: the
+helper script.
+
 Item PL1 (added 2026-09-09 at the user's request; scheduled LAST, after every code item of Tiers 1-3):
 power-limit sweep to find the sweet spot for pp and tg. The cards report `Min Power Limit` 125 W,
 `Default/Max` 250 W (2026-09-09), and a full pp run sits at 165-231 W per card on a 700 W PSU with a
@@ -289,6 +296,14 @@ MTP verify step (width 4) sits between. Protocol (`[SRV]`, no code, ~2 h of GPU 
   lowest limit where tg and the MTP chat lose < 1% against 250 W, with the pp loss stated next to it;
   the user picks. Deliverable: the table in the log and a one-line recommendation for
   `~/llama-serve.sh` (a `sudo nvidia-smi -pl N` step needs root at boot: recommend, do not install).
+
+Results 2026-09-09 (PL1-PL3, `~/p100-opt/pl/PL-report.md`, Final roadmap table): the two P100s never reach
+250 W. tg draws ~155 W per card (peak 168) and is flat down to a 175 W limit (32.04 t/s, MTP chat 39.5 at
+every limit from 250 to 175); pp2048 peaks at 237 W per card and follows the clock once capped (-0.9% at
+225 W, -3.5% at 200, -7.3% at 175, -11.8% at 150, -22% at 125). No thermal slowdown at any limit (max
+64 C). Persistence mode is a no-op here (the display card keeps the driver loaded), governor and C1E hold
+do nothing, ASPM is not supported on the links. Production recommendation: no power limit, all defaults;
+see section 7.
 
 ### 1.6 Host settings to record and fix
 
@@ -1269,13 +1284,38 @@ Keep mmap.
 | I3 | backend sampling with vocab-sharded logits | removes 1 MB D2H + CPU sort per token | small share; needs meta-aware gather |
 | F8 | fewer collectives per layer (sequence parallel) | halves PCIe traffic | model-graph rewrite |
 
+### Deferred code items (user decision 2026-09-09: no more code changes for now, unclear when we get back)
+
+After the D4/E6 census, E7 and E8 the tg step has no fusion left at the graph-node level and the
+remaining pool sits inside the matvec kernels and NCCL. Every open code item below is under 1% of tg or
+a Tier 3 project, so the code phase stops here and the plan continues with the root session (Final
+table). Nothing in this list is killed; the numbers say what each is worth if it is ever picked up.
+
+| Item | What is left | Worth | Notes |
+|---|---|---|---|
+| E2 | MRoPE variant of the fused `RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)` kernel; the node order already matches, one mode check blocks it | 0.12 ms per token, 0.4% tg | ggml-cuda.cu ~2811, `ggml_cuda_op_rms_norm_mul_rope_fused` |
+| D4 | one kernel for `rms_norm(attn_out) * w * silu(z)`, deferred past the z matvec (patch 23 style) | 0.12 ms, 0.4% | 48 launches per token |
+| conv chain | `GET_ROWS + CONCAT -> CPY(cache) -> SSM_CONV + SILU` as one kernel, `conv_input` never in DRAM; the safe subset folds the conv-state CPY into `concat_rows_gather` | 0.26 ms, 0.8% (subset 0.13, 0.4%) | ~250 lines; `conv_input` has two consumers |
+| F9 | the synchronous split-input copies (62 memcpy/memset ops per token, 0.5 ms at d4096 in Tier 0.2), never examined since | up to 1.6% if they are on the critical path, likely less | needs the timeline, not the kernel sums |
+| C5, C8 | 8 vs 16-byte loads on sm_60 (`ggml_cuda_get_max_cpy_bytes`); the `-fa auto` NONE-verdict check | small; a correctness check | one-hour items |
+| D2 | GDN kernel occupancy | pp only (GDN is 6.1% of pp, 1.9% of tg) | nvprof |
+| A4b, Q6_K ceiling, A6 | row-keyed cuBLAS chunk rule; a higher patch 35 ceiling for the wide LM head; MMQ-for-dense number | non-production shapes only (`ngram-mod`, all-logits, Gemma) | - |
+| A7, C7, F7, F8, G4, I3 | Tier 3 research: HFMA2 tiled GEMM, quantized KV shards, P2P allreduce kernel, sequence parallel, fewer meta subgraphs, backend sampling | the only remaining double-digit levers, weeks each | see the Tier 3 table |
+| H3, H5, K2, J7, deliverable 4 | not code: compute buffer vs `-ub`, KV share at 200k, host RAM budget with `--cache-ram 0`, router respawn losing the host cache, the final recommended server command line | memory and operations | can ride along with the root session |
+
+Closed at the same time as effectively dead (no measurement needed): A5 (pays only at small `-ub`, the
+user runs 2048), B5 (patch 09, MoE only), B6 and B7 (covered by E8 and J5), D5 (patch 26 already fuses
+the writeback copies), E4 (rope is 0.3% of the step), G6 (patch 22, premise dead with MTP) and G7 (host
+is not the bottleneck: 2.8% idle), H4 (single-stream answer to question 5), J3 (hybrid models cannot
+shift), I5 (folded into PL3).
+
 ### Final: configuration sweeps (after all Tier 1-3 items; added 2026-09-09)
 
 | Item | Change | Expected | Depends on |
 |---|---|---|---|
-| PL1 | GPU power-limit sweep 250 -> 125 W on both cards, pp2048 / tg d0,d16384 / pp4 / MTP chat per arm, watts, clocks, cap time, tokens per joule (section 1.5). Needs the user for `nvidia-smi -pl` (root); 250 W restored at the end | a lower limit at ~0 tg cost and a stated pp cost; less PSU stress, less heat in a passive chassis | every code item done, so the sweep measures the final binary; open question 9 |
-| PL2 | persistence mode: `persistence_mode` is Disabled on both P100s although `nvidia-persistenced` is active (2026-09-09), so the driver tears the GPUs down whenever the last CUDA process exits (router-mode respawns pay the init again, and a power limit set by PL1 does not survive an idle period). `sudo nvidia-smi -pm 1` now, and fix the daemon unit so it manages the P100s at boot. Measure the child start time with and without | seconds per model respawn (area K); PL1's setting sticks | root; run in the PL1 session |
-| PL3 | host and link latency knobs, each on its own, reverted after: PCIe ASPM policy `performance` (`/sys/module/pcie_aspm/parameters/policy` is `default`, i.e. whatever the BIOS set; the P100 links' L1 state is only readable as root with `lspci -vv`), CPU governor `performance` (today `schedutil` on `intel_cpufreq`), `/dev/cpu_dma_latency` held at 0 for the server's lifetime (C3/C6 are already disabled, C1E with 10 us exit latency is not). Measure tg d0 (-r 5, two passes) and the J5 chat per knob | 0-2% tg from the 128 latency-bound collectives (7.5% of the step) and the 2.8% host/cross-GPU idle; may be 0 | root; run in the PL1 session |
+| PL1 | DONE 2026-09-09 (measurement, `~/p100-opt/pl/PL-report.md`, log entry): 7 arms 250/225/200/175/150/125/250 W, one llama-server per MTP arm. tg is flat to 175 W because each card draws only ~155 W at tg (peak 168): tg d0 32.04 at every limit from 250 to 175, MTP chat 39.5 t/s everywhere down to 175, joules per tg token unchanged. pp follows the clock: pp2048 447.8 / 444.0 / 432.1 / 415.0 / 395.1 / 349.1 t/s at 250 / 225 / 200 / 175 / 150 / 125 W (-0.9 / -3.5 / -7.3 / -11.8 / -22.0%), pp mean clock 1328 -> 1316 -> 1265 -> 1198 -> 1140 -> 984 MHz. At 150 W tg loses 1.0-1.4% and MTP 0.4% for -12% energy per token; at 125 W tg -6.5 to -7.2%. Tolerance summary: within 1% of tg -> 175 W (pp -7.3%), within 2% or 5% -> 150 W (pp -11.8%); the tg knee is between 150 and 165 W. No thermal slowdown at any limit (max 64 C against 82), peak board power 237 W per card, `pviol` 0 at 250 W: the PSU is not stressed. Verdict: keep 250 W (a limit only clips pp and saves nothing at tg); 175 W is the setting if a lower peak (160 W per card instead of 237) is ever wanted for the chassis | no tg to gain; pp -7% at 175 W | - |
+| PL2 | DONE 2026-09-09: persistence mode is a NO-OP on this host. The Quadro K2200 display card and `nvidia_modeset` hold the `nvidia` module loaded permanently (refcount 19), so the driver never tears the GPUs down between processes: CUDA init 327 vs 337 ms and init + load + 1 token 5174 vs 5161 ms with persistence on vs off (medians of 3, inside the noise), and a 200 W power limit survived `pm off` plus a CUDA process exit. The user's daemon fix is harmless and stays on. Router respawns pay the 4.2 s model load only (K1) | 0 | - |
+| PL3 | DONE 2026-09-09: zero. ASPM not testable (both P100 links report `ASPM not supported`). Governor `performance` vs `schedutil`: tg d0 32.24/32.23 vs 32.24/32.27 t/s, MTP 40.11 vs 40.10, with the CPUs at 3390 vs 1740 MHz mean - the host clock does not matter. `cpu_dma_latency` held at 0 vs not: 32.03/32.04 vs 32.05/32.02, MTP 39.51 vs 39.53. Both together: 32.04 vs 32.04. All MTP arms byte-identical (draft_n 636, accepted 298) | 0 | - |
 
 ### What not to do
 
@@ -1620,6 +1660,23 @@ llama.cpp behavior on this hardware:
     of 128 threads) where the elementwise kernel wanted 12-42 blocks of 256. Both together capped E8 at
     +0.5% on Qwen and -0.4% on Gemma (E8, 2026-09-09). Any future producer-side fold must be gated per
     layout and measured on the model whose weights select the bad layout.
+41. Persistence mode does nothing on krk-lab: the Quadro K2200 display card and `nvidia_modeset` keep the
+    `nvidia` module loaded (refcount 19), so there is no driver teardown between CUDA processes to prevent,
+    and a power limit set with `nvidia-smi -pl` survives `pm off` and process exits. Cold start is 0.33 s
+    CUDA init + 4.2 s model load either way (PL2, 2026-09-09). On a headless box without a display card
+    the usual advice applies again.
+42. `nvidia-smi dmon`'s `pviol` column reads 0.0 at 225 and 200 W although the pp clock has already
+    dropped (1328 -> 1316 -> 1265 MHz); the mean graphics clock during the run is the honest indicator of
+    an active power cap, and tviol stayed 0 everywhere (PL1, 2026-09-09).
+43. `llama-bench -p 4 -n 0` (the verify-width shape) is bimodal on this build, ~75.8 or ~80.9 t/s per
+    repetition in every arm including two 250 W baselines, so its median is a coin flip; compare means
+    or use the J5 chat harness for that shape (PL1, 2026-09-09). Also: `llama-bench` computes a `-d`
+    depth once and restores it from a saved state for the other repetitions, so `-d 16384 -r 5` costs one
+    prompt pass, not five; a 7-arm sweep with tg at two depths fits in 18 minutes.
+44. The kernel's ASPM policy `default` is the boot value and cannot be written back at runtime
+    (`Operation not permitted`), so a restore step that echoes `default` must tolerate the error; the
+    first version of `p100-root.sh restore` aborted there under `set -e` and left the governor and the
+    C1E hold to be reset by hand (PL3, 2026-09-09; fixed in the draft under `~/p100-opt/root/`).
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
@@ -1653,6 +1710,40 @@ Original list:
    run, since `nvidia-smi -pl`, `-pm`, the ASPM policy, the governor and `/dev/cpu_dma_latency` all
    need root: the user runs each command on request, or grants a sudoers line limited to those
    commands for that session? Everything is restored at the end except what the user decides to keep. Asked 2026-09-09.
+   Answered 2026-09-09: a root-owned helper script `/usr/local/sbin/p100-root.sh` with fixed subcommands
+   and one NOPASSWD sudoers line for user krk, installed by the user for the session, logged to
+   `/var/log/p100-root.log`, removed afterwards.
+
+## 7. Recommended production configuration (deliverable 4, as of 2026-09-09)
+
+The recorded production line in 0.1 is right and stays. Everything below is what the measurements added
+or confirmed; nothing in the line itself changes.
+
+```
+NCCL_P2P_LEVEL=SYS LLAMA_CACHE=/mnt/hdd/gguf CUDA_VISIBLE_DEVICES=<the two P100 UUIDs> \
+llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --tools all --split-mode tensor \
+  --cache-ram 16384 --jinja -ngl 99 -c 160000 --parallel 1 -fa on -b 2048 -ub 2048 --no-mmproj-offload \
+  --spec-type draft-mtp --draft-p-min 0
+```
+
+- `NCCL_P2P_LEVEL=SYS`: +1.5% pp, +0.9% tg (Tier 0.4); the only environment variable worth setting. Do
+  not set `GGML_CUDA_P2P=1`, `GGML_CUDA_ALLREDUCE=none`, `NCCL_PROTO`, `NCCL_MAX_NCHANNELS`,
+  `NCCL_SHM_DISABLE`, `CUDA_SCALE_LAUNCH_QUEUES` (all measured, none helps, several hurt).
+- `--spec-type draft-mtp` at the default `--spec-draft-n-max 3` (J5): +49% tg on 25k chat follow-ups; do
+  not widen the draft, do not add `ngram-mod`. `-c 160000` is the right size for MTP width 3 (the
+  largest that loads and runs is 168000, gotcha 32); 15.5 GiB per card in use at load.
+- `-b 2048 -ub 2048`: `-ub 512` costs 45% of pp (Tier 0). `-t 4 --poll 0` saves host power only.
+- `--cache-ram 16384` has no speed effect with `--parallel 1` (the slot is re-selected by prefix match,
+  J1); `--cache-ram 0` would free 16 GiB of host RAM if the box ever needs it.
+- No request-level `logit_bias`, no per-request sampler exotica (J6) so the sampler prefilter (patch 43)
+  and graph reuse stay on.
+- GPU and host state: no power limit (PL1: tg draws ~155 W per card and is flat to 175 W; a limit only
+  clips pp; 175 W is the value if a lower chassis peak is ever wanted, at -7% pp), persistence mode on
+  (harmless, a no-op here), stock governor and C-states, ASPM not applicable, no application clocks
+  (boost already sits at 1328 MHz under load). Do not set compute mode EXCLUSIVE_PROCESS (router
+  children).
+- Binary: the branch build (`p100-b10758`, patches 01-30 + gist + p100x 31-44); the production
+  `/home/krk/llama.cpp` (branch `p100`, b10630 base) is 8-10% slower at tg and lacks patches 31-44.
 
 ## Appendix A: environment variables worth knowing (this tree)
 
