@@ -1262,3 +1262,6 @@ on `qwen35` that the kill switches above do not explain points here first.
   PL1-PL3 measured: power limit only clips pp (tg flat to 175 W, cards draw ~155 W at tg), persistence
   mode is a no-op on this host (display card keeps the driver loaded), governor and C1E knobs are zero.
   Plan section 7 holds the recommended production configuration (deliverable 4); gotchas 41-44.
+- 2026-09-09 (wrap-up): `P100-README.md` added as the quick start for building and serving from this
+  branch. The user's wall meter confirmed the power sweep (no change in system draw until 175 W). The
+  testing phase is closed; remaining code items stay deferred.
