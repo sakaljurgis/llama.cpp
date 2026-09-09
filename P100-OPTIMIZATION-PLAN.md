@@ -303,7 +303,7 @@ every limit from 250 to 175); pp2048 peaks at 237 W per card and follows the clo
 225 W, -3.5% at 200, -7.3% at 175, -11.8% at 150, -22% at 125). No thermal slowdown at any limit (max
 64 C). Persistence mode is a no-op here (the display card keeps the driver loaded), governor and C1E hold
 do nothing, ASPM is not supported on the links. Production recommendation: no power limit, all defaults;
-see section 7.
+see section 7. The user's wall meter agrees: no change in system draw until 175 W, -50 W at 150, -100 W at 125.
 
 ### 1.6 Host settings to record and fix
 
@@ -1313,7 +1313,7 @@ shift), I5 (folded into PL3).
 
 | Item | Change | Expected | Depends on |
 |---|---|---|---|
-| PL1 | DONE 2026-09-09 (measurement, `~/p100-opt/pl/PL-report.md`, log entry): 7 arms 250/225/200/175/150/125/250 W, one llama-server per MTP arm. tg is flat to 175 W because each card draws only ~155 W at tg (peak 168): tg d0 32.04 at every limit from 250 to 175, MTP chat 39.5 t/s everywhere down to 175, joules per tg token unchanged. pp follows the clock: pp2048 447.8 / 444.0 / 432.1 / 415.0 / 395.1 / 349.1 t/s at 250 / 225 / 200 / 175 / 150 / 125 W (-0.9 / -3.5 / -7.3 / -11.8 / -22.0%), pp mean clock 1328 -> 1316 -> 1265 -> 1198 -> 1140 -> 984 MHz. At 150 W tg loses 1.0-1.4% and MTP 0.4% for -12% energy per token; at 125 W tg -6.5 to -7.2%. Tolerance summary: within 1% of tg -> 175 W (pp -7.3%), within 2% or 5% -> 150 W (pp -11.8%); the tg knee is between 150 and 165 W. No thermal slowdown at any limit (max 64 C against 82), peak board power 237 W per card, `pviol` 0 at 250 W: the PSU is not stressed. Verdict: keep 250 W (a limit only clips pp and saves nothing at tg); 175 W is the setting if a lower peak (160 W per card instead of 237) is ever wanted for the chassis | no tg to gain; pp -7% at 175 W | - |
+| PL1 | DONE 2026-09-09 (measurement, `~/p100-opt/pl/PL-report.md`, log entry): 7 arms 250/225/200/175/150/125/250 W, one llama-server per MTP arm. tg is flat to 175 W because each card draws only ~155 W at tg (peak 168): tg d0 32.04 at every limit from 250 to 175, MTP chat 39.5 t/s everywhere down to 175, joules per tg token unchanged. pp follows the clock: pp2048 447.8 / 444.0 / 432.1 / 415.0 / 395.1 / 349.1 t/s at 250 / 225 / 200 / 175 / 150 / 125 W (-0.9 / -3.5 / -7.3 / -11.8 / -22.0%), pp mean clock 1328 -> 1316 -> 1265 -> 1198 -> 1140 -> 984 MHz. At 150 W tg loses 1.0-1.4% and MTP 0.4% for -12% energy per token; at 125 W tg -6.5 to -7.2%. Tolerance summary: within 1% of tg -> 175 W (pp -7.3%), within 2% or 5% -> 150 W (pp -11.8%); the tg knee is between 150 and 165 W. No thermal slowdown at any limit (max 64 C against 82), peak board power 237 W per card, `pviol` 0 at 250 W: the PSU is not stressed. Confirmed by the user's wall meter: whole-system draw unchanged down to 175 W, -50 W at 150 W, -100 W at 125 W. Verdict: keep 250 W (a limit only clips pp and saves nothing at tg); 175 W is the setting if a lower peak (160 W per card instead of 237) is ever wanted for the chassis | no tg to gain; pp -7% at 175 W | - |
 | PL2 | DONE 2026-09-09: persistence mode is a NO-OP on this host. The Quadro K2200 display card and `nvidia_modeset` hold the `nvidia` module loaded permanently (refcount 19), so the driver never tears the GPUs down between processes: CUDA init 327 vs 337 ms and init + load + 1 token 5174 vs 5161 ms with persistence on vs off (medians of 3, inside the noise), and a 200 W power limit survived `pm off` plus a CUDA process exit. The user's daemon fix is harmless and stays on. Router respawns pay the 4.2 s model load only (K1) | 0 | - |
 | PL3 | DONE 2026-09-09: zero. ASPM not testable (both P100 links report `ASPM not supported`). Governor `performance` vs `schedutil`: tg d0 32.24/32.23 vs 32.24/32.27 t/s, MTP 40.11 vs 40.10, with the CPUs at 3390 vs 1740 MHz mean - the host clock does not matter. `cpu_dma_latency` held at 0 vs not: 32.03/32.04 vs 32.05/32.02, MTP 39.51 vs 39.53. Both together: 32.04 vs 32.04. All MTP arms byte-identical (draft_n 636, accepted 298) | 0 | - |
 
@@ -1744,6 +1744,8 @@ llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --tools all --
   children).
 - Binary: the branch build (`p100-b10758`, patches 01-30 + gist + p100x 31-44); the production
   `/home/krk/llama.cpp` (branch `p100`, b10630 base) is 8-10% slower at tg and lacks patches 31-44.
+- `~/llama-serve.sh` already carries this exact line including `NCCL_P2P_LEVEL=SYS`; the only step is
+  rebuilding its binary from this branch. `P100-README.md` is the quick start for that.
 
 ## Appendix A: environment variables worth knowing (this tree)
 
@@ -1783,6 +1785,9 @@ llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --tools all --
 | `GGML_CUDA_CUBLAS_CHUNK_ROWS=N`, `GGML_CUDA_CUBLAS_CHUNK_LOG=1` | patch 44 test knobs: force N rows per chunk; one stderr line per split call |
 
 ## Appendix B: reading order for a new agent
+
+0. `P100-README.md`: how the user builds and starts production from this branch, the smoke test, the
+   kill switches that matter, and what is left.
 
 1. `AGENTS.md`, then `P100-PATCHES.md` end to end.
 2. This file: sections 0, 2.0, 2.1, 3, 5.
