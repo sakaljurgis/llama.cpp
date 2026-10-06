@@ -6,6 +6,43 @@
 
 #include <cstdint>
 
+// GGML_CUDA_FATTN_LOG=1 prints one line per distinct flash-attention launch tuple on stderr
+// (kernel kind, ncols1/ncols2, config, occupancy, parallel_blocks, grid).  Off by default.
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#include <string>
+
+static bool ggml_cuda_fattn_log_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_FATTN_LOG") != nullptr;
+    return enabled;
+}
+
+// GGML_CUDA_FATTN_PB_TIEBREAK=0 turns off the parallel_blocks tie-break in launch_fattn;
+// GGML_CUDA_FATTN_TILE_LEGACY=1 turns it off too, so that variable alone restores the b10758 launches.
+static bool ggml_cuda_fattn_pb_tiebreak() {
+    static const bool enabled = []() -> bool {
+        const char * legacy = getenv("GGML_CUDA_FATTN_TILE_LEGACY");
+        if (legacy && atoi(legacy) != 0) {
+            return false;
+        }
+        const char * tb = getenv("GGML_CUDA_FATTN_PB_TIEBREAK");
+        return !(tb && atoi(tb) == 0);
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_fattn_log_once(const char * line) {
+    static std::mutex            mtx;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (seen.insert(std::string(line)).second) {
+        fprintf(stderr, "FATTNLOG %s\n", line);
+        fflush(stderr);
+    }
+}
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -416,9 +453,14 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
+#if defined(GGML_USE_HIP)
+    // Keep this VMEM read close to its packed-byte dequantization. Hoisting it too far
+    // increases VGPR pressure substantially in some FlashAttention vector kernels.
+    __builtin_amdgcn_sched_group_barrier(0x20, 1, 0);
+#endif // defined(GGML_USE_HIP)
     q >>= 4*shift;
     q &= 0x0F0F0F0F;
-    q = __vsubss4(q, 0x08080808);
+    q = __vsub4(q, 0x08080808);
 
     const int8_t * q8 = (const int8_t *) &q;
 
@@ -508,7 +550,7 @@ static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict
         }
     }
 
-    q = __vsubss4(q, 0x10101010);
+    q = __vsub4(q, 0x10101010);
 
     const int8_t * q8 = (const int8_t *) &q;
 
@@ -717,6 +759,9 @@ static __global__ void flash_attn_mask_to_KV_max(
 
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
+
+void ggml_cuda_flash_attn_ext_compact_mask(
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -972,7 +1017,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1088,10 +1134,25 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
+    int32_t n_kv_max = 0;
+    if (use_sparse) {
+        GGML_ASSERT(mask != nullptr);
+        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+        GGML_ASSERT(n_kv_max_query > 0);
+        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+
+        const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+
+        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+    }
+
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1114,16 +1175,32 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
+    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {
-        // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
-        const int max_blocks = max_blocks_per_sm*nsm;
-        const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
-        const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
+        // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
+        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
 
-        const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75;
+        auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+            const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
+            const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
+
+            if (prefer_whole_tiles && tiles_efficiency_percent >= 75) {
+                return false;
+            }
+            if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                return true;
+            }
+            if (amd_wmma_available(cc) && DKQ == 64) {
+                return true; // TODO better configuration
+            }
+            return tiles_efficiency_percent < 75;
+        };
+
+        const int  max_blocks   = max_blocks_per_sm*nsm;
+        const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -1151,6 +1228,7 @@ void launch_fattn(
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        const int parallel_blocks_start = parallel_blocks;
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
@@ -1172,6 +1250,16 @@ void launch_fattn(
                 efficiency_percent_best = efficiency_percent;
                 parallel_blocks = parallel_blocks_test;
             }
+        }
+
+        // The search ignores ntiles_KV % parallel_blocks: a ragged last KV round runs a few blocks while
+        // the GPU waits and costs as much as a full round. Take the smallest parallel_blocks with the
+        // same round count (same waves, even blocks, less combine work). Measured on GP100 only.
+        if (ncols1 == 1 && parallel_blocks > 1 &&
+                GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA &&
+                ggml_cuda_fattn_pb_tiebreak()) {
+            const int rounds = (ntiles_KV + parallel_blocks - 1) / parallel_blocks;
+            parallel_blocks  = std::max(parallel_blocks_start, (ntiles_KV + rounds - 1) / rounds);
         }
 
         blocks_num.x = ntiles_x;
@@ -1207,8 +1295,20 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
-        ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+    if (ggml_cuda_fattn_log_enabled()) {
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+                 "run dev=%d DV=%d ncols1=%d ncols2=%d nwarps=%d nbatch_fa=%d Qne=[%d,%d,%d,%d] "
+                 "Kne1=%d nsm=%d mbpsm=%d pb=%d sk=%d grid=[%u,%u,%u] ntiles_dst=%d ntiles_KV=%d",
+                 id, DV, ncols1, ncols2, nwarps, nbatch_fa,
+                 (int) Q->ne[0], (int) Q->ne[1], (int) Q->ne[2], (int) Q->ne[3],
+                 (int) K->ne[1], nsm, max_blocks_per_sm, parallel_blocks, (int) stream_k,
+                 blocks_num.x, blocks_num.y, blocks_num.z, ntiles_dst, ntiles_KV);
+        ggml_cuda_fattn_log_once(buf);
+    }
+
+    ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+    ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
         V_data,
@@ -1218,7 +1318,7 @@ void launch_fattn(
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+        K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0

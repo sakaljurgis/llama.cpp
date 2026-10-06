@@ -9,9 +9,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -108,6 +110,142 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// Selects a superset of the `nkeep` highest logits without materialising the whole vocabulary.
+//
+// set_logits() below builds one llama_token_data (12 bytes) per vocabulary entry on every single
+// sampled token, and the first sampler that needs an ordering then sweeps all of them again.  On
+// Qwen3 (n_vocab 151936) that is 1.8 MB written and re-read per token, and it is on the critical
+// path: the sampler runs after llama_synchronize(), so the GPU idles through it.  Measured on a
+// llama-server decode loop it is 0.32 ms per token, 2.2% of end-to-end throughput on a Tesla P100.
+// The cost is on the host and does not shrink as the GPU gets faster, and vocabularies keep growing.
+//
+// Only the top few candidates can ever be selected once top-k runs, so scan the raw float logits
+// instead and copy out just those.  The scan keeps a threshold equal to the nkeep-th largest logit
+// seen so far, which makes the common case a compare that fails, and tests a whole 64-wide block at
+// a time so the rejection is one vectorised pass.  common_sampler_prefilter_nkeep() decides whether
+// the chain is one where this is provably equivalent; see there.
+//
+// The block test ORs the comparisons rather than reducing to a max.  A float max reduction is a
+// serial dependency chain that the compiler will not vectorise (std::max is not associative across
+// NaN), which measured ~7x slower than the OR form: 130 us vs 19 us per token over a 151936-entry
+// vocabulary.  Integer OR has no such problem.
+//
+// Elements equal to the threshold are dropped, so `out` holds *a* valid top-nkeep set (ties broken
+// by position) rather than a specific one.  That is all the caller's argument needs: every excluded
+// token has a logit <= the smallest kept one.
+static void common_sampler_prefilter(
+        const float * logits, int n_vocab, int nkeep, std::vector<int32_t> & out) {
+    const int cap = 4*nkeep;
+
+    out.clear();
+    out.reserve(cap);
+
+    float thr = -INFINITY;
+
+    // thr can rise inside this, which only ever drops more; anything skipped is <= the thr in force
+    // at the time, and thr never decreases, so it is <= the smallest surviving candidate.
+    const auto probe = [&](int i) {
+        if (logits[i] > thr) {
+            out.push_back(i);
+
+            if ((int) out.size() == cap) {
+                std::nth_element(out.begin(), out.begin() + nkeep - 1, out.end(),
+                        [logits](int32_t a, int32_t b) { return logits[a] > logits[b]; });
+                out.resize(nkeep);
+
+                // strictly-greater from here on, so later ties with the nkeep-th value are
+                // dropped -- still a valid top-nkeep set
+                thr = logits[out[nkeep - 1]];
+            }
+        }
+    };
+
+    int i0 = 0;
+    for (; i0 + 64 <= n_vocab; i0 += 64) {
+        int any = 0;
+        for (int j = 0; j < 64; ++j) {
+            any |= (int) (logits[i0 + j] > thr);
+        }
+        if (!any) {
+            continue;
+        }
+
+        for (int j = 0; j < 64; ++j) {
+            probe(i0 + j);
+        }
+    }
+    for (; i0 < n_vocab; ++i0) {
+        probe(i0);
+    }
+}
+
+// Number of candidates set_logits() must keep for the prefilter to be equivalent to building the
+// whole vocabulary, or 0 when it is not.
+//
+// Samplers that run before top-k must either be no-ops or only ever lower logits, and the number of
+// tokens they can lower must be bounded, because the margin over top_k is what guarantees enough
+// untouched candidates survive.  Penalties qualify: they touch at most penalty_last_n distinct
+// tokens, and with repeat >= 1 and non-negative freq/present the arithmetic is monotone
+// non-increasing.  Anything past top-k sees exactly the same top-k either way, so it does not
+// matter what it is.
+static int common_sampler_prefilter_nkeep(const common_params_sampling & params, const llama_vocab * vocab) {
+    static const bool enabled = getenv("LLAMA_SAMPLER_PREFILTER")
+        ? atoi(getenv("LLAMA_SAMPLER_PREFILTER")) != 0 : true;
+
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    // same condition as the logit bias sampler in common_sampler_init
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    const bool has_logit_bias = !params.logit_bias.empty() || n_suppress > 0;
+
+    if (!enabled || params.mirostat != 0 || params.top_k <= 0 || has_logit_bias) {
+        return 0;
+    }
+
+    const bool penalties_off =
+        params.penalty_last_n == 0 ||
+        (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+
+    if (!penalties_off &&
+        (params.penalty_last_n < 0 || params.penalty_repeat < 1.0f ||
+         params.penalty_freq < 0.0f || params.penalty_present < 0.0f)) {
+        return 0;
+    }
+
+    const bool dry_off = params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0;
+
+    bool seen_top_k = false;
+    for (const auto & cnstr : params.samplers) {
+        if (cnstr == COMMON_SAMPLER_TYPE_TOP_K) {
+            seen_top_k = true;
+            break;
+        }
+
+        // everything reachable before top-k has to leave the ordering of the tail alone
+        switch (cnstr) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:                              break;
+            case COMMON_SAMPLER_TYPE_DRY:         if (!dry_off) return 0;     break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA: if (params.top_n_sigma > 0.0f) return 0; break;
+            default: return 0;
+        }
+    }
+
+    if (!seen_top_k) {
+        return 0;
+    }
+
+    const int margin = penalties_off ? 0 : params.penalty_last_n;
+    const int nkeep  = std::min<int64_t>(n_vocab, (int64_t) params.top_k + margin);
+
+    // the scan writes up to 4*nkeep candidates, so there has to be real headroom to be worth it
+    if (nkeep <= 0 || 8*nkeep >= n_vocab) {
+        return 0;
+    }
+
+    return nkeep;
+}
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -121,13 +259,18 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // for rejection sampling; independent of the draft, or the target distribution is not preserved
+    std::mt19937 rng;
+    int pf_nkeep;                 // 0 = prefilter not applicable to this chain
+    std::vector<int32_t> pf_idx;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    void set_logits(struct llama_context * ctx, int idx, bool prefilter = false) {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -152,9 +295,25 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+
+            if (prefilter && pf_nkeep > 0 && pf_nkeep < n_vocab) {
+                common_sampler_prefilter(logits, n_vocab, pf_nkeep, pf_idx);
+            } else {
+                pf_idx.clear();
+            }
+
+            if (!pf_idx.empty()) {
+                cur.resize(pf_idx.size());
+                for (size_t i = 0; i < pf_idx.size(); ++i) {
+                    const llama_token token_id = pf_idx[i];
+                    cur[i] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
+            } else {
+                // no candidate above -inf (or prefilter not applicable): build the whole vocabulary
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         }
 
@@ -214,7 +373,7 @@ struct common_sampler * common_sampler_init(
 #ifdef LLAMA_USE_LLGUIDANCE
         grmr = llama_sampler_init_llg(vocab, "lark", grammar_str.c_str());
 #else
-        GGML_ABORT("llguidance (cmake -DLLAMA_LLGUIDANCE=ON) is not enabled");
+        throw std::runtime_error("failed to parse grammar: llguidance is not enabled");
 #endif // LLAMA_USE_LLGUIDANCE
     } else {
         std::vector<std::string> trigger_patterns;
@@ -432,6 +591,10 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        // mix it, the chain and the draft are seeded from this one too
+        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .pf_nkeep= */ common_sampler_prefilter_nkeep(params, vocab),
+        /* .pf_idx  = */ {},
     };
 
     return result;
@@ -515,6 +678,9 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .rng     = */ gsmpl->rng,
+        /* .pf_nkeep= */ gsmpl->pf_nkeep,
+        /* .pf_idx  = */ {},
     };
 }
 
@@ -535,6 +701,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -604,7 +771,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // The prefilter drops everything that top-k would drop anyway, so it is only equivalent while
+    // nothing else needs the full vocabulary before the chain: a grammar applied first, or a
+    // reasoning budget in FORCING state (one forced token that need not be among the highest logits).
+    // With grammar_first false the grammar is rejection sampling and the resample below rebuilds the
+    // whole vocabulary, so the first pass only needs the top-k set.
+    const bool prefilter = !(grammar_first && grammar_should_apply(gsmpl)) &&
+        (!rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING);
+
+    gsmpl->set_logits(ctx, idx, prefilter);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -681,6 +856,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
@@ -689,9 +866,129 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        if (draft[i] != id) {
+        // do not accept draft tokens after an EOG - they are not output but would stay in the context
+        // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
+        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
             break;
         }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+    for (size_t k = 0; k < n; ++k) {
+        if (data[k].id == id) {
+            return data[k].p;
+        }
+    }
+    return 0.0f;
+}
+
+// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
+// Preserves the target distribution exactly, and accepts more often than matching does when the
+// draft samples instead of taking its argmax.
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    // draws come from the sampler's own stream, so they stay independent of what was drafted
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+
+    std::vector<llama_token_data> residual;
+
+    std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // leaves the target distribution in the candidate array
+        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        const auto & q     = draft_q[i];
+
+        const bool masked = !grammar_first && grammar_should_apply(gsmpl);
+        if (masked) {
+            cand.assign(cur_p->data, cur_p->data + cur_p->size);
+            llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
+            llama_sampler_apply(gsmpl->grmr, &arr);
+        }
+
+        // a candidate the grammar rejects carries no probability, whatever the target thinks
+        auto p_raw = [&](size_t k) {
+            return masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
+        };
+
+        // masking drops probability mass, so rescale what is left or the residual is over-weighted
+        float p_sum = 0.0f;
+        if (masked) {
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                p_sum += p_raw(k);
+            }
+        }
+
+        const float p_norm = masked && p_sum > 0.0f ? 1.0f/p_sum : 1.0f;
+
+        auto p_of = [&](size_t k) {
+            return p_raw(k)*p_norm;
+        };
+
+        // q_x is never 0 for a token the draft produced, but guard the divide
+        const float q_x = prob_of(q.data(), q.size(), draft[i]);
+
+        float p_x = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            if (cur_p->data[k].id == draft[i]) {
+                p_x = p_of(k);
+                break;
+            }
+        }
+
+        if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // rejected: tokens outside q's support keep all of p
+        residual.clear();
+        float sum = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            if (r > 0.0f) {
+                residual.push_back({ cur_p->data[k].id, 0.0f, r });
+                sum += r;
+            }
+        }
+
+        llama_token id = id_tgt;
+        if (sum > 0.0f) {
+            float u = uni(gsmpl->rng) * sum;
+            id = residual.back().id;
+            for (const auto & e : residual) {
+                u -= e.p;
+                if (u <= 0.0f) {
+                    id = e.id;
+                    break;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        break;
     }
 
     if (i == draft.size()) {
