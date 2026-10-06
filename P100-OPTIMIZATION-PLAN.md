@@ -1293,6 +1293,7 @@ table). Nothing in this list is killed; the numbers say what each is worth if it
 
 | Item | What is left | Worth | Notes |
 |---|---|---|---|
+| 18b (b11436) | fuse the qwen35 GDN q/k `RMS_NORM + SCALE` pair (#28068 replaced `ggml_l2_norm` with it, so patch 18's L2_NORM sibling fusion went dead and #29393 fuses each norm alone) | 48 launches per token per card, the likely cause of the -0.37% tg of `p100-b11436` against `p100-b10758` | patch 18's sibling rule retargeted; `norm.cu` already has `do_scale` |
 | E2 | MRoPE variant of the fused `RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)` kernel; the node order already matches, one mode check blocks it | 0.12 ms per token, 0.4% tg | ggml-cuda.cu ~2811, `ggml_cuda_op_rms_norm_mul_rope_fused` |
 | D4 | one kernel for `rms_norm(attn_out) * w * silu(z)`, deferred past the z matvec (patch 23 style) | 0.12 ms, 0.4% | 48 launches per token |
 | conv chain | `GET_ROWS + CONCAT -> CPY(cache) -> SSM_CONV + SILU` as one kernel, `conv_input` never in DRAM; the safe subset folds the conv-state CPY into `concat_rows_gather` | 0.26 ms, 0.8% (subset 0.13, 0.4%) | ~250 lines; `conv_input` has two consumers |
@@ -1677,6 +1678,14 @@ llama.cpp behavior on this hardware:
     (`Operation not permitted`), so a restore step that echoes `default` must tolerate the error; the
     first version of `p100-root.sh restore` aborted there under `set -e` and left the governor and the
     C1E hold to be reset by hand (PL3, 2026-09-09; fixed in the draft under `~/p100-opt/root/`).
+45. `~/p100-opt/llama.cpp/build/` on krk-lab is the 2026-09-09 build and still holds the rejected E8
+    experiment (810 `unary_gated_a16k` strings in the binaries) although that tree's working copy is
+    clean, so any "old branch" number taken from it is b10758 + E8 (bench3 on 2026-10-06: tg128 32.82
+    against 32.57 for a clean rebuild of 47ec3fc56 in `build-clean/`). Rebuild before using a tree's
+    `build/` as an arm, or check the binary for strings of a rejected experiment.
+46. `test-llama-archs` crashes are not deterministic: the gist's scratch-pool bug (patch 45) hit 1 run
+    in 4 on b10758 and 4 in 15 on b11436, at a different architecture each time. One clean run proves
+    nothing; run it at least 6 times after any change to `ggml-backend-meta.cpp` or a rebase.
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
