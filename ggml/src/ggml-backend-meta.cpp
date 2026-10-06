@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -408,6 +409,7 @@ struct ggml_backend_meta_simple_tensor_container {
     static constexpr size_t identity_size = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
     std::map<const ggml_tensor *, std::array<char, identity_size>> identities;
     bool validate_identity = false;
+    uint64_t free_gen = 0; // scratch pools: value of ggml_backend_meta_buffer_free_gen at the last reset
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
         ctxs.reserve(n_simple);
@@ -451,10 +453,15 @@ struct ggml_backend_meta_buffer_context {
 
 };
 
+// bumped on every meta buffer free: scratch pool entries may point at shards of the freed buffer,
+// and the identity check cannot see that when a new buffer reuses the same addresses
+static std::atomic<uint64_t> ggml_backend_meta_buffer_free_gen{0};
+
 static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     delete buf_ctx;
+    ggml_backend_meta_buffer_free_gen.fetch_add(1, std::memory_order_relaxed);
 }
 
 static size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf) {
@@ -522,8 +529,10 @@ struct ggml_backend_meta_scratch_shards {
     ggml_backend_meta_simple_tensor_container & stc;
 
     explicit ggml_backend_meta_scratch_shards(size_t n_bufs) : stc(acquire(n_bufs)) {
-        // compact only when the struct arena nears capacity
-        bool needs_compact = false;
+        // compact when the struct arena nears capacity or a meta buffer was freed since the last reset
+        const uint64_t free_gen = ggml_backend_meta_buffer_free_gen.load(std::memory_order_relaxed);
+        bool needs_compact = stc.free_gen != free_gen;
+        stc.free_gen = free_gen;
         for (ggml_context_ptr & c : stc.ctxs) {
             if (ggml_used_mem(c.get()) > 3*ggml_get_mem_size(c.get())/4) {
                 needs_compact = true;
