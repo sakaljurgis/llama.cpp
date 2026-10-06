@@ -32,6 +32,7 @@ Fallback at any time: `mv build build-p100-b11436 && mv build-p100-b10758 build`
 
 ```sh
 export CUDA_VISIBLE_DEVICES=GPU-caf732cd-6831-4ec5-61b0-2e6fc172b1ee,GPU-b86ac28c-57b4-7387-c86f-79fc17819a1a
+export NCCL_P2P_LEVEL=SYS                      # as in ~/llama-serve.sh; without it pp512 drops ~6%
 M=/mnt/hdd/gguf/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf
 ./build/bin/llama-bench -m $M -ngl 99 -sm tensor -fa on -p 512 -n 64 -r 2
 GGML_A16K_CHECK=1 ./build/bin/llama-completion -m $M -p "Hello, who are you?" -n 64 -no-cnv \
@@ -41,6 +42,8 @@ GGML_A16K_CHECK=1 ./build/bin/llama-completion -m $M -p "Hello, who are you?" -n
 Expected: tg64 about 32.3 t/s (tg128 measured 32.45), sensible text, and no `a16k_check:` line on stderr (that line means a
 non-finite matvec output). `llama-completion` needs `-c 4096` or it takes the 262k training context
 and runs out of memory. The pp512 number here is at `-ub 512` and is not the production pp figure.
+`NCCL_P2P_LEVEL=SYS` matters here: on 2026-10-06 the production build gave pp512 256.6 t/s with it and
+241.3 without (tg64 32.1 either way), so a pp512 near 241 means the variable is missing, not a bad build.
 
 ## 3. Serve
 
