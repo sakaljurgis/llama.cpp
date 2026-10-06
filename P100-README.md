@@ -1,9 +1,10 @@
 # P100 quick reference (2x Tesla P100 on krk-lab)
 
-Branch `p100-b10758` = upstream master at b81c99b47 + the shinbunbun P100 patch set (01-30, three
-dropped as superseded) + the philpax meta-backend gist + local patches `p100x` 31-44. Measured on the
-box against a stock build of the same base: Qwen3.8-27B UD-Q4_K_M tg 32.0 vs 21.6 t/s (1.48x), pp2048
-448 vs 417 t/s at `-ub 2048`, MTP chat follow-ups ~40 t/s; Gemma 4 31B UD-Q4_K_XL tg 29 t/s (1.66x).
+Branch `p100-b11436` = upstream master at 6753a033f (b11436 + 3) + the shinbunbun P100 patch set
+(01-30, three dropped as superseded) + the philpax meta-backend gist + local patches `p100x` 31-45.
+Measured on the box against a stock build of the same base: Qwen3.8-27B UD-Q4_K_M tg 32.45 vs 22.12 t/s
+(1.47x), pp2048 453 vs 445 t/s at `-ub 2048`, MTP chat 47-64 t/s; Gemma 4 31B UD-Q4_K_XL tg 29.3 vs
+18.0 t/s (1.62x). The previous branch `p100-b10758` is kept unchanged as the fallback.
 
 Docs: `P100-PATCHES.md` (what every patch does, knobs, rebase recipe, test checklist),
 `P100-OPTIMIZATION-PLAN.md` (measurements; section 0.1 machines and paths, section 7 the recommended
@@ -15,9 +16,9 @@ production configuration, section 5 the gotchas, roadmap "Deferred code items" f
 ```sh
 cd /home/krk/llama.cpp
 git status                                     # clean first; stash or commit anything local
-git fetch origin p100-b10758:p100-b10758       # origin = github.com/sakaljurgis/llama.cpp (https)
-git switch p100-b10758
-mv build build-p100-b10630                     # keep the old binaries as a fallback
+git fetch origin p100-b11436:p100-b11436       # origin = github.com/sakaljurgis/llama.cpp (https)
+git switch p100-b11436
+mv build build-p100-b10758                     # keep the old binaries as a fallback
 export PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=60 -DGGML_CUDA_NCCL=ON -DLLAMA_OPENSSL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j14
@@ -25,7 +26,7 @@ cmake --build build --config Release -j14
 
 Same flags as `~/llama-build.txt` plus an explicit Release. cmake 3.22 needs the explicit arch 60
 (no `native`). NCCL is required (`libnccl-dev` is installed). About 10-15 minutes at `-j14`.
-Fallback at any time: `mv build build-p100-b10758 && mv build-p100-b10630 build`.
+Fallback at any time: `mv build build-p100-b11436 && mv build-p100-b10758 build`.
 
 ## 2. Smoke test before serving (5 minutes)
 
@@ -37,18 +38,25 @@ GGML_A16K_CHECK=1 ./build/bin/llama-completion -m $M -p "Hello, who are you?" -n
     -ngl 99 -sm tensor -fa on -c 4096 --temp 0 -s 1
 ```
 
-Expected: tg64 31.9-32.3 t/s, sensible text, and no `a16k_check:` line on stderr (that line means a
+Expected: tg64 about 32.3 t/s (tg128 measured 32.45), sensible text, and no `a16k_check:` line on stderr (that line means a
 non-finite matvec output). `llama-completion` needs `-c 4096` or it takes the 262k training context
 and runs out of memory. The pp512 number here is at `-ub 512` and is not the production pp figure.
 
 ## 3. Serve
 
-`~/llama-serve.sh` already matches the recommended configuration (plan section 7): `NCCL_P2P_LEVEL=SYS`,
-`--split-mode tensor -fa on -b 2048 -ub 2048 -c 160000 --parallel 1 --spec-type draft-mtp --draft-p-min 0`
-at the default draft width 3. Nothing to change: it points at `/home/krk/llama.cpp/build/bin/llama`,
-which is the new build after step 1. Optional tidying: drop `NCCL_DEBUG=INFO` (log noise only) and the
-stale comment lines (draft width 4 and `ngram-mod` were measured and rejected; `-ctk/-ctv q8_0` is not
-supported on the tile attention path).
+`~/llama-serve.sh` points at `/home/krk/llama.cpp/build/bin/llama`, which is the new build after
+step 1, so nothing in it has to change for the update. As read on 2026-10-06 it runs `llama serve`
+(router, `--models-dir`) with `NCCL_P2P_LEVEL=SYS --split-mode tensor -fa on -b 2048 -ub 2048
+-c 149000 --parallel 1 --cache-ram 16384 --jinja`, and its MTP lines are comments. The recommended
+configuration (plan section 7) adds `--spec-type draft-mtp --draft-p-min 0` at the default draft width
+3 (J5: +49% on chat follow-ups). Stale comment lines in the script: draft width 4 and `ngram-mod` were
+measured and rejected; `-ctk/-ctv q8_0` is not supported on the tile attention path.
+
+What b11436 changes at the serving level (P100-PATCHES.md, rebase section): `preserve_reasoning` is on
+by default (earlier turns' reasoning stays in the prompt; `--no-reasoning-preserve` for the old
+behaviour); context checkpoints are kept until the list is full, so a long chat holds up to
+`--ctx-checkpoints` (default 32) x 150 MB of host memory per slot, 5.6 GB measured; `--mmap`,
+`--no-mmap`, `--mlock` and `-dio` no longer exist (`-lm/--load-mode`), the script uses none of them.
 
 No GPU or host state changes are needed or useful: no power limit (tg draws ~155 W per card and is
 flat down to a 175 W cap; only pp is clipped), persistence mode is a no-op on this host, stock
@@ -58,8 +66,8 @@ governor and C-states. Do not set compute mode EXCLUSIVE_PROCESS: the router run
 
 Before serving a GGUF the branch has not run (plan gotcha 31): run the `GGML_A16K_CHECK=1` sample from
 step 2 with that model (`--jinja` instead of `-no-cnv` for chat models with a strict template), then
-compare a greedy chat reply against the same command with `GGML_CUDA_DISABLE_MMVQ_F16_K=1` (stock
-math). The two replies should read the same; byte-identical is not required (F16 accumulation). If
+compare a greedy chat reply against the same command with `GGML_CUDA_DISABLE_MMVQ_F16_K=1
+GGML_CUDA_FATTN_TILE_LEGACY=1` (stock math). The two replies should read the same; byte-identical is not required (F16 accumulation). If
 anything looks off, serve with that variable set (costs ~8% tg) and note it.
 
 ## 5. Kill switches worth knowing (full table in P100-PATCHES.md, "Runtime knobs")
@@ -78,7 +86,10 @@ anything looks off, serve with that variable set (costs ~8% tg) and note it.
 
 `P100-PATCHES.md`, "Updating to a new upstream": the branch is a linear series, so it is one
 `git rebase` onto the new master, then the test checklist there. Rebase patches 17/19/40/42 as a
-group (one kernel); 23/24 sit in `ggml_cuda_try_fuse`, which upstream reworks now and then.
+group (one kernel); 23/24 sit in `ggml_cuda_try_fuse`, which upstream reworks now and then. After
+every rebase check the `launch_fattn` call of patch 36 against upstream's parameter list (b11436 added
+`use_sparse` in front of `warp_size` and a clean merge compiled into a wrong call), and run
+`test-llama-archs` several times (patch 45's bug crashed only some runs).
 
 ## 7. What is left
 
