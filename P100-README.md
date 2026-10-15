@@ -48,12 +48,23 @@ and runs out of memory. The pp512 number here is at `-ub 512` and is not the pro
 ## 3. Serve
 
 `~/llama-serve.sh` points at `/home/krk/llama.cpp/build/bin/llama`, which is the new build after
-step 1, so nothing in it has to change for the update. As read on 2026-10-06 it runs `llama serve`
-(router, `--models-dir`) with `NCCL_P2P_LEVEL=SYS --split-mode tensor -fa on -b 2048 -ub 2048
--c 149000 --parallel 1 --cache-ram 16384 --jinja`, and its MTP lines are comments. The recommended
-configuration (plan section 7) adds `--spec-type draft-mtp --draft-p-min 0` at the default draft width
-3 (J5: +49% on chat follow-ups). Stale comment lines in the script: draft width 4 and `ngram-mod` were
-measured and rejected; `-ctk/-ctv q8_0` is not supported on the tile attention path.
+step 1, so nothing in it has to change for the update. As read on 2026-10-15 (edited by the user on
+2026-10-07) it runs `llama serve` (router, `--models-dir`) with `NCCL_P2P_LEVEL=SYS --split-mode tensor
+-fa on -b 2048 -ub 2048 -c 145000 --parallel 1 --cache-ram 16384 --jinja --chat-template-file
+/mnt/hdd/gguf/chat_template.jinja --reasoning-format deepseek -ctk q8_0 -ctv q8_0 --spec-type draft-mtp
+--draft-p-min 0`, and the client requests Qwen3.8-27B UD-Q6_K. That is option A of plan section 7,
+validated on this branch on 2026-10-15 (plan item C9):
+
+- It works: a 139k-token chat plus near-exact prefix-hit follow-ups, no crash; greedy output matches
+  stock with the two stock-math switches of section 4, perplexity equals stock.
+  `-sm tensor` does take quantized KV (upstream #23792); older notes here said otherwise.
+- It is at the memory wall: 16181 of 16269 MiB per card at peak. Do not raise `-c`: 147500 still runs,
+  150000 loads and then kills the server on its first request. Keep MTP width 3 (width 1 is slower).
+- q8_0 KV costs nothing on prompt processing and 1% / 5% / 11% of MTP generation at depth 0 / 32k /
+  100k against F16 KV, which on Q6_K fits only `-c 100000`. Q4_K_M with F16 KV at `-c 160000` is
+  22-35% faster than option A and holds more context; the quality difference is the open item QL1.
+
+Stale comment lines in the script: draft width 4 and `ngram-mod` were measured and rejected.
 
 What b11436 changes at the serving level (P100-PATCHES.md, rebase section): `preserve_reasoning` is on
 by default (earlier turns' reasoning stays in the prompt; `--no-reasoning-preserve` for the old
@@ -96,6 +107,9 @@ every rebase check the `launch_fattn` call of patch 36 against upstream's parame
 
 ## 7. What is left
 
+Next session: QL1 (plan "Final" table), answer quality of Q6_K vs Q4_K_M and of q8_0 vs F16 KV,
+especially at long context near the max `-c`; it decides between the options of plan section 7.
+
 Plan roadmap "Deferred code items": E2 (0.4% tg), D4 (0.4%), the delta-net conv chain (0.8%), F9
-(unverified), and the Tier 3 research items. Everything above 1% that remains sits inside the matvec
+(unverified), and the Tier 3 research items (C7 is now quantized-KV attention speed only). Everything above 1% that remains sits inside the matvec
 kernels and NCCL. Rejected with numbers so nobody repeats them: B2, E7, E8, G2/G3, F5, C3, C4.

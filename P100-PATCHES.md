@@ -1119,6 +1119,12 @@ LCP slot matching in the server.
   defect latent). With 41 the chat output is byte-identical to stock and tg is 1.63x stock. Every model
   that is new to the branch gets a run with `GGML_A16K_CHECK=1` and a chat greedy sample before it is
   served (plan gotcha 31).
+- Quantized KV under `-sm tensor` works on this branch (upstream #23792; the gist and patch 45 do not
+  break it). Validated 2026-10-15 with Qwen3.8-27B UD-Q6_K, `-ctk/-ctv q8_0`, `-c 145000`, MTP width 3
+  (plan item C9): 139k-token fill and prefix-hit follow-ups clean, greedy byte-identical to stock with
+  `GGML_CUDA_DISABLE_MMVQ_F16_K=1 GGML_CUDA_FATTN_TILE_LEGACY=1`, perplexity equal to stock. Widths 1-2
+  run upstream's VEC on q8_0 directly; width 3+ converts K/V to F16 (upstream) and then runs the TILE
+  kernel that patches 36/38 retune.
 
 ## Rejected after measurement, no patch number (plan rule 0.2)
 
@@ -1402,3 +1408,13 @@ on `qwen35` that the kill switches above do not explain points here first.
   and to v1 without them, the 53k-token prefix-hit check clean (follow-up prompt phase 445.4 vs 445.5 ms).
   Alternated bench v1 / v2: pp512 256.44 / 256.61, pp2048 454.85 / 455.40, tg128 32.49 / 32.53 t/s, all
   inside the spread.
+- 2026-10-15: production config check (plan item C9, report `~/p100-opt/kvq8/REPORT.md` on krk-lab,
+  measurement only, no code change). The user's production line (Qwen3.8-27B UD-Q6_K, `-ctk/-ctv q8_0`,
+  `-c 145000`, MTP width 3, `-sm tensor`) runs on this branch: 139472-token fill and two prefix-hit
+  follow-ups clean, 16181 of 16269 MiB per card at peak (147500 runs, 150000 aborts on the first decode).
+  FLASH_ATTN_EXT 3991/3991; greedy with q8_0 byte-identical to stock with the two switches (284-token and
+  31.6k-token prompts); perplexity q8_0 6.0922 branch = stock, F16 6.0851. q8_0 vs F16 on Q6_K: pp equal,
+  MTP tg 0.99x / ~0.95x / 0.89x at depth 0 / 32k / ~100k, plain tg 0.71x at 100k. Q4_K_M + F16 at
+  `-c 160000` is 22-35% faster than the production line. The docs' claim that `-sm tensor` refuses
+  quantized KV was wrong since upstream #23792 (b9455) and is corrected in the plan (area C, H5, C7,
+  gotchas 12/15/32, section 7) and the README.
