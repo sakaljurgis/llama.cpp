@@ -37,18 +37,18 @@ SRV_BUILD=~/p100-opt/llama.cpp/build           # built by ~/p100-opt/build-all.s
 CUDA=/usr/local/cuda-12.6                      # export PATH=/usr/local/cuda/bin:$PATH; cmake 3.22 (no arch "native"), gcc 11.4, nsys 2024.5.1, nvprof, NCCL 2.30.7, driver 580.173.02
 GPUS="CUDA_VISIBLE_DEVICES=GPU-caf732cd-6831-4ec5-61b0-2e6fc172b1ee,GPU-b86ac28c-57b4-7387-c86f-79fc17819a1a"   # the two P100s; index 2 is a Quadro K2200 display card and must stay excluded
 M=/mnt/hdd/gguf                                # HF cache layout (LLAMA_CACHE), files are symlinks into blobs
-MODEL_Q4=$M/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf     # 16.5 GB, production
-MODEL_Q6=$M/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q6_K.gguf       # 22.0 GB
+MODEL_Q4=$M/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf     # 16.5 GB, the measurement model of this plan
+MODEL_Q6=$M/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q6_K.gguf       # 22.0 GB, the model production served on 2026-10-15 (with -ctk/-ctv q8_0, C9)
 MODEL_IQ4=$M/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-IQ4_XS.gguf    # 14.3 GB (patches 29/30 territory)
 MODEL_GEMMA=$M/models--unsloth--gemma-4-31B-it-GGUF/snapshots/c1ac76e99d5513b141e8adde7288b85c3f9c32ec/gemma-4-31B-it-UD-Q4_K_XL.gguf  # 18.8 GB
 MODEL_MOE=$M/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf  # 22.1 GB MoE (07/08/09 live)
-SERVER_FLAGS: router `llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --tools all --split-mode tensor --cache-ram 16384 --jinja -ngl 99 -c 160000 --parallel 1 -fa on -b 2048 -ub 2048 --no-mmproj-offload --spec-type draft-mtp --draft-p-min 0`
-              started by ~/llama-serve.sh (also sets LLAMA_CACHE=/mnt/hdd/gguf NCCL_DEBUG=INFO and the GPUS line above); child per model adds --ctx-size 160000 --cache-ram 16384 --batch-size 2048 --ubatch-size 2048
-              production binary: /home/krk/llama.cpp/build/bin/llama (branch `p100`, old b10630-based tip; do not touch)
+SERVER_FLAGS: router `llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --split-mode tensor --cache-ram 16384 --jinja --chat-template-file /mnt/hdd/gguf/chat_template.jinja --reasoning-format deepseek -ngl 99 -c 145000 --parallel 1 -fa on -b 2048 -ub 2048 --no-mmproj-offload -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --draft-p-min 0`
+              started by ~/llama-serve.sh (as read 2026-10-15, edited by the user 2026-10-07; also sets LLAMA_CACHE=/mnt/hdd/gguf NCCL_P2P_LEVEL=SYS and the GPUS line above); the router child that ran on 2026-10-15 served MODEL_Q6 (the client picks the model from --models-dir). The 2026-09-03 line had -c 160000, F16 KV and --tools all
+              production binary: /home/krk/llama.cpp/build/bin/llama (branch `p100-b11436` since 2026-10-06; do not touch)
 SUDO=no                                        # no clock/power/persistence/IOMMU changes possible; record and recommend only
-PROD_PAUSE=not-needed                          # user 2026-09-03: production is not in use; agents may stop a `llama serve` process if one appears and must NOT restart it (no `llama-serve.sh` runs by agents)
+PROD_PAUSE=ask                                 # user 2026-09-03: production was not in use then and agents could stop it. Since 2026-10-15 it is in use again: GPU work needs the user's word that the GPUs are free, and a production process that appears is never stopped (the kvq8 scripts abort instead). No `llama-serve.sh` runs by agents
 NUMERICS=perplexity                            # user 2026-09-03: changes may alter low-order bits if llama-perplexity stays within 0.5% of stock and P100-PATCHES.md documents it
-MODELS=Qwen3.8-27B Q4_K_M (primary), Gemma-4 31B UD-Q4_K_XL, Qwen3.6-35B-A3B MoE (secondary)
+MODELS=Qwen3.8-27B Q4_K_M (primary for measurements; production runs its Q6_K), Gemma-4 31B UD-Q4_K_XL, Qwen3.6-35B-A3B MoE (secondary)
 ```
 
 Server rule from the user: do not change settings or files on krk-lab outside `~/p100-opt/`
@@ -603,11 +603,15 @@ Current behavior on sm_60 (no `p100:` commit touches `fattn*`; this is stock ups
 - Stream-k and the fixup kernels are inert on sm_60; long-KV parallelism comes only from
   `parallel_blocks` + `flash_attn_combine_results`. The `parallel_blocks` search probes occupancy
   with `cudaOccupancyMaxActiveBlocksPerMultiprocessor` and stops at 95% efficiency.
-- `-sm tensor` requires FA on and refuses quantized KV entirely ("simultaneous use of
-  SPLIT_MODE_TENSOR and KV cache quantization not implemented"). Under `-sm layer`, quantized KV
-  at batch > 2 falls to TILE, which dequantizes the whole K and V cache to F16 into the pool on
-  every call: a per-step bandwidth cost that grows with context. So on this machine KV
-  quantization is a memory tool, not a speed tool, and it is unavailable in the user's mode.
+- `-sm tensor` requires FA on. It accepts quantized KV: upstream #23792 (8e6fff84d, b9455, in every
+  base this branch ever had) removed the "simultaneous use of SPLIT_MODE_TENSOR and KV cache
+  quantization not implemented" refusal that this paragraph used to quote (corrected 2026-10-15, C9).
+  With quantized KV, widths 1-2 take VEC, which reads q8_0 directly but has no GQA packing; width 3+
+  (MTP verify, pp) takes TILE, which converts that layer's whole K and V view to F16 on every call
+  into the FA op's extra buffer. That buffer is part of the reserved compute buffer (+~400 MiB per
+  card at 145k on Qwen3.8-27B), not the pool, so memory does not grow with depth. Both costs grow
+  with context; VEC is the larger one (C9). On this machine KV quantization is a memory tool, not a
+  speed tool: q8_0 holds ~45% more context than F16 for 1% (depth 0) to 11% (100k) of MTP tg.
 - The KV cache is sharded across the two cards under `-sm tensor` (axis 0, same segmentation as
   `attn_output.weight`), so attention itself moves nothing over PCIe.
 - No defrag exists any more; `llama_kv_cache::update` only does cross-stream copies and the RoPE
@@ -617,7 +621,7 @@ Correction (2026-09-05, C2 measurements): the primary model is D=256 with GQA 6 
 heads; 12 and 2 per GPU under `-sm tensor`), not D=128; the Tier 0 C1 numbers at GQA 4 and 8 do not
 bracket it, because the launcher packs by powers of two and 6 landed on `ncols2 = 2` (three blocks
 per kv head each streaming the whole K/V); and only the tile kernel is ever selected for this model
-(every launch is in `~/p100-opt/log/C2-41.log`). The table's `occupancy` field is a register budget
+with F16 KV (every launch is in `~/p100-opt/log/C2-41.log`; with q8_0 KV widths 1-2 take VEC, C9). The table's `occupancy` field is a register budget
 (`65536/(nthreads*occupancy)`), not a block count: every `ncols 2/4` FP16 entry at 64/128 threads
 and occupancy 2 has no effective register limit. Patch 36 fixes the D=256 entries; the D=128 ones
 are probably the same one-line fix (unmeasured).
@@ -679,13 +683,38 @@ Items:
   GQA 8, untouched); logit softcap only selects a template. iSWA layers use a small cache
   (`n_swa`), so their attention cost is flat. Verify `-sm tensor` supports the gemma4 arch before
   planning anything else for it; `test-llama-archs` runs every arch through the meta backend.
-- C7 KV quantization under `-sm tensor` (research, tier 3): implementing quantized K/V shards in
-  the meta backend would halve KV memory (more context or a second slot) but cost tg through the
-  TILE dequant-per-call behavior above. Only worth it after C2/C3 if VEC wins for tg (VEC reads
-  quantized KV natively). Do not start before then.
+- C7 DONE UPSTREAM (found 2026-10-15): quantized K/V shards in the meta backend are upstream #23792
+  (8e6fff84d, b9455) and work on this branch under `-sm tensor` (C9). The original item assumed they
+  were missing. What is left is speed only, tier 3: a GQA-packed VEC for quantized K/V (widths 1-2 run
+  at 0.67-0.74x of F16 at 100k; VEC runs with ncols2 1, i.e. no GQA packing), or TILE
+  reading q8_0 without the per-call F16 conversion (width 4 at 0.88x of F16 at 100k).
 - C8 Non-FA path check: with `-fa auto` a `NONE` verdict silently disables FA (`-fa on` errors
   instead). Always run the server with `-fa on` so a future kernel-selection regression is a
   startup error, not a silent 2x slowdown.
+- C9 DONE 2026-10-15 (kvq8, measurement only; Opus agent, report `~/p100-opt/kvq8/REPORT.md`, scripts
+  and every command line in `~/p100-opt/kvq8/`): the production line of 0.1 (Q6_K, `-ctk/-ctv q8_0`,
+  `-c 145000`, MTP width 3) on the branch build.
+  - Works: filled to 139472 tokens, two near-exact prefix-hit follow-ups, no crash, OOM or assert.
+  - Memory per card: 15779 MiB after load, 16181 MiB peak of 16269 usable (~88 MiB free), reached at
+    the first ubatch and flat to 140k. KV 2409.75 MiB (q8_0, 17 KiB per token per card; F16 is 32 KiB),
+    recurrent 299.25, compute 1534.34 (F16 at 100k: 959; at equal `-c` q8_0 adds ~400 MiB, the conversion buffer above),
+    MTP draft context KV 283.50 (F16: the draft takes `-ctkd/-ctvd`, default f16, not `-ctk/-ctv`) and
+    compute 839.06. Walls in gotcha 32.
+  - Speed, q8_0 / F16 on Q6_K, llama-bench `-r 5`: pp2048 0.995-1.001x at depths 0-100k; tg64 0.983 /
+    0.961 / 0.881 / 0.790 / 0.707x at 0 / 8k / 32k / 64k / 100k; per-step pp1 (VEC) 0.744x, pp2 (VEC)
+    0.673x, pp4 (TILE + conversion) 0.883x at 100k.
+  - Server MTP width 3, same request (256 tokens, temp 0; the Q6 answers are identical at 0 and ~100k and
+    differ at 32k, so compare ms per step there), t/s at depth 0 / 32k / ~100k: Q6 q8_0 @145k 40.3 /
+    39.9 / 25.0, Q6 F16 @100k 40.9 / 38.2 / 28.0, Q4_K_M F16 @160k 49.1 / 43.8 / 33.8. ms per verify
+    step 68.7 / 78.8 / 101.0 (113.7 at 140k) vs 67.8 / 75.0 / 90.1 vs 59.1 / 66.1 / 82.0. MTP width 1
+    on q8_0 is slower at every depth (31.3 at 32k, 21.1 at 100k): keep width 3.
+  - Correct: `test-backend-ops -o FLASH_ATTN_EXT` 3991/3991 (367 q8_0 cases; none at this model's GQA
+    6 with q8_0, none at D=256 q8_0 with 2-4 columns, none over 16384 used KV rows). Greedy with q8_0:
+    branch with `GGML_CUDA_DISABLE_MMVQ_F16_K=1 GGML_CUDA_FATTN_TILE_LEGACY=1` byte-identical to stock
+    on a 284-token and a 31.6k-token prompt; branch defaults differ only through patches 32/33.
+    Perplexity (wiki.test.raw, `-c 2048`, 20 chunks): branch q8_0 6.0922 = stock q8_0 6.0922, branch
+    F16 6.0851 (q8_0 +0.12%), Q4_K_M F16 6.0806; at `-ub 2` / `-ub 4` (5 chunks) branch vs stock q8_0
+    +0.03% / +0.11%. A 20-chunk run at 2k context cannot separate Q4_K_M from Q6_K (+/-0.10): QL1.
 
 ### Area D: delta-net (GDN) layers of `qwen35`
 
@@ -976,7 +1005,8 @@ Current state: both cards at ~94% after load with `-c 200000 -np 1`. The VMM poo
 virtual range per device and grows physical backing as a high-water mark that is never returned;
 one wide LM-head cuBLAS call (~1.3 GB F16 per card) raises it permanently, which is the OOM in the
 runtime notes. Compute buffers are sized by the pp reserve at `min(n_ctx, n_ubatch)` tokens.
-Quantized KV is unavailable under `-sm tensor`. Patch 10's q8_1 cache is a raw `cudaMalloc` that
+Quantized KV works under `-sm tensor` (upstream #23792; this line said the opposite until 2026-10-15):
+q8_0 takes 17 KiB per token per card on Qwen3.8-27B against 32 KiB for F16 (C9). Patch 10's q8_1 cache is a raw `cudaMalloc` that
 grows and never shrinks (small).
 
 Items:
@@ -996,9 +1026,10 @@ Items:
   (verify it is supported for the hybrid memory: `llama_memory_hybrid` with unified KV; run
   `llama-server --help` and a smoke test). Only if the user wants concurrent requests; tg per
   request drops because the step is launch-bound, not because of bandwidth.
-- H5 If the F16 KV size at 200k is the dominant consumer (H1 will show it: 16 attention layers x
-  2 x n_head_kv x 128 x 2 bytes per token), the only reductions on this branch are a smaller
-  `-c` or C7 (quantized KV in the meta backend, tier 3).
+- H5 ANSWERED 2026-10-15 (C9): F16 KV is 16 attention layers x 2 x 4 kv heads x 256 x 2 bytes = 64 KiB
+  per token, 32 KiB per card under `-sm tensor` (3128 MiB per card at `-c 100000`). The reductions are
+  `-ctk/-ctv q8_0` (17 KiB per token per card, works under `-sm tensor`, costs tg at depth, C9) or a
+  smaller `-c`. The original text used head size 128 and named C7 as the only way; both were wrong.
 
 ### Area I: sampling and the CPU side
 
@@ -1280,7 +1311,7 @@ Keep mmap.
 | A7 | HFMA2 tiled GEMM with in-register dequant | removes the F16 round trip and temporaries | cuBLAS is already at ~68-80% of peak |
 | F7 | P2P direct allreduce kernel for 2 GPUs | < 10 us per collective vs 20-40 | needs stable P2P; Pascal has no `__nanosleep` |
 | G4 | fewer subgraph boundaries in the meta backend | 1 CUDA graph per device per token | deep change in `ggml_backend_meta_graph_compute` |
-| C7 | quantized KV shards in the meta backend | context or slots | TILE dequantizes the whole cache per call; only with VEC |
+| C7 | quantized-KV attention speed: GQA-packed VEC for q8_0, or TILE without the per-call F16 conversion (the shards themselves are upstream #23792, C9) | q8_0 MTP tg at 100k is 0.89x of F16, plain tg 0.71x | only matters if production keeps q8_0 KV past ~32k; VEC and TILE are upstream-churned files |
 | I3 | backend sampling with vocab-sharded logits | removes 1 MB D2H + CPU sort per token | small share; needs meta-aware gather |
 | F8 | fewer collectives per layer (sequence parallel) | halves PCIe traffic | model-graph rewrite |
 
@@ -1301,7 +1332,7 @@ table). Nothing in this list is killed; the numbers say what each is worth if it
 | C5, C8 | 8 vs 16-byte loads on sm_60 (`ggml_cuda_get_max_cpy_bytes`); the `-fa auto` NONE-verdict check | small; a correctness check | one-hour items |
 | D2 | GDN kernel occupancy | pp only (GDN is 6.1% of pp, 1.9% of tg) | nvprof |
 | A4b, Q6_K ceiling, A6 | row-keyed cuBLAS chunk rule; a higher patch 35 ceiling for the wide LM head; MMQ-for-dense number | non-production shapes only (`ngram-mod`, all-logits, Gemma) | - |
-| A7, C7, F7, F8, G4, I3 | Tier 3 research: HFMA2 tiled GEMM, quantized KV shards, P2P allreduce kernel, sequence parallel, fewer meta subgraphs, backend sampling | the only remaining double-digit levers, weeks each | see the Tier 3 table |
+| A7, C7, F7, F8, G4, I3 | Tier 3 research: HFMA2 tiled GEMM, quantized-KV attention speed, P2P allreduce kernel, sequence parallel, fewer meta subgraphs, backend sampling | the only remaining double-digit levers, weeks each | see the Tier 3 table |
 | H3, H5, K2, J7, deliverable 4 | not code: compute buffer vs `-ub`, KV share at 200k, host RAM budget with `--cache-ram 0`, router respawn losing the host cache, the final recommended server command line | memory and operations | can ride along with the root session |
 
 Closed at the same time as effectively dead (no measurement needed): A5 (pays only at small `-ub`, the
@@ -1316,6 +1347,8 @@ shift), I5 (folded into PL3).
 |---|---|---|---|
 | PL1 | DONE 2026-09-09 (measurement, `~/p100-opt/pl/PL-report.md`, log entry): 7 arms 250/225/200/175/150/125/250 W, one llama-server per MTP arm. tg is flat to 175 W because each card draws only ~155 W at tg (peak 168): tg d0 32.04 at every limit from 250 to 175, MTP chat 39.5 t/s everywhere down to 175, joules per tg token unchanged. pp follows the clock: pp2048 447.8 / 444.0 / 432.1 / 415.0 / 395.1 / 349.1 t/s at 250 / 225 / 200 / 175 / 150 / 125 W (-0.9 / -3.5 / -7.3 / -11.8 / -22.0%), pp mean clock 1328 -> 1316 -> 1265 -> 1198 -> 1140 -> 984 MHz. At 150 W tg loses 1.0-1.4% and MTP 0.4% for -12% energy per token; at 125 W tg -6.5 to -7.2%. Tolerance summary: within 1% of tg -> 175 W (pp -7.3%), within 2% or 5% -> 150 W (pp -11.8%); the tg knee is between 150 and 165 W. No thermal slowdown at any limit (max 64 C against 82), peak board power 237 W per card, `pviol` 0 at 250 W: the PSU is not stressed. Confirmed by the user's wall meter: whole-system draw unchanged down to 175 W, -50 W at 150 W, -100 W at 125 W. Verdict: keep 250 W (a limit only clips pp and saves nothing at tg); 175 W is the setting if a lower peak (160 W per card instead of 237) is ever wanted for the chassis | no tg to gain; pp -7% at 175 W | - |
 | PL2 | DONE 2026-09-09: persistence mode is a NO-OP on this host. The Quadro K2200 display card and `nvidia_modeset` hold the `nvidia` module loaded permanently (refcount 19), so the driver never tears the GPUs down between processes: CUDA init 327 vs 337 ms and init + load + 1 token 5174 vs 5161 ms with persistence on vs off (medians of 3, inside the noise), and a 200 W power limit survived `pm off` plus a CUDA process exit. The user's daemon fix is harmless and stays on. Router respawns pay the 4.2 s model load only (K1) | 0 | - |
+| C9 | DONE 2026-10-15 (kvq8): the production line with Q6_K and q8_0 KV works and matches stock; speed and walls in area C9, options in section 7 | - | - |
+| QL1 | OPEN (user, 2026-10-15; next session): measure answer quality of Q6_K vs Q4_K_M and of q8_0 vs F16 KV, especially at long context close to the max `-c`. Q4_K_M + F16 is the fastest option and holds the most context (section 7), so the question is what Q6_K and q8_0 cost or buy in quality. The C9 perplexity (`-c 2048`, 20 chunks) cannot separate the two quants (+/-0.10) and says nothing about 100k+. The method is still to be designed | decides the production option of section 7 | C9 |
 | PL3 | DONE 2026-09-09: zero. ASPM not testable (both P100 links report `ASPM not supported`). Governor `performance` vs `schedutil`: tg d0 32.24/32.23 vs 32.24/32.27 t/s, MTP 40.11 vs 40.10, with the CPUs at 3390 vs 1740 MHz mean - the host clock does not matter. `cpu_dma_latency` held at 0 vs not: 32.03/32.04 vs 32.05/32.02, MTP 39.51 vs 39.53. Both together: 32.04 vs 32.04. All MTP arms byte-identical (draft_n 636, accepted 298) | 0 | - |
 
 ### What not to do
@@ -1323,8 +1356,12 @@ shift), I5 (folded into PL3).
 - Do not touch `ggml-backend-meta.cpp` beyond what F/G need; upstream churns it and the gist
   already carries a 236-line rewrite. Every extra line there is rebase cost.
 - Do not retune MMQ for dense on sm_60 (A6 is a one-off number, not a project).
-- Do not try quantized KV, `-sm row`, `GGML_CUDA_FORCE_MMQ`, `GGML_CUDA_PEER_MAX_BATCH_SIZE`,
-  or unified memory; the reasons are in Part 2.
+- Do not try `-sm row`, `GGML_CUDA_FORCE_MMQ`, `GGML_CUDA_PEER_MAX_BATCH_SIZE`, or unified memory;
+  the reasons are in Part 2. (Quantized KV was on this list until 2026-10-15 on the false premise that
+  `-sm tensor` refuses it; it works and is a memory-for-speed trade, C9.)
+- Do not raise `-c` past the walls in gotcha 32 on the strength of a clean load: an over-limit `-c` loads
+  and then aborts the whole server on its first decode. Do not drop MTP to width 1 to keep q8_0 KV on
+  VEC: it is slower at every depth (C9).
 - Do not add tests under `tests/`; use `test-backend-ops` cases and the protocol in section 4.
 - Do not retry the IQ4_XS HFMA2 matvec at widths 1-3 with a better table lookup (B4b, 2026-09-04):
   its int8 path already runs at ~400 GB/s on GP100 (70% of the DRAM ceiling, 78 us on 4096x14336),
@@ -1538,7 +1575,8 @@ llama.cpp behavior on this hardware:
 
 11. CUDA graphs are hard-disabled below Volta; every kernel is launched individually. This is
     the single most important fact for tg on this machine.
-12. `-sm row` no longer exists on CUDA; `-sm tensor` needs `-fa on` and F16/BF16/F32 KV only.
+12. `-sm row` no longer exists on CUDA; `-sm tensor` needs `-fa on`. It also takes quantized KV (upstream
+    #23792; until 2026-10-15 this line said F16/BF16/F32 only, C9).
 13. Backend (GPU) sampling is refused under `-sm tensor`; CPU sampling patches 11/13 are the relief.
 14. The sampler prefilter (patch 13) turns itself off with any logit-bias sampler in the chain (a
     request `logit_bias`; vocab suppress tokens would too, but none of the three GGUFs has any), and
@@ -1551,7 +1589,10 @@ llama.cpp behavior on this hardware:
     value of 0.0 still counts: `tools/server/server-schema.cpp` pushes the entry whatever the value
     and `common_sampler_prefilter_nkeep` only tests `!logit_bias.empty()` (J5, 2026-09-08).
 15. FA at tg with F16 KV and GQA uses the TILE kernel, not VEC, and the Pascal FP16 tile table is
-    an upstream TODO. Quantized KV at batch > 2 dequantizes the whole cache per call.
+    an upstream TODO (patches 36/38 retune it). Quantized KV at widths 1-2 uses VEC with no GQA packing
+    (the larger cost: 0.67-0.74x of F16 per step at 100k); at width 3+ it uses TILE after converting the
+    layer's whole K/V view to F16 per call (0.88x at width 4). The conversion target is the FA op's
+    extra buffer inside the reserved compute buffer, not the pool (C9).
 16. `GGML_CUDA_FORCE_MMQ` cannot enable MMQ for dense matmul on sm_60; the DP4A rule returns first.
 17. cuBLAS temporaries are per-call pool allocations of the whole weight matrix in F16; the VMM
     pool never shrinks, so one wide LM-head call permanently raises the high-water mark (the OOM).
@@ -1606,7 +1647,11 @@ llama.cpp behavior on this hardware:
     (176128 loads and then aborts on the first decode); at width 1, 176128 runs and 184000 fails at
     load. One unit of draft width is worth about 1800 tokens of `-c`. None of this is moved by patch
     44: with MTP the LM head only reaches cuBLAS at 32 draft tokens, which does not load (J5,
-    2026-09-08; supersedes the earlier A4 note that put the wall at 40).
+    2026-09-08; supersedes the earlier A4 note that put the wall at 40). Those walls are for Q4_K_M
+    with F16 KV. For Q6_K at width 3 (C9, 2026-10-15): F16 KV 102500 runs and 105000 aborts on the first
+    decode; q8_0 KV 147500 runs (8 MiB free) and 150000 aborts on the first decode. With MTP each 1000
+    tokens of `-c` cost ~40.5 MiB per card with F16 and ~30 MiB with q8_0. The MTP draft context keeps
+    F16 KV under `-ctk/-ctv q8_0` (it takes `-ctkd/-ctvd`; 283.5 MiB per card at 145k).
 33. `test-backend-ops -o MUL_MAT` cannot reach the cuBLAS dense path on this branch: its quantized
     cases are 16 rows x k=256 with n <= 9, which patch 35 routes through the MMVQ column loop, so 0
     of 1253 cases exercise the src0 conversion. Forcing it needs
@@ -1723,24 +1768,46 @@ Original list:
    and one NOPASSWD sudoers line for user krk, installed by the user for the session, logged to
    `/var/log/p100-root.log`, removed afterwards.
 
-## 7. Recommended production configuration (deliverable 4, as of 2026-09-09)
+## 7. Recommended production configuration (deliverable 4, as of 2026-10-15)
 
-The recorded production line in 0.1 is right and stays. Everything below is what the measurements added
-or confirmed; nothing in the line itself changes.
+Production as of 2026-10-15 is option A (the user's script edit of 2026-10-07, the client requesting Q6_K; validated by C9):
 
 ```
 NCCL_P2P_LEVEL=SYS LLAMA_CACHE=/mnt/hdd/gguf CUDA_VISIBLE_DEVICES=<the two P100 UUIDs> \
-llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --tools all --split-mode tensor \
-  --cache-ram 16384 --jinja -ngl 99 -c 160000 --parallel 1 -fa on -b 2048 -ub 2048 --no-mmproj-offload \
+llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --split-mode tensor --cache-ram 16384 \
+  --jinja --chat-template-file /mnt/hdd/gguf/chat_template.jinja --reasoning-format deepseek \
+  -ngl 99 -c 145000 --parallel 1 -fa on -b 2048 -ub 2048 --no-mmproj-offload -ctk q8_0 -ctv q8_0 \
   --spec-type draft-mtp --draft-p-min 0
 ```
+
+Three options were measured on the branch build (C9; MTP width 3, server t/s on the same request,
+ms per verify step in brackets; perplexity at `-c 2048`, 20 chunks):
+
+| option | model + KV | `-c` (wall) | free per card at peak | t/s depth 0 | 32k | ~100k | ppl |
+|---|---|---|---|---|---|---|---|
+| A (production) | Q6_K + q8_0 | 145000 (147500 runs, 150000 aborts) | ~88 MiB | 40.3 (68.7) | 39.9 (78.8) | 25.0 (101.0) | 6.0922 |
+| B | Q6_K + F16 | 100000 (102500 runs, 105000 aborts) | ~206 MiB | 40.9 (67.8) | 38.2 (75.0) | 28.0 (90.1) | 6.0851 |
+| C (recommended 2026-09-09) | Q4_K_M + F16 | 160000 (168000, gotcha 32) | ~220 MiB | 49.1 (59.1) | 43.8 (66.1) | 33.8 (82.0) | 6.0806 |
+
+- A is the only way to run Q6_K past 100k and it works (139k fill plus prefix-hit follow-ups, output
+  matches stock). It costs 1% of MTP tg at depth 0, ~5% at 32k and ~11% at 100k against B, and it has
+  the least headroom: keep `-c 145000`, do not raise it (an over-limit `-c` loads and aborts the
+  server on its first decode), and keep MTP width 3.
+- B is the faster Q6_K option for chats that stay under 100k (+12% at ~100k).
+- C is faster than A at every depth (+22% at 0, +35% at ~100k) and holds the most context. Whether
+  Q6_K or q8_0 buys answer quality, especially near the max context, is not measured: the 20-chunk
+  perplexity cannot separate the quants. That is item QL1 (Final table), and it decides between A, B
+  and C. Until then A stays, by the user's choice of Q6_K.
+- `-ctkd q8_0 -ctvd q8_0` (MTP draft KV in q8_0) would free ~140 MiB per card on A but move the draft's
+  width-1 attention onto the slow VEC path; not measured.
+
+What the earlier measurements added, and still holds for every option:
 
 - `NCCL_P2P_LEVEL=SYS`: +1.5% pp, +0.9% tg (Tier 0.4); the only environment variable worth setting. Do
   not set `GGML_CUDA_P2P=1`, `GGML_CUDA_ALLREDUCE=none`, `NCCL_PROTO`, `NCCL_MAX_NCHANNELS`,
   `NCCL_SHM_DISABLE`, `CUDA_SCALE_LAUNCH_QUEUES` (all measured, none helps, several hurt).
 - `--spec-type draft-mtp` at the default `--spec-draft-n-max 3` (J5): +49% tg on 25k chat follow-ups; do
-  not widen the draft, do not add `ngram-mod`. `-c 160000` is the right size for MTP width 3 (the
-  largest that loads and runs is 168000, gotcha 32); 15.5 GiB per card in use at load.
+  not widen the draft, do not add `ngram-mod`. The `-c` walls per model and KV type are in gotcha 32.
 - `-b 2048 -ub 2048`: `-ub 512` costs 45% of pp (Tier 0). `-t 4 --poll 0` saves host power only.
 - `--cache-ram 16384` has no speed effect with `--parallel 1` (the slot is re-selected by prefix match,
   J1); `--cache-ram 0` would free 16 GiB of host RAM if the box ever needs it.
@@ -1751,10 +1818,10 @@ llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --tools all --
   (harmless, a no-op here), stock governor and C-states, ASPM not applicable, no application clocks
   (boost already sits at 1328 MHz under load). Do not set compute mode EXCLUSIVE_PROCESS (router
   children).
-- Binary: the branch build (`p100-b10758`, patches 01-30 + gist + p100x 31-44); the production
-  `/home/krk/llama.cpp` (branch `p100`, b10630 base) is 8-10% slower at tg and lacks patches 31-44.
-- `~/llama-serve.sh` already carries this exact line including `NCCL_P2P_LEVEL=SYS`; the only step is
-  rebuilding its binary from this branch. `P100-README.md` is the quick start for that.
+- Binary: the branch build. Production `/home/krk/llama.cpp` runs `p100-b11436` since 2026-10-06
+  (1.47x stock tg); the previous `p100-b10758` binaries are kept in `build-p100-b10758` as the fallback.
+- `~/llama-serve.sh` carries option A including `NCCL_P2P_LEVEL=SYS`. `P100-README.md` is the quick
+  start for rebuilding its binary from this branch.
 
 ## Appendix A: environment variables worth knowing (this tree)
 
