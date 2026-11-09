@@ -81,7 +81,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_pre_add = false, int max_cache = 6>
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_pre_add = false, int max_cache = 6, bool grid_loop = true>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -237,6 +237,11 @@ static __global__ void rms_norm_f32(const float * x,
                 for (int col = tid; col < ncols; col += block_size) {
                     store(col, xc[col]);
                 }
+            }
+
+            if constexpr (!grid_loop) {
+                // the grid covers every channel and sample: one iteration, no trailing sync
+                return;
             }
 
             if constexpr (block_size > WARP_SIZE) {
@@ -570,14 +575,28 @@ static void group_norm_f32_cuda(
 }
 
 // max_cache 6 so a 5376-wide row (Gemma 4) is cached too; GGML_CUDA_NORM_CACHE_LEGACY=1 keeps the old limit of 4
+// the grid-stride loop over channels/samples (#28175) only runs when grid.y/z were clamped: its state raises the
+// 1024-thread kernels above 32 registers (one block per SM instead of two) and costs ~0.5 us per single-row call
 template <bool do_multiply, bool do_add, bool do_scale, bool do_pre_add, typename... Args>
-static void rms_norm_f32_launch_1024(const ggml_cuda_kernel_launch_params & launch_params, Args &&... args) {
+static void rms_norm_f32_launch_1024(const ggml_cuda_kernel_launch_params & launch_params, const float * x, float * dst,
+        const int ncols, const int nchannels, const int nsamples, Args &&... args) {
     static bool legacy = getenv("GGML_CUDA_NORM_CACHE_LEGACY") != nullptr &&
                          std::atoi(getenv("GGML_CUDA_NORM_CACHE_LEGACY"));
+    static bool force_loop = getenv("GGML_CUDA_NORM_GRID_LOOP") != nullptr &&
+                             std::atoi(getenv("GGML_CUDA_NORM_GRID_LOOP"));
+    const bool grid_loop = force_loop || nchannels > UINT16_MAX || nsamples > UINT16_MAX;
     if (legacy) {
-        ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_scale, do_pre_add, 4>, launch_params, std::forward<Args>(args)...);
+        if (grid_loop) {
+            ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_scale, do_pre_add, 4, true>, launch_params, x, dst, ncols, nchannels, nsamples, std::forward<Args>(args)...);
+        } else {
+            ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_scale, do_pre_add, 4, false>, launch_params, x, dst, ncols, nchannels, nsamples, std::forward<Args>(args)...);
+        }
     } else {
-        ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_scale, do_pre_add, 6>, launch_params, std::forward<Args>(args)...);
+        if (grid_loop) {
+            ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_scale, do_pre_add, 6, true>, launch_params, x, dst, ncols, nchannels, nsamples, std::forward<Args>(args)...);
+        } else {
+            ggml_cuda_kernel_launch(rms_norm_f32<1024, do_multiply, do_add, do_scale, do_pre_add, 6, false>, launch_params, x, dst, ncols, nchannels, nsamples, std::forward<Args>(args)...);
+        }
     }
 }
 

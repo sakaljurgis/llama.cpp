@@ -215,8 +215,8 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-template <bool KDA, bool keep_rs_t>
-static void launch_gated_delta_net(
+template <bool KDA, bool keep_rs_t, int cols_per_warp>
+static void launch_gated_delta_net_cols(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
         float * dst_d, float * state_d,
@@ -234,7 +234,6 @@ static void launch_gated_delta_net(
     // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
     // SMs without a CTA, so small head counts keep the device filled
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
-    const int cols_per_warp = gdn_cols_per_warp;
     int num_warps = 4;
     while (num_warps > 1 && H*n_seqs*(S_v / (cols_per_warp * num_warps)) < nsm) {
         num_warps /= 2;
@@ -249,21 +248,21 @@ static void launch_gated_delta_net(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {
         case 16:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, cols_per_warp>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
                 beta_pre_d, beta_sig_d, s_base_d, s_rows_d, s_row_stride, s_gather_dst_d);
             break;
         case 32:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, cols_per_warp>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
                 beta_pre_d, beta_sig_d, s_base_d, s_rows_d, s_row_stride, s_gather_dst_d);
             break;
         case 64: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, cols_per_warp>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
@@ -271,7 +270,7 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, cols_per_warp>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
@@ -280,6 +279,22 @@ static void launch_gated_delta_net(
         }
         default:
             GGML_ABORT("fatal error");
+    }
+}
+
+// Pascal decode (up to 8 tokens per sequence: tg and MTP verify): one column per warp (the b11436 layout); the
+// four-column layout of #30087 is slower there, most of all with the state gather folded in (patch 24), but faster
+// for prompt batches. GGML_CUDA_GDN_COLS_PER_WARP=1|4 overrides.
+template <bool KDA, bool keep_rs_t, typename... Rest>
+static void launch_gated_delta_net(const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d,
+        const float * s_d, float * dst_d, float * state_d, int64_t S_v, int64_t H, int64_t n_tokens, Rest... rest) {
+    static const char * env = getenv("GGML_CUDA_GDN_COLS_PER_WARP");
+    const bool one_col = env ? atoi(env) == 1 :
+        n_tokens <= 8 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA;
+    if (one_col) {
+        launch_gated_delta_net_cols<KDA, keep_rs_t, 1>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, rest...);
+    } else {
+        launch_gated_delta_net_cols<KDA, keep_rs_t, gdn_cols_per_warp>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, rest...);
     }
 }
 
