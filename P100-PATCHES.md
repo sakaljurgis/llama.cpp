@@ -18,19 +18,19 @@ Every patch also carries its reasoning in the comments it adds to the source.
 
 ## Branch layout
 
-- Base: upstream `master` at `6753a033f` (`b11436` + 3 commits, master of 2026-10-06).
+- Base: upstream `master` at `f12aaa344` (tag `b11682`, master of 2026-10-16).
 - One commit per patch, subject `p100: NN-name`, in the original numeric order.
   Order matters: several patches touch the same lines and later ones build on earlier ones.
 - Commits after the patch series: the meta backend gist, this document, and local patches
   written for this machine with subject `p100x: NN-name`, numbered from 31 so they never collide
   with the upstream patch repo's 01-30 (see "Local patches" below). 09, 22 and 28 are not on the
-  branch (deferred, see below); 03 and 06 were dropped (superseded upstream, see below).
+  branch (deferred, see below); 03, 06 and 08 were dropped (superseded upstream, see below).
 - One branch per upstream base, named `p100-b<build>` (`p100-b10133`, `p100-b10630`,
-  `p100-b10758`, `p100-b11436`). A rebase starts a new branch and leaves the old one untouched, so
-  every build stays available for recovery. This document describes `p100-b11436`; what the rebase
-  from `p100-b10758` changed is in "Rebase onto 6753a033f (b11436)" below.
+  `p100-b10758`, `p100-b11436`, `p100-b11682`). A rebase starts a new branch and leaves the old one
+  untouched, so every build stays available for recovery. This document describes `p100-b11682`;
+  what the rebase from `p100-b11436` changed is in "Rebase onto f12aaa344 (b11682)" below.
 
-## Status per patch (against 6753a033f)
+## Status per patch (against f12aaa344)
 
 Scope tags are from the patch repo. "Fires" says whether the patch does anything for the
 models listed above; inert patches are kept to stay close to the upstream patch set.
@@ -42,23 +42,23 @@ models listed above; inert patches are kept to stay close to the upstream patch 
 | 04 | concat-non-cont-flat | CUDA | clean | qwen35 (delta-net) |
 | 05 | mmvf-f32-pascal | pre-Turing | clean | yes (batch 2-8 F32 matvec) |
 | 07 | mmvq-moe-rows-sm60 | all archs | clean | MoE only |
-| 08 | mmvq-mmid-batch-sm60 | pre-Volta | clean | MoE only |
+| 08 | mmvq-mmid-batch-sm60 | pre-Volta | **dropped** (b11682, superseded by #27828, see the rebase section) | MoE only |
 | 09 | mmvq-nwarps-small-k-sm60 | pre-Turing | **deferred** (see below) | MoE only |
-| 10 | mmvq-q8-1-activation-cache | CUDA | clean | yes |
+| 10 | mmvq-q8-1-activation-cache | CUDA | moved (b11682, #30420: initializers only) | yes |
 | 11 | penalties-direct | host | clean | yes (CPU sampling with penalties) |
 | 12 | mmvq-f16-sm60 | sm_60 | clean | Q4_1 only, inert for K-quants |
 | 13 | sampler-prefilter | host | fixed (see below); moved (b11436, #27694) | yes (CPU sampling) |
 | 14 | getrows-narrow-rows | CUDA | clean | with 15 |
-| 15 | mtp-draft-vocab | model | clean | off unless `LLAMA_MTP_DRAFT_VOCAB` is set |
+| 15 | mtp-draft-vocab | model | moved (b11682, #29600) | off unless `LLAMA_MTP_DRAFT_VOCAB` is set |
 | 16 | cpy-fastdiv | CUDA | clean | yes |
-| 17 | norm-register-cache | CUDA | moved (b11436, #29393) | yes |
-| 18 | fuse-sibling-nodes | CUDA | clean | CPY part only; the L2_NORM part is dead on qwen35 since #28068 |
-| 19 | fuse-pre-add-rms-norm | CUDA | moved (b11436, #29393) | yes |
+| 17 | norm-register-cache | CUDA | moved (b11436, #29393); rewritten (b11682, #28175) | yes |
+| 18 | fuse-sibling-nodes | CUDA | moved (b11682, #29807); fused L2_NORM refuses ne2/ne3 > 65535 | CPY part only; the L2_NORM part is dead on qwen35 since #28068 |
+| 19 | fuse-pre-add-rms-norm | CUDA | moved (b11436, #29393); rewritten (b11682, #28175) | yes |
 | 20 | fuse-add-unary-mul | CUDA (delta-net) | clean | qwen35 |
 | 21 | sched-reset-lazy | host | clean | yes |
 | 22 | decode-sched-slots | host | **deferred** (see below) | speculative decoding only |
-| 23 | fuse-gdn-beta-sigmoid | CUDA (delta-net) | clean | qwen35 |
-| 24 | fuse-gdn-state-gather | CUDA (delta-net) | clean | qwen35 |
+| 23 | fuse-gdn-beta-sigmoid | CUDA (delta-net) | fixed (b11682, #29353) | qwen35 |
+| 24 | fuse-gdn-state-gather | CUDA (delta-net) | fixed (b11682, #30087 / #29353) | qwen35 |
 | 25 | gdn-gather-single-snapshot | CUDA (delta-net) | clean | qwen35 |
 | 26 | cpy-fused-rows | CUDA | clean | yes |
 | 27 | fuse-concat-gather | CUDA (delta-net) | clean | qwen35 |
@@ -68,6 +68,7 @@ models listed above; inert patches are kept to stay close to the upstream patch 
 
 "clean" = applied by `git rebase` without conflict. That is not the same as compiled or
 measured; see the test checklist. "moved" = conflicted on that rebase and was resolved by hand.
+"fixed" = needed a source change on that rebase although it may have merged clean.
 
 The Qwen3.8-27B GGUF ships the MTP head; it is loaded and unused without speculative
 decoding. 14, 15 and 22 go live the moment MTP speculative decoding is switched on, so
@@ -136,12 +137,78 @@ keeping upstream's rule first and the patch rule after it; the rules match diffe
 the order does not matter. Patch content is unchanged (`git range-diff` against the b10630
 series shows context-only differences for 23, 24 and 29).
 
+On b11682 both needed source changes after merging clean (#30087 four state columns per warp: 24's
+gather indexing; #29353 GDN MMA kernel skipped while 23 or 24 is active), see "Rebase onto f12aaa344
+(b11682)". Patch 46 puts the decode GDN kernel back to one column per warp on Pascal.
+
 ### 28 top-k-partial
 
 Conflicts with upstream #27466 (`f8dbcd618`, "ROCm: add radix TOP_K for long rows"), which
 rewrote most of `top-k.cu`; the conflict is one block covering the whole region 28 edits. Only
 used with GPU (backend) sampling, which is off here, so deferred on 2026-09-02 instead of
 re-implemented. Revisit if GPU sampling is switched on.
+
+## Rebase onto f12aaa344 (b11682)
+
+2026-10-16: `p100-b11436` rebased onto `f12aaa344` (tag b11682, 243 upstream commits) as `p100-b11682`.
+Seven commits conflicted, two more merged clean but were wrong or unsafe, one was dropped:
+
+- 10, 32 (`common.cuh`): #30420 turned the stream/cuBLAS array initializers into `= {}`; the patches'
+  cache members stay in front of them.
+- 15 (`llama-model.cpp`): #29600 (Prism Hadamard weights) added `load_tensors_hadamard()` where the
+  patch calls `build_draft_head()`; both run, Hadamard first. `build_draft_head` now also declines a
+  Hadamard-folded LM head (`hdmd.rot` has `output`), because its draft path multiplies with
+  `ggml_mul_mat` directly and would skip the activation transform.
+- 17, 19, 40, 42 (`norm.cu`): #28175 moved the body of `rms_norm_f32` and `l2_norm_f32` into a
+  grid-stride loop over channel and sample (grid y/z clamped to 65535, `nchannels`/`nsamples` are kernel
+  arguments now, `__syncthreads()` after every iteration). The register cache (17, 40, 42) and the
+  pre-add prologue (19) were rewritten inside that loop with per-iteration pointers (`xc`, `dstc`,
+  `mulc`, `addc`, `pre_ac`, `pre_bc`, `pre_dstc`); the launch sites of 19 and 40 pass the two new
+  arguments and use the clamped grid. Same arithmetic, same order. The loop costs decode speed on
+  sm_60 (registers 30-32 -> 39-56 in the 1024-thread kernels); patch 46 runs it only when the grid
+  was clamped.
+- 18: #29807 put an SSM_SCAN -> CPY fusion where 18 adds its CPY / L2_NORM run merging; both kept
+  (different ops). 18's fused L2_NORM launch does not loop over excess channels like the new
+  `l2_norm_f32`, so `ggml_cuda_l2_norm_fused` now returns false for ne2 or ne3 > 65535.
+- 44 (`ggml-cuda.cu`): #29442 chunks F32-compute F16/BF16 src0 above 512 MiB in the caller and passes
+  non-contiguous dst views, with `ldc = nb1/sizeof(float)` as the GEMM leading dimension. 44's row-chunk
+  loop runs inside the impl and now uses `ldc` instead of `ne0`; the two compose (upstream's outer split
+  only for F32 compute, 44's for any compute type above `GGML_CUDA_CUBLAS_CHUNK_MB`).
+- 24 (`gated_delta_net.cu`), merged clean and wrong: #30087 gives each warp four state columns
+  (`lanes_per_col = warp_size/4`, `rows_per_lane = S_v/lanes_per_col`, row `i = r*lanes_per_col +
+  lane_in_col`). 24's fused GET_ROWS gather still read `i = r*warp_size + lane`: out of the column's
+  bounds and the wrong rows. Fixed to the new indexing. This is the decode path at `--parallel 1`.
+  The four-column kernel with the folded gather is also slower at decode on sm_60 (16.6 vs 11.9 us
+  per call); patch 46 uses one column per warp there.
+- 23, 24: #29353 added a chunked GDN MMA kernel that the op tries first. It does not know 23's folded
+  sigmoid or 24's folded gather, so the impl skips it when either is active. It only runs on Ampere
+  GA10x, Ada, Blackwell and DGX Spark, never on sm_60: no P100 gain from #29353, and the guard only
+  matters for the branch on newer cards.
+- 08 dropped: #27828 returns `MMVQ_MAX_BATCH_SIZE` for MUL_MAT_ID on `cc == GGML_CUDA_CC_PASCAL`, the
+  same as 08 on sm_60. 08 also lifted the cap for sm_61 and older, which its measurement did not cover.
+
+Checked and unchanged: 36's `launch_fattn` call (the fattn files did not change upstream except one
+dead `break`); the gist's grep rule (`ggml_backend_meta_buffer_simple_tensor(` = definition + the
+ensure call) still holds after #30453 / #30217 / #26610; 31 and 37 merged clean next to upstream's
+checkpoint work (#26004 checkpoints in the slot save file, #30498, #30567, #30574 draft state in the
+slot file), and a slot save/restore round trip on the production line restores the checkpoints and
+the draft state with identical follow-ups. 13 and #29797 (greedy sampler at temperature 0): the
+greedy check is byte-identical to stock.
+
+Upstream changes without a conflict that matter here:
+
+- #30087 (GDN four columns per warp) changes the decode reduction order: greedy output on long prompts
+  now differs from `p100-b11436` at a near-tied position (Q4_K_M, 22k-token prompt, ~75 tokens in), and
+  stock b11682 differs from stock 6753a033f the same way. The perplexity references moved with the base:
+  Q4_K_M F16 6.0806 -> 6.0638, Q6_K q8_0 6.0922 -> 6.1016 (20 chunks, branch = stock in both).
+- #30449 caps a pinned host buffer at 4 GB; #30327 reads the CUDA env vars once
+  (`ggml_cuda_fusion_disabled()`); upstream tags semver releases (v0.6.0, v0.7.0) next to b-tags.
+- `-ctkd/-ctvd q8_0` (MTP draft KV in q8_0) is not usable with option A of the plan: at `-c 145000` the
+  server loads with +482 MiB per card (the draft context reserves its own full-context F16 conversion
+  buffer for the TILE path) and aborts on the first request.
+
+New local patch 46 wins back most of the decode loss from #28175 and #30087 (section 46).
+Validation on krk-lab is in the change log (2026-10-16 and 2026-11-09).
 
 ## Rebase onto 6753a033f (b11436)
 
@@ -221,6 +288,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 43 | sampler-prefilter-grammar | host (sampling) | yes (every request that carries `tools` with `tool_choice` auto, the coding-harness shape, where patch 13 was off; the MTP verify step doubles the gain) |
 | 44 | cublas-src0-chunk | CUDA (all archs, measured on sm_60) | only above 256 MiB of converted src0, which on these models is exactly the LM head: `ngram-mod` verify batches (default 48-64), never for MTP in a configuration that runs (it would need `--spec-draft-n-max 32`, and J5 measured that widths above 10 do not survive a decode at `-c 160000`), every all-logits pass, and Gemma 4 31B, whose tied LM head is not row-split |
 | 45 | meta-scratch-free-gen | host (meta backend, `-sm tensor`) | yes (bug fix for the gist: every graph-external set/get/memset of a tensor after a meta buffer was freed) |
+| 46 | norm-gdn-decode | CUDA (norm: all archs; GDN: pre-Volta) | yes (every 1024-thread `rms_norm` launch of every model; the qwen35 GDN kernel at 1-8 tokens per sequence: tg and MTP verify) |
 
 ### 31 server-ckpt-adopt
 
@@ -278,6 +346,8 @@ takes a different continuation at a near-tied token.
 Kill switch `GGML_CUDA_DISABLE_MMVQ_F16_K=1` (restores the int8 path exactly); tuning knobs
 `GGML_A16K_ROWS`, `GGML_A16K_NWARPS`, `GGML_A16K_PF`, `GGML_A16K_SMALL_GRID`,
 `GGML_A16K_NCOLS_MIN`, `GGML_A16K_NCOLS_MAX`, `GGML_A16K_LOG=1`.
+
+b11682: the cache members in `common.cuh` sit in front of upstream's new `= {}` initializers (#30420).
 
 ### 33 mmvq-k-hfma2
 
@@ -841,6 +911,8 @@ Perplexity 5.4367, identical to base and stock; 256 greedy tokens byte-identical
 
 Kill switch `GGML_CUDA_NORM_CACHE_LEGACY=1`: the 4-value limit of patch 17. Rebase note: patches 17,
 19 and 40 all live in the `rms_norm_f32` kernel and its launchers; rebase them as a group.
+b11682: rewritten inside upstream's channel/sample grid-stride loop (#28175), see the rebase section;
+patch 46 adds the `grid_loop` template flag to the same kernel.
 
 ### 41 mmvq-k-f16-range
 
@@ -910,7 +982,7 @@ norms stop reading the row twice (patch 40 stopped at 5120). tg64 d0 28.630 -> 2
 were already cached and the extra iteration is predicated off), `test-backend-ops -o RMS_NORM`
 51/51, Qwen greedy 256 tokens byte-identical. Registers 30/31/32 as before with one instantiation
 at 32 instead of 31, no spills. `GGML_CUDA_NORM_CACHE_LEGACY=1` still gives the 4-value limit of
-patch 17.
+patch 17. b11682: moved with 17/19/40 into the #28175 loop (rebase section).
 
 ### 43 sampler-prefilter-grammar
 
@@ -996,6 +1068,9 @@ indexing directly, and at `CHUNK_ROWS=1` (M=1 per GEMM) cuBLAS degrades far enou
 `MUL_MAT(mxfp4, m=2880, n=32, k=2880)` misses the 5e-4 tolerance at 3.8e-3 - chunks must keep M
 in the thousands, which the MiB rule does.
 
+b11682: upstream #29442 chunks F32-compute F16/BF16 src0 above 512 MiB in the caller and passes a dst
+leading dimension `ldc`; 44's GEMMs use `ldc` now and the two splits compose (rebase section).
+
 ### 45 meta-scratch-free-gen
 
 `ggml/src/ggml-backend-meta.cpp` (+11/-2). A bug fix for the gist, found on b11436 by
@@ -1011,6 +1086,43 @@ fills) when the counter moved since its last reset. Entries are recreated on dem
 one re-registration per tensor after a free; production frees meta buffers only at load and
 shutdown. 8 of 8 full `test-llama-archs` runs clean with the fix (validated as an isolated
 `libggml-base` first, then in the branch build, see the change log). No kill switch.
+
+### 46 norm-gdn-decode
+
+`ggml/src/ggml-cuda/norm.cu`, `ggml/src/ggml-cuda/gated_delta_net.cu` (+45/-11). Written on b11682 for
+the decode loss the rebase brought (tg -1.35% Qwen Q4_K_M, -0.97% Q6_K with q8_0 KV, -0.61% Gemma 4
+against `p100-b11436`), which an nsys census traced to two upstream changes:
+
+- #28175 runs `rms_norm_f32` as a grid-stride loop over channel and sample. The loop state raises the
+  1024-thread instantiations from 30-32 to 39-56 registers, so one block fits per SM instead of two,
+  and costs ~0.5 us per single-row call (5120x1: 4.58 us against 3.96). The kernel gets a `grid_loop`
+  template flag; `rms_norm_f32_launch_1024` takes the loop variant only when `nchannels` or `nsamples`
+  is above 65535 (the launcher clamps grid y/z there), otherwise the body runs once and returns without
+  the trailing `__syncthreads()`. Registers back to 30-32, same arithmetic and order (output hashes
+  equal, including clamped-grid shapes with 70000 channels that take the loop).
+  `GGML_CUDA_NORM_GRID_LOOP=1` forces the loop variant.
+- #30087 gives each GDN warp four state columns. With patch 24's folded state gather the decode kernel
+  takes 16.6 us per call on sm_60 against 11.9 us with one column (the b11436 layout, 88 registers
+  against 55); for prompt batches four columns are faster (one column everywhere cost pp512 -0.8% and
+  pp2048 -1.6%). The launcher is templated on the column count, and a dispatcher picks one column
+  when `n_tokens <= 8` (tg, MTP verify) on `cc < GGML_CUDA_CC_VOLTA`, upstream's four otherwise.
+  `GGML_CUDA_GDN_COLS_PER_WARP=1|4` overrides; 4 restores upstream's reduction order (and so stock
+  output at decode), 1 the b11436 one.
+
+Measured against the rebased branch without it, 2x P100, `-sm tensor -fa on`, median of 10 alternated
+runs: Qwen3.8-27B UD-Q4_K_M tg128 32.11 -> 32.39 (+0.87%), UD-Q6_K q8_0 tg128 24.38 -> 24.56 (+0.74%),
+Gemma 4 31B tg128 29.11 -> 29.15 (+0.17%), pp512/pp2048 +0.14% to +0.23%. Against `p100-b11436` that
+leaves Q4 -0.49%, Q6 q8_0 -0.24%, Gemma -0.48% (Gemma has no GDN; the rest of its loss is outside
+the norm kernels). Census: decode pre-add norm 9.21 us (rebased 9.87, b11436 8.91), GDN 12.42 us.
+Confirmed in the validation session (2026-11-09, same-session alternated bench): tg128 32.42 vs 32.10
+(+1.0%), tg128 at depth 16384 31.19 vs 30.86 (+1.07%), MTP chat on the production line +1.14% at equal
+acceptance (-0.18% from `p100-b11436`, was -1.3%). Gemma's remaining gap to b11436 (+1.2% kernel time
+per token) is NCCL all-reduce launches, `mul_mat_vec_k_a16` and the 256-thread norms and
+`rms_norm_mul_rope`, which keep upstream's loop; not pursued (each under 0.4%).
+
+Numerics: the norm part changes nothing. The GDN part changes the reduction order at decode on
+Pascal, so the stock-math switch set for greedy comparisons gains `GGML_CUDA_GDN_COLS_PER_WARP=4`
+(test checklist). Validation: change log 2026-11-09.
 
 ### Meta backend gist
 
@@ -1100,8 +1212,10 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_A16K_CHECK=1` | 41 | debug: sync after every HFMA2 K-quant launch and print the first 8 calls with a non-finite dst (tensor, type, shape, block count, first bad value, non-finite count of src1, per-block amax stats) |
 | `GGML_CUDA_CUBLAS_CHUNK_MB=N` (default 256, 0 = off) | 44 | kill switch and threshold: a converted src0 copy above N MiB is converted and multiplied in row chunks of N MiB; 0 restores the single whole-matrix copy. Values below the largest ffn weight cost pp (64 MiB -3.3%, 32 MiB -10.9% on pp2048) |
 | `GGML_CUDA_CUBLAS_CHUNK_ROWS=N`, `GGML_CUDA_CUBLAS_CHUNK_LOG=1` | 44 | test knobs: force N rows per chunk whatever the size of src0 (N=1 makes cuBLAS pick another kernel and moves results past the test tolerance); one stderr line per split call |
+| `GGML_CUDA_NORM_GRID_LOOP=1` | 46 | kill switch for the norm part (upstream's channel/sample grid-stride loop in every 1024-thread `rms_norm_f32` launch) |
+| `GGML_CUDA_GDN_COLS_PER_WARP=1|4` | 46 | GDN state columns per warp for every launch; unset = 1 at `n_tokens <= 8` on pre-Volta, else 4 (upstream). 4 = kill switch and the stock reduction order |
 
-No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30, 45 (and the MoE-only 07, 08).
+No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30, 45 (and the MoE-only 07).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
 `git revert`). 21 is a scheduler patch (`ggml-backend.cpp`, lazy `ggml_backend_sched_reset`)
 next to where the meta backend crash lived; it was on the branch for the 89k validation run
@@ -1185,7 +1299,7 @@ git format-patch --no-numbered --zero-commit -o patches/ <base>..p100-b<build>
 ```sh
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=60 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/bin/test-backend-ops                       # patch repo reports 13327 tests, 0 failures
+./build/bin/test-backend-ops                       # b11682: 18535 tests per card, 0 failures
 ./build/bin/test-llama-archs                       # runs every arch through -sm tensor on the GPUs (meta backend)
 ./build/bin/llama-bench -m <model> -ngl 99 -sm tensor -p 512 -n 64   # compare with stock master
 ~/p100-opt/c2/check6.sh                            # GQA 6 tile path of 36/38 (no test-backend-ops case)
@@ -1209,12 +1323,13 @@ rebuilds if that needs pinning down.
 
 Output vs. stock: the patches that change numbers are 12 (Q4_1 weights, n >= 2), 15 (off
 unless `LLAMA_MTP_DRAFT_VOCAB` is set), 32/33 (every Q4_K, Q5_K, Q6_K matvec at decode widths 1-8,
-on by default) and 36 (flash-attention summation order on long prompts, seen on b11436 after
-~75 tokens of a 22k-token prompt). Run the greedy comparison (`--temp 0 --seed 1`, same prompt,
-this build vs a stock build of the same base commit) with
-`GGML_CUDA_DISABLE_MMVQ_F16_K=1 GGML_CUDA_FATTN_TILE_LEGACY=1`: with both switches set the
-output is expected to be identical to the last token, not just similar, and any divergence is
-a bug; bisect at runtime with the kill switches above (start with `GGML_CUDA_DISABLE_FUSION=1`,
+on by default), 36 (flash-attention summation order on long prompts, seen on b11436 after
+~75 tokens of a 22k-token prompt; on b11682 the branch defaults equal stock on that prompt) and 46
+(GDN reduction order at 1-8 tokens on Pascal). Run the greedy comparison (`--temp 0 --seed 1`, same
+prompt, this build vs a stock build of the same base commit) with
+`GGML_CUDA_DISABLE_MMVQ_F16_K=1 GGML_CUDA_FATTN_TILE_LEGACY=1 GGML_CUDA_GDN_COLS_PER_WARP=4` (the
+third one since patch 46): with the switches set the output is expected to be identical to the
+last token, not just similar, and any divergence is a bug; bisect at runtime with the kill switches above (start with `GGML_CUDA_DISABLE_FUSION=1`,
 then `LLAMA_SAMPLER_PREFILTER=0`) before rebuilding anything. Without the switch the Q4_K path
 of 32 may take a different token at a near-tied position (2026-09-03: identical for the first
 76 words of a 256-token run, then a different continuation); its check is the perplexity one
@@ -1418,3 +1533,47 @@ on `qwen35` that the kill switches above do not explain points here first.
   `-c 160000` is 22-35% faster than the production line. The docs' claim that `-sm tensor` refuses
   quantized KV was wrong since upstream #23792 (b9455) and is corrected in the plan (area C, H5, C7,
   gotchas 12/15/32, section 7) and the README.
+- 2026-10-16: rebased onto `f12aaa344` (tag b11682, 243 upstream commits) as `p100-b11682`; resolutions,
+  the patch 24 gather fix, the 18 / 15 guards and the dropped 08 are in "Rebase onto f12aaa344 (b11682)".
+  Validated on krk-lab (`~/p100-opt/b11682/REPORT.md`): build without warnings; `test-backend-ops`
+  18535/18535 on CUDA0 and CUDA1; `check6.sh` identical to b11436 in all 44 rows; `test-llama-archs`
+  10 of 10 full runs clean (521 cases); fusion counts per token equal to b11436 (1752.8 kernels per token
+  per card against 1751.8); greedy byte-identical to stock b11682 with `GGML_CUDA_DISABLE_MMVQ_F16_K=1
+  GGML_CUDA_FATTN_TILE_LEGACY=1` in 4 of 4 (Q4_K_M F16 and Q6_K q8_0, 284- and 22054-token prompts), no
+  `a16k_check` line; perplexity branch = stock to four decimals (Q4_K_M F16 6.0638, Q6_K q8_0 6.1016; the
+  shift from 6.0806 / 6.0922 is upstream's, stock 6753a033f reproduces the old Q4 value). Server: 23.6k
+  chat follow-ups at 425.9 ms prompt phase (b11436 426.9, stock 1291.4) with the same checkpoint events,
+  a 53k-token conversation with 12 near-exact prefix hits clean, slot save/restore round trips identical
+  on the production line (with MTP draft state), Q4 and stock. Production option A: 139.5k fill and two
+  prefix hits clean, peak 16181 MiB per card (unchanged). Bench, median of 10 alternated runs, `-sm tensor
+  -fa on`:
+
+      Qwen3.8-27B UD-Q4_K_M   stock b11682   p100-b11682   p100-b11436   new vs old
+      pp512  (ub 512)              253.19         261.02        256.69        +1.69%
+      pp2048 (ub 2048)             457.81         465.25        454.72        +2.32%
+      tg128                         22.14          32.11         32.55        -1.35%
+      tg128 at depth 16384          21.55          30.89         31.24        -1.12%
+      Qwen3.8-27B UD-Q6_K, q8_0 KV
+      pp2048                       458.99         461.95        451.57        +2.30%
+      tg128                         17.30          24.38         24.62        -0.97%
+      Gemma 4 31B UD-Q4_K_XL
+      pp2048                       383.43         390.19        388.40        +0.46%
+      tg128                         18.11          29.11         29.29        -0.61%
+
+  The tg loss is #28175 (norm registers, all models) and #30087 (GDN four columns per warp with the
+  patch 24 gather, qwen35); patch 46 (2026-11-09) wins most of it back. `-ctkd/-ctvd q8_0` on option A
+  aborts on the first request at `-c 145000` (rebase section).
+- 2026-11-09: local patch 46 (`p100x: 46-norm-gdn-decode`, written 2026-10-16) validated on krk-lab
+  (`~/p100-opt/b11682/REPORT-46.md`): build without warnings; `test-backend-ops` 18535/18535 on CUDA0
+  and CUDA1; `test-llama-archs` 5 of 5 full runs clean; greedy byte-identical to stock b11682 in 4 of 4
+  (Q4_K_M F16 and Q6_K q8_0, short and 22k-token prompts) with `GGML_CUDA_DISABLE_MMVQ_F16_K=1
+  GGML_CUDA_FATTN_TILE_LEGACY=1 GGML_CUDA_GDN_COLS_PER_WARP=4` (the two-switch set also matched here, but
+  it does not pin the GDN reduction order); with defaults the Q6_K q8_0 short reply now leaves stock
+  ~24 tokens in (rebased branch: ~87), the other three equal stock. Perplexity unchanged (Q4_K_M F16
+  6.0638, Q6_K q8_0 6.1016; stock 6753a033f gives 6.0922 for Q6_K q8_0, so both base shifts are
+  upstream's). MTP smoke on the production line +1.14% at equal acceptance with identical text; server
+  follow-up chain, checkpoint kill-switch arm (710 ms, b11436 704) and the 53k prefix-hit shape clean
+  with the same checkpoint events; option A 139.5k fill clean at the same 16181 MiB peak per card.
+  Bench same session, alternated: tg128 32.42 vs 32.10 t/s (+1.0%), at depth 16384 31.19 vs 30.86
+  (+1.07%); earlier A/B: Q6_K q8_0 tg128 +0.74%, Gemma +0.17%, pp +0.14-0.23%. Production
+  `/home/krk/llama.cpp` switched to `p100-b11682` (old binaries in `build-p100-b11436`).

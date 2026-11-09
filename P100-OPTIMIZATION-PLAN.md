@@ -44,7 +44,7 @@ MODEL_GEMMA=$M/models--unsloth--gemma-4-31B-it-GGUF/snapshots/c1ac76e99d5513b141
 MODEL_MOE=$M/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf  # 22.1 GB MoE (07/08/09 live)
 SERVER_FLAGS: router `llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --split-mode tensor --cache-ram 16384 --jinja --chat-template-file /mnt/hdd/gguf/chat_template.jinja --reasoning-format deepseek -ngl 99 -c 145000 --parallel 1 -fa on -b 2048 -ub 2048 --no-mmproj-offload -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --draft-p-min 0`
               started by ~/llama-serve.sh (as read 2026-10-15, edited by the user 2026-10-07; also sets LLAMA_CACHE=/mnt/hdd/gguf NCCL_P2P_LEVEL=SYS and the GPUS line above); the router child that ran on 2026-10-15 served MODEL_Q6 (the client picks the model from --models-dir). The 2026-09-03 line had -c 160000, F16 KV and --tools all
-              production binary: /home/krk/llama.cpp/build/bin/llama (branch `p100-b11436` since 2026-10-06; do not touch)
+              production binary: /home/krk/llama.cpp/build/bin/llama (branch `p100-b11682` since 2026-11-09, `p100-b11436` 2026-10-06 to 2026-11-09; do not touch)
 SUDO=no                                        # no clock/power/persistence/IOMMU changes possible; record and recommend only
 PROD_PAUSE=ask                                 # user 2026-09-03: production was not in use then and agents could stop it. Since 2026-10-15 it is in use again: GPU work needs the user's word that the GPUs are free, and a production process that appears is never stopped (the kvq8 scripts abort instead). No `llama-serve.sh` runs by agents
 NUMERICS=perplexity                            # user 2026-09-03: changes may alter low-order bits if llama-perplexity stays within 0.5% of stock and P100-PATCHES.md documents it
@@ -1348,7 +1348,8 @@ shift), I5 (folded into PL3).
 | PL1 | DONE 2026-09-09 (measurement, `~/p100-opt/pl/PL-report.md`, log entry): 7 arms 250/225/200/175/150/125/250 W, one llama-server per MTP arm. tg is flat to 175 W because each card draws only ~155 W at tg (peak 168): tg d0 32.04 at every limit from 250 to 175, MTP chat 39.5 t/s everywhere down to 175, joules per tg token unchanged. pp follows the clock: pp2048 447.8 / 444.0 / 432.1 / 415.0 / 395.1 / 349.1 t/s at 250 / 225 / 200 / 175 / 150 / 125 W (-0.9 / -3.5 / -7.3 / -11.8 / -22.0%), pp mean clock 1328 -> 1316 -> 1265 -> 1198 -> 1140 -> 984 MHz. At 150 W tg loses 1.0-1.4% and MTP 0.4% for -12% energy per token; at 125 W tg -6.5 to -7.2%. Tolerance summary: within 1% of tg -> 175 W (pp -7.3%), within 2% or 5% -> 150 W (pp -11.8%); the tg knee is between 150 and 165 W. No thermal slowdown at any limit (max 64 C against 82), peak board power 237 W per card, `pviol` 0 at 250 W: the PSU is not stressed. Confirmed by the user's wall meter: whole-system draw unchanged down to 175 W, -50 W at 150 W, -100 W at 125 W. Verdict: keep 250 W (a limit only clips pp and saves nothing at tg); 175 W is the setting if a lower peak (160 W per card instead of 237) is ever wanted for the chassis | no tg to gain; pp -7% at 175 W | - |
 | PL2 | DONE 2026-09-09: persistence mode is a NO-OP on this host. The Quadro K2200 display card and `nvidia_modeset` hold the `nvidia` module loaded permanently (refcount 19), so the driver never tears the GPUs down between processes: CUDA init 327 vs 337 ms and init + load + 1 token 5174 vs 5161 ms with persistence on vs off (medians of 3, inside the noise), and a 200 W power limit survived `pm off` plus a CUDA process exit. The user's daemon fix is harmless and stays on. Router respawns pay the 4.2 s model load only (K1) | 0 | - |
 | C9 | DONE 2026-10-15 (kvq8): the production line with Q6_K and q8_0 KV works and matches stock; speed and walls in area C9, options in section 7 | - | - |
-| QL1 | OPEN (user, 2026-10-15; next session): measure answer quality of Q6_K vs Q4_K_M and of q8_0 vs F16 KV, especially at long context close to the max `-c`. Q4_K_M + F16 is the fastest option and holds the most context (section 7), so the question is what Q6_K and q8_0 cost or buy in quality. The C9 perplexity (`-c 2048`, 20 chunks) cannot separate the two quants (+/-0.10) and says nothing about 100k+. The method is still to be designed | decides the production option of section 7 | C9 |
+| QL1 | PARKED (user, 2026-10-16: rebase first). Reframed by the user on 2026-10-16: decide option A (Q6_K + q8_0 KV at 145k) against C (Q4_K_M + F16 at 160k), both with MTP on, for coding through an agent harness. The C9 perplexity (`-c 2048`, 20 chunks) cannot separate the quants (+/-0.10) and says nothing about 100k+. An end-to-end coding benchmark has too little power (~150 paired tasks for a 10-point gap). Proposed method: (1) teacher-forced fidelity against a Q8_0 + F16 reference (~29 GB download) on the user's own harness transcripts, by depth bucket: KLD and top-1 flips where the reference p > 0.9, split by tool call / code / prose / thinking (custom tool: stock `llama-perplexity` needs n_ctx x n_vocab floats, ~99 GB host RAM at 100k); (2) next-action replay at real cut points through `llama-server` with the production command lines: tool-call JSON valid, edit applies, same action as the reference, t/s on real traffic. Open questions to the user: which harness and where its sessions are stored, OK for the reference download. Published: Terminal-Bench 2.1 (Quesma, 89 tasks, F16 KV) Q4_K_M = BF16; KLD Q6_K 0.00107 vs Q4_K_M 0.01126 (AtomicChat); nothing on q8_0 vs F16 KV | decides the production option of section 7 | C9 |
+| R11682 | DONE 2026-11-09: rebase onto b11682 (`p100-b11682`, 243 upstream commits), validated 2026-10-16 (P100-PATCHES.md change log), local patch 46 for the decode loss it brought (validated 2026-11-09), production switched to it 2026-11-09 | - | - |
 | PL3 | DONE 2026-09-09: zero. ASPM not testable (both P100 links report `ASPM not supported`). Governor `performance` vs `schedutil`: tg d0 32.24/32.23 vs 32.24/32.27 t/s, MTP 40.11 vs 40.10, with the CPUs at 3390 vs 1740 MHz mean - the host clock does not matter. `cpu_dma_latency` held at 0 vs not: 32.03/32.04 vs 32.05/32.02, MTP 39.51 vs 39.53. Both together: 32.04 vs 32.04. All MTP arms byte-identical (draft_n 636, accepted 298) | 0 | - |
 
 ### What not to do
@@ -1798,8 +1799,12 @@ ms per verify step in brackets; perplexity at `-c 2048`, 20 chunks):
   Q6_K or q8_0 buys answer quality, especially near the max context, is not measured: the 20-chunk
   perplexity cannot separate the quants. That is item QL1 (Final table), and it decides between A, B
   and C. Until then A stays, by the user's choice of Q6_K.
-- `-ctkd q8_0 -ctvd q8_0` (MTP draft KV in q8_0) would free ~140 MiB per card on A but move the draft's
-  width-1 attention onto the slow VEC path; not measured.
+- `-ctkd q8_0 -ctvd q8_0` (MTP draft KV in q8_0) does not fit A: measured on b11682 it loads with
+  482 MiB more per card instead of ~140 MiB less (the draft context reserves its own full-context F16
+  conversion buffer for the TILE path) and aborts on the first request at `-c 145000`.
+- The t/s in the table are from `p100-b11436`. On `p100-b11682` before patch 46, option A ran 43.7 / 37.2 /
+  24.5 t/s at depth 0 / 32k / ~100k with ms per verify step +1.2% / +1.1% / +0.9%; the text differs at
+  0 and 32k (base numerics), so compare the step times.
 
 What the earlier measurements added, and still holds for every option:
 
@@ -1818,8 +1823,8 @@ What the earlier measurements added, and still holds for every option:
   (harmless, a no-op here), stock governor and C-states, ASPM not applicable, no application clocks
   (boost already sits at 1328 MHz under load). Do not set compute mode EXCLUSIVE_PROCESS (router
   children).
-- Binary: the branch build. Production `/home/krk/llama.cpp` runs `p100-b11436` since 2026-10-06
-  (1.47x stock tg); the previous `p100-b10758` binaries are kept in `build-p100-b10758` as the fallback.
+- Binary: the branch build. Production `/home/krk/llama.cpp` runs `p100-b11682` since 2026-11-09
+  (1.46x stock tg); the previous `p100-b11436` binaries are kept in `build-p100-b11436` as the fallback.
 - `~/llama-serve.sh` carries option A including `NCCL_P2P_LEVEL=SYS`. `P100-README.md` is the quick
   start for rebuilding its binary from this branch.
 
