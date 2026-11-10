@@ -2417,6 +2417,26 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+// #30137 leaves new state bytes uninitialized, so a fresh buffer was first touched by the pageable device-to-host
+// copy that fills it. On the P100 host that copy then took ~180 ms instead of ~105 ms for a 150 MiB recurrent-state
+// checkpoint (follow-up prompt phase 426 -> 501 ms). Touching the grown part first, as the zero-filling std::vector
+// did before #30137, takes the page faults out of the copy. A buffer recycled at the same size (patch 37) is not
+// touched again.
+void common_state_data_resize(common_state_data & data, size_t size) {
+    static const bool prefault = [] {
+        const char * env = getenv("LLAMA_STATE_PREFAULT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    const size_t size_old = data.size();
+
+    data.resize(size);
+
+    if (prefault && size > size_old) {
+        memset(data.data() + size_old, 0, size - size_old);
+    }
+}
+
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
@@ -2427,7 +2447,7 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+    common_state_data_resize(data_tgt, ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -2445,7 +2465,7 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_dft.resize(ckpt_size);
+    common_state_data_resize(data_dft, ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

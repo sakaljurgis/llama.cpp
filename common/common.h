@@ -1304,6 +1304,10 @@ struct common_no_init_allocator : std::allocator<T> {
 // sequence state data, filled by llama_state_seq_get_data_ext()
 using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
 
+// resize state data that a state copy fills next; the grown part is zero-filled first so its pages are faulted in
+// here and not inside the pageable device-to-host copy (LLAMA_STATE_PREFAULT=0: plain uninitialized resize)
+void common_state_data_resize(common_state_data & data, size_t size);
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
