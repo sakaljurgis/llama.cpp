@@ -1,10 +1,11 @@
 # P100 quick reference (2x Tesla P100 on krk-lab)
 
-Branch `p100-b11682` = upstream master at f12aaa344 (tag b11682) + the shinbunbun P100 patch set
-(01-30, four dropped as superseded) + the philpax meta-backend gist + local patches `p100x` 31-46.
-Measured on the box against a stock build of the same base: Qwen3.8-27B UD-Q4_K_M tg 32.39 vs 22.14 t/s
-(1.46x), pp2048 467 vs 458 t/s at `-ub 2048`, MTP chat 44-55 t/s; Gemma 4 31B UD-Q4_K_XL tg 29.2 vs
-18.1 t/s (1.61x). The previous branch `p100-b11436` is kept unchanged as the fallback.
+Branch `p100-b12212` = upstream master at d78f4255d (tag b12212) + the shinbunbun P100 patch set
+(01-30, four dropped as superseded) + the philpax meta-backend gist + local patches `p100x` 31-47.
+Measured on the box against a stock build of the same base: Qwen3.8-27B UD-Q4_K_M tg 32.90 vs 22.94 t/s
+(1.43x), pp2048 470 vs 462 t/s at `-ub 2048`; Gemma 4 31B UD-Q4_K_XL tg 29.6 vs 18.9 t/s (1.57x); MTP
+chat on the production line 44-55 t/s. The previous branch `p100-b11682` is kept unchanged as the
+fallback.
 
 Docs: `P100-PATCHES.md` (what every patch does, knobs, rebase recipe, test checklist),
 `P100-OPTIMIZATION-PLAN.md` (measurements; section 0.1 machines and paths, section 7 the recommended
@@ -16,9 +17,9 @@ production configuration, section 5 the gotchas, roadmap "Deferred code items" f
 ```sh
 cd /home/krk/llama.cpp
 git status                                     # clean first; stash or commit anything local
-git fetch origin p100-b11682:p100-b11682       # origin = github.com/sakaljurgis/llama.cpp (https)
-git switch p100-b11682
-mv build build-p100-b11436                     # keep the old binaries as a fallback
+git fetch origin p100-b12212:p100-b12212       # origin = github.com/sakaljurgis/llama.cpp (https)
+git switch p100-b12212
+mv build build-p100-b11682                     # keep the old binaries as a fallback
 export PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=60 -DGGML_CUDA_NCCL=ON -DLLAMA_OPENSSL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j14
@@ -26,7 +27,7 @@ cmake --build build --config Release -j14
 
 Same flags as `~/llama-build.txt` plus an explicit Release. cmake 3.22 needs the explicit arch 60
 (no `native`). NCCL is required (`libnccl-dev` is installed). About 10-15 minutes at `-j14`.
-Fallback at any time: `mv build build-p100-b11682 && mv build-p100-b11436 build`.
+Fallback at any time: `mv build build-p100-b12212 && mv build-p100-b11682 build`.
 
 ## 2. Smoke test before serving (5 minutes)
 
@@ -56,9 +57,10 @@ step 1, so nothing in it has to change for the update. As read on 2026-10-15 (ed
 validated on this branch on 2026-10-15 (plan item C9):
 
 - It works: a 139k-token chat plus near-exact prefix-hit follow-ups, no crash; greedy output matches
-  stock with the stock-math switches of section 4, perplexity equals stock (checked again on b11682).
+  stock with the stock-math switches of section 4 (checked again on b12212); perplexity is 0.26% below
+  stock on b12212 because of patch 19's summation order (6.0782 vs 6.0940), equal to stock with it off.
   `-sm tensor` does take quantized KV (upstream #23792); older notes here said otherwise.
-- It is at the memory wall: 16181 of 16269 MiB per card at peak. Do not raise `-c`: 147500 still runs,
+- It is at the memory wall: 16187 of 16269 MiB per card at peak (b12212; 16181 on b11682). Do not raise `-c`: 147500 still runs,
   150000 loads and then kills the server on its first request. Keep MTP width 3 (width 1 is slower).
 - q8_0 KV costs nothing on prompt processing and 1% / 5% / 11% of MTP generation at depth 0 / 32k /
   100k against F16 KV, which on Q6_K fits only `-c 100000`. Q4_K_M with F16 KV at `-c 160000` is
@@ -68,6 +70,14 @@ Stale comment lines in the script: draft width 4 and `ngram-mod` were measured a
 Do not add `-ctkd q8_0 -ctvd q8_0` (MTP draft KV in q8_0): on b11682 it loads with 482 MiB more per card
 and kills the server on its first request at `-c 145000`.
 
+What b12212 changes at the serving level: context checkpoints are shared with the prompt cache
+(#30137) instead of copied, and #30541 fixes the state copy sizes for quantized KV caches (this line's
+q8_0 slot save/restore and prompt cache). Checked on this line on b12212: a slot save/restore round
+trip (with the MTP draft state), two conversations that push each other through the prompt cache with
+continuations equal to a cold control, and a 139.5k fill. #30137 also made fresh checkpoints slower,
+and patch 47 takes that back: ~75 ms per follow-up on a line without MTP, only ~5 ms on this MTP line.
+MTP chat is 0.3% slower than on b11682 (#31660 builds
+the conv snapshots with 4 launches per layer).
 What b11682 changes at the serving level: context checkpoints and the MTP draft state are stored in
 slot save files (`--slot-save-path`; upstream #26004, #30574), checked with a save/restore round trip on
 this line. What b11436 changed (P100-PATCHES.md, rebase sections): `preserve_reasoning` is on
@@ -85,7 +95,7 @@ governor and C-states. Do not set compute mode EXCLUSIVE_PROCESS: the router run
 Before serving a GGUF the branch has not run (plan gotcha 31): run the `GGML_A16K_CHECK=1` sample from
 step 2 with that model (`--jinja` instead of `-no-cnv` for chat models with a strict template), then
 compare a greedy chat reply against the same command with `GGML_CUDA_DISABLE_MMVQ_F16_K=1
-GGML_CUDA_FATTN_TILE_LEGACY=1 GGML_CUDA_GDN_COLS_PER_WARP=4` (stock math). The two replies should read the same; byte-identical is not required (F16 accumulation). If
+GGML_CUDA_FATTN_TILE_LEGACY=1 GGML_CUDA_GDN_COLS_PER_WARP=4 GGML_CUDA_DISABLE_FUSE_PRE_ADD=1` (stock math). The two replies should read the same; byte-identical is not required (F16 accumulation). If
 anything looks off, serve with that variable set (costs ~8% tg) and note it.
 
 ## 5. Kill switches worth knowing (full table in P100-PATCHES.md, "Runtime knobs")
@@ -94,7 +104,7 @@ anything looks off, serve with that variable set (costs ~8% tg) and note it.
 |---|---|
 | garbage or nan output on a model | `GGML_CUDA_DISABLE_MMVQ_F16_K=1` (HFMA2 K-quant matvec off, exact int8 path) |
 | attention wrong at long context | `GGML_CUDA_FATTN_TILE_LEGACY=1` (patches 36/38 off) |
-| follow-up requests misbehave | `LLAMA_SERVER_CKPT_LEGACY=1`, `LLAMA_SERVER_CKPT_SAVE_LEGACY=1` (patches 31/37 off) |
+| follow-up requests misbehave | `LLAMA_SERVER_CKPT_LEGACY=1`, `LLAMA_SERVER_CKPT_SAVE_LEGACY=1` (patches 31/37 off), `LLAMA_STATE_PREFAULT=0` (patch 47 off) |
 | abort inside cuBLAS on a wide batch | `GGML_CUDA_CUBLAS_CHUNK_MB=0` (patch 44 off) or a smaller value |
 | norm or delta-net (qwen35) suspicion at decode | `GGML_CUDA_NORM_GRID_LOOP=1`, `GGML_CUDA_GDN_COLS_PER_WARP=4` (patch 46 off) |
 | sampler oddities with grammars or tools | `LLAMA_SAMPLER_PREFILTER=0` |
@@ -110,14 +120,19 @@ every rebase check the `launch_fattn` call of patch 36 against upstream's parame
 `use_sparse` in front of `warp_size` and a clean merge compiled into a wrong call), and run
 `test-llama-archs` several times (patch 45's bug crashed only some runs). Clean merges can still be
 wrong: on b11682 patch 24's state gather merged clean onto a GDN kernel with a new column layout and
-read the wrong rows, so read the patched GDN and norm kernels against upstream's changes.
+read the wrong rows, so read the patched GDN and norm kernels against upstream's changes. On b12212
+#29720 rewrote `rms_norm_f32` (a float4 path next to the scalar one), and #30137 made checkpoints shared
+`shared_ptr<const ...>`: patch 31/37 hunks merged clean and did not compile, so read `create_checkpoint`
+against the checkpoint type after every rebase.
 
 ## 7. What is left
 
-Next: the rebase onto upstream b12212 (532 commits past b11682, 2026-11-09). Parked: QL1 (plan
+Next: the next upstream rebase, when it is worth one. Parked: QL1 (plan
 "Final" table), answer quality of option A against C (both with MTP, coding through an agent harness);
 it decides between the options of plan section 7.
 
 Plan roadmap "Deferred code items": E2 (0.4% tg), D4 (0.4%), the delta-net conv chain (0.8%), F9
-(unverified), and the Tier 3 research items (C7 is now quantized-KV attention speed only). Everything above 1% that remains sits inside the matvec
+(unverified), and from b12212 a float4 pre-add for patch 19, the MTP conv-snapshot index chain (0.3% MTP),
+the Q3_K matvec at 2-8 columns and huge pages for the state buffers (THP1, ~45 ms per fresh checkpoint
+on the production line), and the Tier 3 research items (C7 is now quantized-KV attention speed only). Everything above 1% that remains sits inside the matvec
 kernels and NCCL. Rejected with numbers so nobody repeats them: B2, E7, E8, G2/G3, F5, C3, C4.
