@@ -1855,3 +1855,8 @@ on `qwen35` that the kill switches above do not explain points here first.
     effect on prompt-cache saves.
   - Production line: prompt cache 6/6 equal to cold, 0 asserts. Slot round trip a2 = a2ref. MTP text and
     acceptance equal v1. 15785 MiB per card after load, 16013/16015 after a 2-turn chat, both equal v1.
+- 2026-11-11: the user kept patch 47 as is (on the production line it saves ~5 ms and costs nothing; it is
+  the allocation point THP1 would use). `p100-b12212` pushed to the fork, production `/home/krk/llama.cpp`
+  switched to it (old binaries in `build-p100-b11682`): Release build without warnings in 14 minutes, UI
+  embedded; README smoke pp512 262.56, tg64 32.71 t/s (validation: 262.40, tg128 32.90), sensible text,
+  no `a16k_check` line.

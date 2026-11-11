@@ -40,7 +40,7 @@ GGML_A16K_CHECK=1 ./build/bin/llama-completion -m $M -p "Hello, who are you?" -n
     -ngl 99 -sm tensor -fa on -c 4096 --temp 0 -s 1
 ```
 
-Expected: tg64 about 32.3 t/s (tg128 measured 32.39), sensible text, and no `a16k_check:` line on stderr (that line means a
+Expected: tg64 about 32.7 t/s and pp512 about 262 t/s (the production build on 2026-11-11: 32.71 and 262.56), sensible text, and no `a16k_check:` line on stderr (that line means a
 non-finite matvec output). `llama-completion` needs `-c 4096` or it takes the 262k training context
 and runs out of memory. The pp512 number here is at `-ub 512` and is not the production pp figure.
 `NCCL_P2P_LEVEL=SYS` matters here: on 2026-10-06 the production build gave pp512 256.6 t/s with it and
