@@ -314,7 +314,7 @@ Upstream changes without a conflict that matter here:
   #31373, #29927, #30915.
 
 New local patch 47 takes back the checkpoint cost of #30137 (section 47). Validation on krk-lab is in the
-change log (2026-11-10).
+change log (2026-11-10). Patch 48 (2026-11-11, section 48) puts the large state buffers in huge pages.
 
 ## Rebase onto f12aaa344 (b11682)
 
@@ -458,6 +458,7 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 45 | meta-scratch-free-gen | host (meta backend, `-sm tensor`) | yes (bug fix for the gist: every graph-external set/get/memset of a tensor after a meta buffer was freed) |
 | 46 | norm-gdn-decode | CUDA (norm: all archs; GDN: pre-Volta) | yes (every scalar 1024-thread `rms_norm` launch of every model, i.e. 19's pre-add norms; the qwen35 GDN kernel at 1-8 tokens per sequence: tg and MTP verify) |
 | 47 | state-prefault | host (common, server) | yes (hybrid/recurrent models: every context checkpoint created into a fresh buffer, i.e. every follow-up until the checkpoint list is full; every prompt-cache save). Measurable only without MTP: -15% per follow-up there, -0.5% on the MTP production line |
+| 48 | state-thp | host (common; Linux) | yes (every state buffer of 32 MiB or more: hybrid/recurrent checkpoints and prompt-cache entries; huge pages only while the kernel has free 2 MiB blocks, i.e. on the production line with `--load-mode dio`). Fresh checkpoint 105 -> 53 ms with MTP |
 
 ### 31 server-ckpt-adopt
 
@@ -1346,6 +1347,57 @@ the ~5 ms that a fault inside the device-to-host copy costs over a memset fault.
 save runs with the GPU idle, so nothing hides the memset there either. Moving the remaining cost
 needs huge pages (plan deferred item THP1), not a prefault.
 
+Since patch 48 the default prefault is `madvise(MADV_POPULATE_WRITE)` instead of the memset
+(`LLAMA_STATE_PREFAULT=2`; `1` is this section's memset, `0` still turns the prefault off).
+
+### 48 state-thp
+
+`common/common.h`, `common/common.cpp` (+186/-10). Plan item THP1, written and measured on 2026-11-11
+(`~/p100-opt/thp1/REPORT.md` on krk-lab). It moves the cost that patch 47 could only shift: the first
+touch of a fresh state buffer in 4 KiB pages, ~74 ms per 150 MiB on this host, which lands on the
+follow-up latency whenever MTP is on.
+
+- `common_state_data` uses `common_state_allocator`. On Linux, a buffer of at least 32 MiB gets its
+  own `mmap` at a 2 MiB-aligned address, rounded up to 2 MiB. It is madvised `MADV_HUGEPAGE` only
+  while `/proc/buddyinfo` lists at least twice the buffer in free blocks of 2 MiB or more. Smaller
+  buffers (the 24-25 MiB draft states, non-recurrent models) and other platforms keep `std::allocator`.
+  The choice depends only on the size and the switch, so the allocator is stateless and free always
+  matches alloc. Moving buffers between checkpoints, 37's spare and prompt-cache entries (#30137) only
+  moves the pointer.
+- `common_state_data_resize()` prefaults with `madvise(MADV_POPULATE_WRITE)`. The kernel then maps
+  the pages without a user-space pass over them, and it falls back to 47's memset where the call fails
+  (kernels before 5.14).
+- Why the guard: THP runs `defrag=madvise` here. A huge-page fault that finds no free 2 MiB block
+  then reclaims and compacts memory synchronously. With the model file filling the page cache (mmap
+  load) and no guard, fresh checkpoints took 0.6-1.8 s and follow-ups up to 2.2 s (2908-5552
+  compaction stalls per chat chain). With the guard, a full page cache only means 4 KiB pages plus
+  populate. `--load-mode dio` keeps the model out of the page cache, so the guard rarely declines on
+  the production line (README section 3).
+
+Measured on krk-lab. The Q4 rows are the j6 chain with MTP (Q4_K_M, F16 KV, 23.5k-token chat, two
+runs each). Production is Q6_K, q8_0 KV, MTP, the `pcache.py` scenario. Times in ms; outputs, prompt_n
+and cache_n are identical to the base in every run.
+
+| case | fresh checkpoint | follow-up | prompt-cache save part |
+|---|---:|---:|---:|
+| base (47, memset) | 104.5-105.4 | 510.6-511.2 | 282.7-286.7 |
+| 48, memory free | 53.2-54.6 | 459.6-460.5 | - |
+| 48, page cache full (the guard declines: 4 KiB + populate) | 69-72 | 475-478 | 200.8-204.3 |
+| 48, production with `--load-mode dio` | 53.4 | 883.5 (base 934-937) | 171.2 |
+| unguarded huge pages, page cache full (`LLAMA_STATE_THP=2`) | 80-961 median, up to 1807 | 487-1359 median | - |
+
+- Recycled checkpoints stay at 30 ms (with MTP) or 99 ms (without) in every arm.
+- Without MTP, 47's -15% holds: 422.6 ms against 423.8 for the base, and 501.5 with 47 off.
+- Huge pages also make reads faster. A prompt-cache load takes 82-85 ms instead of 97-100, and a slot
+  restore 326-328 ms instead of 403.
+- Production start: GPU memory unchanged (15785 MiB per card after load, peak 16013-16015). Host RSS
+  is +1-2 MiB; rounding to 2 MiB costs +0.35 MiB per 150 MiB checkpoint and at most 2 MiB per
+  prompt-cache entry. `--cache-ram` counts `size()`, so RSS can exceed it by at most 0.5%.
+
+Switches (read once): `LLAMA_STATE_THP=0` keeps `std::allocator`. With `LLAMA_STATE_PREFAULT=1` as
+well, that is exactly patch 47; this was checked (run X0 = base). `LLAMA_STATE_THP=2` madvises without
+the guard and is for measurements only.
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -1436,7 +1488,8 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_CUBLAS_CHUNK_ROWS=N`, `GGML_CUDA_CUBLAS_CHUNK_LOG=1` | 44 | test knobs: force N rows per chunk whatever the size of src0 (N=1 makes cuBLAS pick another kernel and moves results past the test tolerance); one stderr line per split call |
 | `GGML_CUDA_NORM_GRID_LOOP=1` | 46 | kill switch for the norm part (upstream's channel/sample grid-stride loop in every scalar 1024-thread `rms_norm_f32` launch; the float4 kernels of #29720 always loop, as upstream) |
 | `GGML_CUDA_GDN_COLS_PER_WARP=1|4` | 46 | GDN state columns per warp for every launch; unset = 1 at `n_tokens <= 8` on pre-Volta, else 4 (upstream). 4 = kill switch and the stock reduction order |
-| `LLAMA_STATE_PREFAULT=0` | 47 | kill switch (checkpoint and prompt-cache state buffers grow uninitialized, as upstream since #30137) |
+| `LLAMA_STATE_PREFAULT=0|1|2` | 47, 48 | prefault of grown state buffers: 0 = none (upstream since #30137), 1 = memset (patch 47), 2 = `MADV_POPULATE_WRITE` (default since 48) |
+| `LLAMA_STATE_THP=0|1|2` | 48 | state buffers of 32 MiB or more: 0 = `std::allocator` (kill switch; with `LLAMA_STATE_PREFAULT=1` = patch 47), 1 = 2 MiB-aligned mapping, `MADV_HUGEPAGE` while `/proc/buddyinfo` has free 2 MiB blocks (default), 2 = without that guard (measurement only: compaction stalls) |
 
 No kill switch: 01, 02, 04, 05, 10, 11, 14, 16, 17, 21, 25, 29, 30, 45 (and the MoE-only 07).
 To bisect one of those, build with the commit dropped (`git rebase -i` or
@@ -1860,3 +1913,36 @@ on `qwen35` that the kill switches above do not explain points here first.
   switched to it (old binaries in `build-p100-b11682`): Release build without warnings in 14 minutes, UI
   embedded; README smoke pp512 262.56, tg64 32.71 t/s (validation: 262.40, tg128 32.90), sensible text,
   no `a16k_check` line.
+- 2026-11-11: new patch 48 (`p100x: 48-state-thp`, plan item THP1; section 48, report
+  `~/p100-opt/thp1/REPORT.md`). Variants measured on krk-lab:
+
+      fresh 150 MiB buffer, allocate + prefault + fill   CPU    GPU copy (D2H, pageable)
+      47 (memset, 4 KiB)                                 88.4   93.5
+      4 KiB + MADV_POPULATE_WRITE                        54.1   58.5
+      2 MiB + memset / + populate                        44.6 / 38.3   48.5 / 42.3
+      GLIBC_TUNABLES=glibc.malloc.hugetlb=1 (+ memset)   44.7   49.0
+      recycled buffer                                    -      19.6
+
+  Unguarded huge pages stall in synchronous compaction once the page cache fills the RAM: run Bdef had
+  2908 stalls and checkpoints up to 599 ms; under a memory balloon, follow-ups reached 1359 ms median and
+  2.2 s max. Hence the `/proc/buddyinfo` guard. The glibc tunable gives the same huge pages without
+  code, but has no guard (pc1 run C1: 495 stalls, saves up to 332 ms) and +70-88 MiB RSS. It also made
+  generation 0.4-0.9% faster, additive to 48; plan deferred item THP2 is to find which host buffer that is.
+  `--load-mode dio` (no async upload with `-sm tensor`: synchronous after O_DIRECT reads):
+
+      cold Q6_K start      to /health   MemFree after load   page cache   free in 2 MiB blocks (Normal)
+      mmap                 84.0 / 83.6 s   7.0 GB            22.8 GB       3.8 GB
+      dio                  86.7 / 87.2 s  27.0 GB             2.8 GB       8.4 GB
+
+  The same greedy texts and MTP acceptance in both modes, GPU memory +2 MiB. Host tensors (994.6 MiB)
+  become a pinned `CUDA_Host` buffer instead of `CPU_Mapped`. With dio the stall sequence (production
+  pcache, then a cold Q4 chain) ran with 0 stalls and all buffers in huge pages, and the unguarded
+  variant was equal there (459.3 vs 460.6 ms), so the guard costs nothing. In router mode the child
+  inherits `--load-mode dio`.
+
+  On the user's go, production `/home/krk/llama.cpp` was rebuilt with 48 (`ebf55bed6`, incremental,
+  0 warnings) and `--load-mode dio` was added to `~/llama-serve.sh` (backup
+  `~/p100-opt/thp1/prod/llama-serve.sh.bak-20261111`). Smoke: pp512 262.68, tg64 32.72 t/s (before:
+  262.56 / 32.71), no `a16k_check`. Production line with dio: up in 87 s; 2-turn chat with the same
+  text, t/s and acceptance as before; checkpoints took 55.7 / 53.8 ms; 460 MiB in huge pages, 0
+  fallbacks, 0 compaction stalls; 16015 MiB per card.

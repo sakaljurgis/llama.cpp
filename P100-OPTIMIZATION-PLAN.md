@@ -42,8 +42,8 @@ MODEL_Q6=$M/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c03
 MODEL_IQ4=$M/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-IQ4_XS.gguf    # 14.3 GB (patches 29/30 territory)
 MODEL_GEMMA=$M/models--unsloth--gemma-4-31B-it-GGUF/snapshots/c1ac76e99d5513b141e8adde7288b85c3f9c32ec/gemma-4-31B-it-UD-Q4_K_XL.gguf  # 18.8 GB
 MODEL_MOE=$M/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf  # 22.1 GB MoE (07/08/09 live)
-SERVER_FLAGS: router `llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --split-mode tensor --cache-ram 16384 --jinja --chat-template-file /mnt/hdd/gguf/chat_template.jinja --reasoning-format deepseek -ngl 99 -c 145000 --parallel 1 -fa on -b 2048 -ub 2048 --no-mmproj-offload -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --draft-p-min 0`
-              started by ~/llama-serve.sh (as read 2026-10-15, edited by the user 2026-10-07; also sets LLAMA_CACHE=/mnt/hdd/gguf NCCL_P2P_LEVEL=SYS and the GPUS line above); the router child that ran on 2026-10-15 served MODEL_Q6 (the client picks the model from --models-dir). The 2026-09-03 line had -c 160000, F16 KV and --tools all
+SERVER_FLAGS: router `llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --split-mode tensor --cache-ram 16384 --jinja --chat-template-file /mnt/hdd/gguf/chat_template.jinja --reasoning-format deepseek -ngl 99 -c 145000 --parallel 1 -fa on -b 2048 -ub 2048 --no-mmproj-offload -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --draft-p-min 0 --load-mode dio`
+              started by ~/llama-serve.sh (as read 2026-10-15, edited by the user 2026-10-07; `--load-mode dio` added 2026-11-11 on the user's request for patch 48 (THP1), backup in ~/p100-opt/thp1/prod/; also sets LLAMA_CACHE=/mnt/hdd/gguf NCCL_P2P_LEVEL=SYS and the GPUS line above); the router child that ran on 2026-10-15 served MODEL_Q6 (the client picks the model from --models-dir). The 2026-09-03 line had -c 160000, F16 KV and --tools all
               production binary: /home/krk/llama.cpp/build/bin/llama (branch `p100-b12212` since 2026-11-11, `p100-b11682` 2026-11-09 to 2026-11-11, `p100-b11436` 2026-10-06 to 2026-11-09; do not touch)
 SUDO=no                                        # no clock/power/persistence/IOMMU changes possible; record and recommend only
 PROD_PAUSE=ask                                 # user 2026-09-03: production was not in use then and agents could stop it. Since 2026-10-15 it is in use again: GPU work needs the user's word that the GPUs are free, and a production process that appears is never stopped (the kvq8 scripts abort instead). No `llama-serve.sh` runs by agents
@@ -1265,7 +1265,8 @@ at the user-message start and at 4 and 4+n_ubatch tokens before the end, bypassi
 one ubatch, upper bound 1.98 -> ~1.1 s per follow-up, context independent. Design question to
 settle first: which of the three checkpoints the `n_past--` re-decode and a mid-turn prefix
 mismatch actually need. K1: mmap loads in 4 s warm; `--load-mode dio` takes 70 s on the HDD.
-Keep mmap.
+Keep mmap. (Superseded 2026-11-11: production uses `--load-mode dio` because patch 48 needs free
+2 MiB blocks. Cold Q6_K start 87 s dio vs 84 s mmap; the `/mnt/hdd` disk is a SATA SSD.)
 
 ### Tier 1: small, high-confidence code changes (each < 1 day, one commit, kill switch)
 
@@ -1327,7 +1328,9 @@ table). Nothing in this list is killed; the numbers say what each is worth if it
 | 18b (b11436) | fuse the qwen35 GDN q/k `RMS_NORM + SCALE` pair (#28068 replaced `ggml_l2_norm` with it, so patch 18's L2_NORM sibling fusion went dead and #29393 fuses each norm alone) | 48 launches per token per card, the likely cause of the -0.37% tg of `p100-b11436` against `p100-b10758` | patch 18's sibling rule retargeted; `norm.cu` already has `do_scale` |
 | 19b (b12212) | patch 19's pre-add prologue on #29720's float4 path, in upstream's summation order (today it bypasses the dispatcher and runs the scalar kernel) | bit-identical to stock again (19 is the only prompt-processing difference: Q6_K q8_0 ppl 6.0782 vs 6.0940); validation agent's estimate ~6.5 vs 9.11 us per pre-add, ~0.3 ms per token per card (~1% tg), unmeasured | `norm.cu`, `static_assert(!do_pre_add \|\| !do_vec)` marks the spot; measured 2026-11-10: 19 on vs off pp +0.3-0.44%, tg -0.16% to +0.03% |
 | M31660 (b12212) | the MTP conv-snapshot index chain of #30878/#31660 (ARANGE + SCALE_BIAS + CAST + SET_ROWS per GDN layer, 192 launches per verify step per card; the index is the same for all 48 layers): build it once per step, or fuse it | MTP -0.3% against `p100-b11682` (+343 us launches per step per card at equal kernel time) | upstream graph code (`build_conv_state` side), rebase cost; patch 18's CPY merge went dead with it |
-| THP1 (b12212) | huge pages for the host state buffers (`common_state_data` of checkpoints and prompt-cache entries): 2 MiB-aligned allocation plus `madvise(MADV_HUGEPAGE)` for large buffers (THP is in `madvise` mode on krk-lab) | first touch 74 -> 28 ms per 150 MiB and 189 -> 71 ms per 380 MiB (CPU probe). That is ~45 ms per fresh checkpoint on the production line, where patch 47 saves only ~5 ms, and ~120 ms per prompt-cache save; unmeasured end to end | `~/p100-opt/b12212/v2/tools/faultthp.c`, `log/faultthp.txt`; risk: depends on THP availability, and `defrag=madvise` can stall on fragmented memory |
+| THP1 (b12212) | DONE 2026-11-11 as `p100x: 48-state-thp` (P100-PATCHES.md section 48; `~/p100-opt/thp1/REPORT.md`). Guarded huge pages plus `MADV_POPULATE_WRITE`; production needs `--load-mode dio` so that the page cache leaves free 2 MiB blocks | fresh checkpoint 105 -> 53 ms, production follow-up 936 -> 884 ms, prompt-cache save 285 -> 171 ms | without the guard: synchronous compaction stalls of up to 2 s once the page cache fills the RAM |
+| THP2 (b12212) | `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` made MTP generation 0.4-0.9% faster, additive to patch 48 (16 tokens: 338.1-338.6 vs 340.5-340.8 ms). Some host buffer allocated through malloc benefits from huge pages. Find it and give it a guarded allocation like 48's; the tunable itself has no guard (495 compaction stalls in one run) and adds +70-88 MiB RSS | ~0.5% tg | `~/p100-opt/thp1/log/t9-summary.txt`, `t4-summary.txt` |
+| THP3 (b12212) | prefault the next checkpoint buffer in the background while tokens are generated (a per-slot future next to patch 37's spare) | ~23 ms per fresh checkpoint on top of 48 (53 -> ~30 ms) | ~40-60 lines in `server-context.cpp`, a second thread on slot state, one idle 150 MiB buffer per slot; report task 9 |
 | Q3K (b12212) | Q3_K int8 MMVQ at 2-8 columns after #30517 (VDR 2): 4-13% slower than stock at 2-4 columns, 13-33% slower than `p100-b11682` and stock at 5-8 (patch 02's 4 rows per block, patch 35's column threshold measured on the old kernel) | only Qwen Q4_K_M (7 Q3_K, 4 IQ3_S tensors); none in the production Q6_K | `~/p100-opt/b12212/log/mmvq-summary.txt`; retune 02/35 for Q2_K/Q3_K |
 | E2 | MRoPE variant of the fused `RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)` kernel; the node order already matches, one mode check blocks it | 0.12 ms per token, 0.4% tg | ggml-cuda.cu ~2811, `ggml_cuda_op_rms_norm_mul_rope_fused` |
 | D4 | one kernel for `rms_norm(attn_out) * w * silu(z)`, deferred past the z matvec (patch 23 style) | 0.12 ms, 0.4% | 48 launches per token |
@@ -1621,7 +1624,9 @@ llama.cpp behavior on this hardware:
 25. Graph reuse breaks on any ubatch shape change (MTP with variable draft length), costing a
     rebuild plus a 15-20 ms meta re-split; `--draft-p-min 0` keeps the shape constant.
 26. The pinned async model upload exists only without mmap (`--load-mode dio`); mmap and the 8 GB
-    host cache compete for page cache on 32 GB.
+    host cache compete for page cache on 32 GB. With `-sm tensor` dio does not use the async upload
+    either (the meta buffer type is not the device default); it reads with O_DIRECT and uploads
+    synchronously (THP1, 2026-11-11).
 27. Greedy output must be bit-identical to stock for every patch that does not change math;
     F16-accumulating changes (B4, F5's BF16 wire, cuBLAS compute type) must document it and pass
     the perplexity check.
@@ -1737,6 +1742,11 @@ llama.cpp behavior on this hardware:
 46. `test-llama-archs` crashes are not deterministic: the gist's scratch-pool bug (patch 45) hit 1 run
     in 4 on b10758 and 4 in 15 on b11436, at a different architecture each time. One clean run proves
     nothing; run it at least 6 times after any change to `ggml-backend-meta.cpp` or a rebase.
+47. Huge pages are not free when the page cache fills the RAM: with THP `defrag=madvise` a
+    `MADV_HUGEPAGE` fault without a free 2 MiB block reclaims and compacts synchronously (0.6-2 s per
+    150 MiB buffer in THP1). A CPU probe that frees each buffer before the next does not show it;
+    measure with a server that keeps adding buffers, after a cold model load or under a balloon.
+    Patch 48 guards on `/proc/buddyinfo`; `--load-mode dio` keeps the model out of the page cache.
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
@@ -1783,8 +1793,12 @@ NCCL_P2P_LEVEL=SYS LLAMA_CACHE=/mnt/hdd/gguf CUDA_VISIBLE_DEVICES=<the two P100 
 llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --split-mode tensor --cache-ram 16384 \
   --jinja --chat-template-file /mnt/hdd/gguf/chat_template.jinja --reasoning-format deepseek \
   -ngl 99 -c 145000 --parallel 1 -fa on -b 2048 -ub 2048 --no-mmproj-offload -ctk q8_0 -ctv q8_0 \
-  --spec-type draft-mtp --draft-p-min 0
+  --spec-type draft-mtp --draft-p-min 0 --load-mode dio
 ```
+
+`--load-mode dio` was added on 2026-11-11 for patch 48 (THP1). It keeps the GGUF out of the page cache, so
+the state buffers get huge pages. The cost is 3 s per cold start, and a same-day restart or router
+model switch is a disk read (~85 s) instead of a page-cache hit (~8 s).
 
 Three options were measured on the branch build (C9; MTP width 3, server t/s on the same request,
 ms per verify step in brackets; perplexity at `-c 2048`, 20 chunks):
@@ -1828,8 +1842,8 @@ What the earlier measurements added, and still holds for every option:
   (harmless, a no-op here), stock governor and C-states, ASPM not applicable, no application clocks
   (boost already sits at 1328 MHz under load). Do not set compute mode EXCLUSIVE_PROCESS (router
   children).
-- Binary: the branch build. Production `/home/krk/llama.cpp` runs `p100-b12212` since 2026-11-11
-  (1.43x stock tg); the previous `p100-b11682` binaries are kept in `build-p100-b11682` as the fallback.
+- Binary: the branch build. Production `/home/krk/llama.cpp` runs `p100-b12212` since 2026-11-11, with
+  patch 48 since 2026-11-11 13:01 (1.43x stock tg); the previous `p100-b11682` binaries are kept in `build-p100-b11682` as the fallback.
 - `~/llama-serve.sh` carries option A including `NCCL_P2P_LEVEL=SYS`. `P100-README.md` is the quick
   start for rebuilding its binary from this branch.
 
@@ -1855,6 +1869,8 @@ What the earlier measurements added, and still holds for every option:
 | `GGML_SCHED_DEBUG=1|2`, `GGML_SCHED_DEBUG_REALLOC=1` | scheduler assignments, unexpected reallocs |
 | `LLAMA_GRAPH_REUSE_DISABLE=1` | llama graph reuse off (-27% tg here; diagnostic only) |
 | `LLAMA_SAMPLER_PREFILTER=0` | patch 13 off (and 43 with it) |
+| `LLAMA_STATE_THP=0|1|2` | patch 48: large state buffers in guarded huge pages (1, default), off (0), unguarded (2, measurement only) |
+| `LLAMA_STATE_PREFAULT=0|1|2` | patches 47/48: state buffer prefault off / memset / `MADV_POPULATE_WRITE` (default) |
 | `LLAMA_MTP_DRAFT_VOCAB=<file>` | patch 15 draft vocab subset |
 | `LLAMA_SERVER_SLOTS_DEBUG=1`, `LLAMA_TRACE=1` | server slot/trace logging (J1) |
 | `CUDA_SCALE_LAUNCH_QUEUES=4x` | larger CUDA command buffer (G5) |

@@ -1,7 +1,7 @@
 # P100 quick reference (2x Tesla P100 on krk-lab)
 
 Branch `p100-b12212` = upstream master at d78f4255d (tag b12212) + the shinbunbun P100 patch set
-(01-30, four dropped as superseded) + the philpax meta-backend gist + local patches `p100x` 31-47.
+(01-30, four dropped as superseded) + the philpax meta-backend gist + local patches `p100x` 31-48.
 Measured on the box against a stock build of the same base: Qwen3.8-27B UD-Q4_K_M tg 32.90 vs 22.94 t/s
 (1.43x), pp2048 470 vs 462 t/s at `-ub 2048`; Gemma 4 31B UD-Q4_K_XL tg 29.6 vs 18.9 t/s (1.57x); MTP
 chat on the production line 44-55 t/s. The previous branch `p100-b11682` is kept unchanged as the
@@ -53,7 +53,7 @@ step 1, so nothing in it has to change for the update. As read on 2026-10-15 (ed
 2026-10-07) it runs `llama serve` (router, `--models-dir`) with `NCCL_P2P_LEVEL=SYS --split-mode tensor
 -fa on -b 2048 -ub 2048 -c 145000 --parallel 1 --cache-ram 16384 --jinja --chat-template-file
 /mnt/hdd/gguf/chat_template.jinja --reasoning-format deepseek -ctk q8_0 -ctv q8_0 --spec-type draft-mtp
---draft-p-min 0`, and the client requests Qwen3.8-27B UD-Q6_K. That is option A of plan section 7,
+--draft-p-min 0` (since 2026-11-11 also `--load-mode dio`, see below), and the client requests Qwen3.8-27B UD-Q6_K. That is option A of plan section 7,
 validated on this branch on 2026-10-15 (plan item C9):
 
 - It works: a 139k-token chat plus near-exact prefix-hit follow-ups, no crash; greedy output matches
@@ -76,6 +76,13 @@ q8_0 slot save/restore and prompt cache). Checked on this line on b12212: a slot
 trip (with the MTP draft state), two conversations that push each other through the prompt cache with
 continuations equal to a cold control, and a 139.5k fill. #30137 also made fresh checkpoints slower,
 and patch 47 takes that back: ~75 ms per follow-up on a line without MTP, only ~5 ms on this MTP line.
+Patch 48 puts the large state buffers in huge pages. On this line a fresh checkpoint takes 53 ms
+instead of 105, a follow-up 884 ms instead of 936, and a prompt-cache save 171 ms instead of 285.
+This needs `--load-mode dio`. With the default mmap the 22 GB GGUF stays in the page cache, the
+kernel then has few free 2 MiB blocks, and patch 48's guard falls back to 4 KiB pages (about
+two thirds of the gain). Without the guard the kernel would compact memory synchronously, at up to 2 s per
+request. The cost of dio: a cold start takes 87 s instead of 84, and a restart or router model
+switch on the same day reads the file from disk again (~85 s) instead of the page cache (~8 s).
 MTP chat is 0.3% slower than on b11682 (#31660 builds
 the conv snapshots with 4 launches per layer).
 What b11682 changes at the serving level: context checkpoints and the MTP draft state are stored in
@@ -84,7 +91,8 @@ this line. What b11436 changed (P100-PATCHES.md, rebase sections): `preserve_rea
 by default (earlier turns' reasoning stays in the prompt; `--no-reasoning-preserve` for the old
 behaviour); context checkpoints are kept until the list is full, so a long chat holds up to
 `--ctx-checkpoints` (default 32) x 150 MB of host memory per slot, 5.6 GB measured; `--mmap`,
-`--no-mmap`, `--mlock` and `-dio` no longer exist (`-lm/--load-mode`), the script uses none of them.
+`--no-mmap`, `--mlock` and `-dio` no longer exist (`-lm/--load-mode`); the script uses `--load-mode dio`
+(added 2026-11-11 for patch 48).
 
 No GPU or host state changes are needed or useful: no power limit (tg draws ~155 W per card and is
 flat down to a 175 W cap; only pp is clipped), persistence mode is a no-op on this host, stock
@@ -104,7 +112,7 @@ anything looks off, serve with that variable set (costs ~8% tg) and note it.
 |---|---|
 | garbage or nan output on a model | `GGML_CUDA_DISABLE_MMVQ_F16_K=1` (HFMA2 K-quant matvec off, exact int8 path) |
 | attention wrong at long context | `GGML_CUDA_FATTN_TILE_LEGACY=1` (patches 36/38 off) |
-| follow-up requests misbehave | `LLAMA_SERVER_CKPT_LEGACY=1`, `LLAMA_SERVER_CKPT_SAVE_LEGACY=1` (patches 31/37 off), `LLAMA_STATE_PREFAULT=0` (patch 47 off) |
+| follow-up requests misbehave | `LLAMA_SERVER_CKPT_LEGACY=1`, `LLAMA_SERVER_CKPT_SAVE_LEGACY=1` (patches 31/37 off), `LLAMA_STATE_THP=0 LLAMA_STATE_PREFAULT=1` (patch 48 off, back to 47), `LLAMA_STATE_PREFAULT=0` (no prefault at all) |
 | abort inside cuBLAS on a wide batch | `GGML_CUDA_CUBLAS_CHUNK_MB=0` (patch 44 off) or a smaller value |
 | norm or delta-net (qwen35) suspicion at decode | `GGML_CUDA_NORM_GRID_LOOP=1`, `GGML_CUDA_GDN_COLS_PER_WARP=4` (patch 46 off) |
 | sampler oddities with grammars or tools | `LLAMA_SAMPLER_PREFILTER=0` |
