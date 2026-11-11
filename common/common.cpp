@@ -59,6 +59,11 @@
 #include <pwd.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <new>
+#endif
+
 #if defined(_AIX)
 #include <sys/systemcfg.h>
 #endif
@@ -2419,22 +2424,162 @@ void common_prompt_checkpoint::update_pos(
 
 // #30137 leaves new state bytes uninitialized, so a fresh buffer was first touched by the pageable device-to-host
 // copy that fills it. On the P100 host that copy then took ~180 ms instead of ~105 ms for a 150 MiB recurrent-state
-// checkpoint (follow-up prompt phase 426 -> 501 ms). Touching the grown part first, as the zero-filling std::vector
-// did before #30137, takes the page faults out of the copy. A buffer recycled at the same size (patch 37) is not
-// touched again.
+// checkpoint (follow-up prompt phase 426 -> 501 ms). Faulting the grown part in first takes the page faults out of the
+// copy, where they can overlap the GPU work still in flight. MADV_POPULATE_WRITE does it in one call without a pass
+// over the memory: 38 ms instead of 73 ms for a zero-fill per 150 MiB in 4 KiB pages, 23 instead of 29 ms in 2 MiB
+// pages. A buffer recycled at the same size (patch 37) is not touched again.
 void common_state_data_resize(common_state_data & data, size_t size) {
-    static const bool prefault = [] {
+    // 0: off, 1: zero-fill, 2: MADV_POPULATE_WRITE (default; zero-fill where it is not available)
+    static const int prefault = [] {
         const char * env = getenv("LLAMA_STATE_PREFAULT");
-        return env == nullptr || atoi(env) != 0;
+        return env == nullptr ? 2 : atoi(env);
     }();
 
     const size_t size_old = data.size();
 
     data.resize(size);
 
-    if (prefault && size > size_old) {
-        memset(data.data() + size_old, 0, size - size_old);
+    if (prefault == 0 || size <= size_old) {
+        return;
     }
+
+    uint8_t * ptr = data.data() + size_old;
+    const size_t n = size - size_old;
+
+#if defined(__linux__) && defined(MADV_POPULATE_WRITE)
+    // the kernel populates the pages writable (zeroed; in 2 MiB pages where the allocator madvised MADV_HUGEPAGE)
+    // without a user-space pass over them; the range is widened to whole pages, all of which hold bytes of this buffer
+    if (prefault == 2) {
+        static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+        const uintptr_t beg = (uintptr_t) ptr & ~(page - 1);
+        const uintptr_t end = ((uintptr_t) ptr + n + page - 1) & ~(page - 1);
+        if (madvise((void *) beg, end - beg, MADV_POPULATE_WRITE) == 0) {
+            return;
+        }
+    }
+#endif
+
+    memset(ptr, 0, n);
+}
+
+// Large state buffers (a 150 MiB recurrent-state checkpoint, a 380 MiB prompt-cache entry) are written once by the state
+// copy right after they are allocated. With 4 KiB pages their first touch costs ~0.5 ms per MiB of page faults on the
+// P100 host (74 ms per 150 MiB); in 2 MiB pages it is ~0.15 ms per MiB. THP runs in "madvise" mode on most distributions,
+// so the buffer has to ask for it, and only 2 MiB-aligned 2 MiB ranges inside the mapping can get a huge page.
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+static constexpr size_t COMMON_STATE_HUGE_SIZE = 2u << 20; // PMD size of x86-64 and of arm64 with 4 KiB pages
+static constexpr size_t COMMON_STATE_HUGE_MIN  = 32u << 20;
+
+// LLAMA_STATE_THP: 0 = std::allocator, 1 = huge pages while the kernel has free 2 MiB blocks (default),
+// 2 = always ask for huge pages
+static int common_state_huge_mode() {
+    static const int mode = [] {
+        const char * env = getenv("LLAMA_STATE_THP");
+        return env == nullptr ? 1 : atoi(env);
+    }();
+    return mode;
+}
+
+static size_t common_state_huge_min() {
+    return common_state_huge_mode() == 0 ? SIZE_MAX : COMMON_STATE_HUGE_MIN;
+}
+
+static size_t common_state_huge_len(size_t size) {
+    return (size + COMMON_STATE_HUGE_SIZE - 1) & ~(COMMON_STATE_HUGE_SIZE - 1);
+}
+
+// With THP defrag "madvise" (the default) a fault in a MADV_HUGEPAGE range that finds no free 2 MiB block reclaims and
+// compacts memory synchronously. Once the page cache fills the RAM that costs far more than the 4 KiB faults it saves
+// (a fresh 150 MiB checkpoint took up to 600 ms instead of 105 ms), so huge pages are only asked for while the free
+// lists hold at least twice the buffer in blocks of 2 MiB or more (/proc/buddyinfo, all zones; orders >= 9 with
+// 4 KiB pages).
+static bool common_state_huge_available(size_t len) {
+    FILE * f = fopen("/proc/buddyinfo", "r");
+    if (f == nullptr) {
+        return false;
+    }
+
+    size_t n_huge = 0;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        // "Node 0, zone   Normal   <free blocks of order 0> <order 1> ... <order 10>"
+        const char * p = strstr(line, "zone");
+        if (p == nullptr) {
+            continue;
+        }
+        p += 4;
+        while (*p == ' ') {
+            p++;
+        }
+        while (*p != ' ' && *p != '\0') {
+            p++;
+        }
+        for (int order = 0; ; ++order) {
+            char * end = nullptr;
+            const unsigned long long n = strtoull(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            if (order >= 9) {
+                n_huge += (size_t) n << (order - 9);
+            }
+            p = end;
+        }
+    }
+
+    fclose(f);
+
+    return n_huge * COMMON_STATE_HUGE_SIZE >= 2 * len;
+}
+#endif
+
+void * common_state_alloc_large(size_t size) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (size < common_state_huge_min()) {
+        return nullptr;
+    }
+
+    const size_t len = common_state_huge_len(size);
+
+    // map one huge page more, then unmap the unaligned head and the rest of the tail
+    uint8_t * raw = (uint8_t *) mmap(nullptr, len + COMMON_STATE_HUGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) {
+        throw std::bad_alloc();
+    }
+
+    uint8_t * ptr = (uint8_t *) (((uintptr_t) raw + COMMON_STATE_HUGE_SIZE - 1) & ~(uintptr_t) (COMMON_STATE_HUGE_SIZE - 1));
+    if (ptr > raw) {
+        munmap(raw, ptr - raw);
+    }
+    munmap(ptr + len, raw + len + COMMON_STATE_HUGE_SIZE - (ptr + len));
+
+    // without the madvise (or if it fails: THP not built into the kernel) it is an ordinary mapping
+    if (common_state_huge_mode() == 2 || common_state_huge_available(len)) {
+        madvise(ptr, len, MADV_HUGEPAGE);
+    }
+
+    return ptr;
+#else
+    GGML_UNUSED(size);
+    return nullptr;
+#endif
+}
+
+bool common_state_free_large(void * ptr, size_t size) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (size < common_state_huge_min()) {
+        return false;
+    }
+
+    munmap(ptr, common_state_huge_len(size));
+
+    return true;
+#else
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    return false;
+#endif
 }
 
 void common_prompt_checkpoint::update_tgt(

@@ -1301,11 +1301,42 @@ struct common_no_init_allocator : std::allocator<T> {
     template <typename U> void construct(U * p) { ::new ((void *) p) U; }
 };
 
-// sequence state data, filled by llama_state_seq_get_data_ext()
-using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
+// large state buffers on Linux: a buffer of at least 32 MiB gets its own mapping at a 2 MiB-aligned address, its size
+// rounded up to 2 MiB, madvised MADV_HUGEPAGE while the kernel has free 2 MiB blocks for it, so that its first touch
+// faults in 2 MiB pages instead of 4 KiB ones (LLAMA_STATE_THP=0: std::allocator, 2: madvise without looking at the
+// free blocks). Whether a buffer takes this path depends only on its size and on the switch (read once), so the
+// allocator stays stateless and alloc/free always agree. alloc returns nullptr for a size it does not take and throws
+// std::bad_alloc if the mapping fails; free returns false for a size alloc does not take. Other platforms: never taken.
+void * common_state_alloc_large(size_t size);
+bool   common_state_free_large(void * ptr, size_t size);
 
-// resize state data that a state copy fills next; the grown part is zero-filled first so its pages are faulted in
-// here and not inside the pageable device-to-host copy (LLAMA_STATE_PREFAULT=0: plain uninitialized resize)
+template <typename T>
+struct common_state_allocator : common_no_init_allocator<T> {
+    template <typename U> struct rebind { using other = common_state_allocator<U>; };
+
+    common_state_allocator() = default;
+    template <typename U> common_state_allocator(const common_state_allocator<U> &) {}
+
+    T * allocate(size_t n) {
+        if (void * p = common_state_alloc_large(n * sizeof(T))) {
+            return static_cast<T *>(p);
+        }
+        return std::allocator<T>::allocate(n);
+    }
+
+    void deallocate(T * p, size_t n) {
+        if (!common_state_free_large(p, n * sizeof(T))) {
+            std::allocator<T>::deallocate(p, n);
+        }
+    }
+};
+
+// sequence state data, filled by llama_state_seq_get_data_ext()
+using common_state_data = std::vector<uint8_t, common_state_allocator<uint8_t>>;
+
+// resize state data that a state copy fills next; the grown part is prefaulted first so its pages are faulted in
+// here and not inside the pageable device-to-host copy. LLAMA_STATE_PREFAULT: 0 = plain uninitialized resize,
+// 1 = zero-fill, 2 = madvise(MADV_POPULATE_WRITE) (default; no user-space pass, zero-fill where it fails)
 void common_state_data_resize(common_state_data & data, size_t size);
 
 struct common_prompt_checkpoint {
