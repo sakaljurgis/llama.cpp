@@ -1326,7 +1326,7 @@ table). Nothing in this list is killed; the numbers say what each is worth if it
 | Item | What is left | Worth | Notes |
 |---|---|---|---|
 | 18b (b11436) | fuse the qwen35 GDN q/k `RMS_NORM + SCALE` pair (#28068 replaced `ggml_l2_norm` with it, so patch 18's L2_NORM sibling fusion went dead and #29393 fuses each norm alone) | 48 launches per token per card, the likely cause of the -0.37% tg of `p100-b11436` against `p100-b10758` | patch 18's sibling rule retargeted; `norm.cu` already has `do_scale` |
-| 19b (b12212) | patch 19's pre-add prologue on #29720's float4 path, in upstream's summation order (today it bypasses the dispatcher and runs the scalar kernel) | bit-identical to stock again (19 is the only prompt-processing difference: Q6_K q8_0 ppl 6.0782 vs 6.0940); validation agent's estimate ~6.5 vs 9.11 us per pre-add, ~0.3 ms per token per card (~1% tg), unmeasured | `norm.cu`, `static_assert(!do_pre_add \|\| !do_vec)` marks the spot; measured 2026-11-10: 19 on vs off pp +0.3-0.44%, tg -0.16% to +0.03% |
+| 19b (b12212) | DONE 2026-11-12 as `p100x: 19b-pre-add-float4` (P100-PATCHES.md section 19b; `~/p100-opt/19b/REPORT.md`). Patch 19's pre-add prologue on #29720's float4 path, through `rms_norm_f32_dispatch` (16-byte alignment of the ADD's tensors added), in upstream's summation order; refused rows keep the scalar pre-add | bit-identical to stock (logits md5 = stock on Q4_K_M F16 and Q6_K q8_0, ppl 6.0940 = stock); 9.12 -> 6.75 us per decode pre-add; tg +1.27% (Q4_K_M), +1.23% at depth 16384, +0.75% (Q6_K q8_0), MTP production line +0.65%, pp and Gemma 4 unchanged (estimate was ~6.5 us, ~1%) | kill switch `GGML_CUDA_PRE_ADD_SCALAR=1`; no grid loop unless clamped (40 vs 48 registers); stock math now needs three switches; fold into 19 at the next rebase |
 | M31660 (b12212) | the MTP conv-snapshot index chain of #30878/#31660 (ARANGE + SCALE_BIAS + CAST + SET_ROWS per GDN layer, 192 launches per verify step per card; the index is the same for all 48 layers): build it once per step, or fuse it | MTP -0.3% against `p100-b11682` (+343 us launches per step per card at equal kernel time) | upstream graph code (`build_conv_state` side), rebase cost; patch 18's CPY merge went dead with it |
 | THP1 (b12212) | DONE 2026-11-11 as `p100x: 48-state-thp` (P100-PATCHES.md section 48; `~/p100-opt/thp1/REPORT.md`). Guarded huge pages plus `MADV_POPULATE_WRITE`; production needs `--load-mode dio` so that the page cache leaves free 2 MiB blocks | fresh checkpoint 105 -> 53 ms, production follow-up 936 -> 884 ms, prompt-cache save 285 -> 171 ms | without the guard: synchronous compaction stalls of up to 2 s once the page cache fills the RAM |
 | THP2 (b12212) | CLOSED 2026-11-12, no patch (`~/p100-opt/thp2/REPORT.md`). `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` speeds up generation by 0.1-0.2% per token (Q4 MTP line 20.30 -> 20.28 ms/token, -0.10..-0.15%; ~20k-token prompts -0.13%; llama-bench tg128 -0.08%; production line with dio 23.448 -> 23.404 ms/token, -0.19%) plus ~1.5-2.5 ms per reply start. THP1's -0.9% was measured on 16-token replies, where that per-request part dominates (now -0.54..-0.88%). The owner is the main sbrk heap's small objects (graph build, scheduler, `-sm tensor` split, ~900-1500 mallocs per token): huge pages for every allocation >= 64 KiB give nothing, a one-time `MADV_COLLAPSE` of the heap alone gives all of it. Dropped suspects: per-token churn (0.35 allocations >= 64 KiB per token, reused; 0.2-0.8 faults per token), sampler arrays (`cur` holds the prefiltered candidates, never n_vocab), output buffer (`CUDA_Host`, pinned) | 0.1-0.2% tg | a heap collapse after load behind 48's guard was measured (same gain, +22 MiB instead of ~100) but not built: Linux >= 6.1, ~40 lines, not worth 0.13-0.19%. The tunable is documented as an optional knob in P100-README section 3 (safe with dio, no guard) |
@@ -1752,6 +1752,10 @@ llama.cpp behavior on this hardware:
     `__libc_malloc` and friends directly, and check `AnonHugePages` under the shim before trusting a
     huge-page arm. The tunable's gain also depends on where glibc's chunks land against 2 MiB
     boundaries: 1 of 8 runs got none, so give it 4+ alternated runs.
+49. A final perplexity equal to four decimals does not mean equal numerics. On b12212, patch 19's scalar
+    order matched stock's Q4_K_M F16 ppl (6.0663) while 18 of 20 chunks differed (chunk 1 5.1907 vs
+    5.2150; 19b). For a bit-identity claim compare the logits: md5 of the `--kl-divergence-base` file
+    (a fifo into `md5sum` avoids writing the multi-GB file), or every chunk.
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
@@ -1850,7 +1854,7 @@ What the earlier measurements added, and still holds for every option:
   (boost already sits at 1328 MHz under load). Do not set compute mode EXCLUSIVE_PROCESS (router
   children).
 - Binary: the branch build. Production `/home/krk/llama.cpp` runs `p100-b12212` since 2026-11-11, with
-  patch 48 since 2026-11-11 13:01 (1.43x stock tg); the previous `p100-b11682` binaries are kept in `build-p100-b11682` as the fallback.
+  patch 48 since 2026-11-11 13:01 and 19b since 2026-11-12 14:03 (1.45x stock tg); the previous `p100-b11682` binaries are kept in `build-p100-b11682` as the fallback.
 - `~/llama-serve.sh` carries option A including `NCCL_P2P_LEVEL=SYS`. `P100-README.md` is the quick
   start for rebuilding its binary from this branch.
 
@@ -1889,6 +1893,7 @@ What the earlier measurements added, and still holds for every option:
 | `GGML_CUDA_DISABLE_CONVERT_VEC=1` | patch 39 kill switch: scalar `convert_unary` for the contiguous F16/BF16 <-> F32 conversions |
 | `GGML_CUDA_DISABLE_DEQUANT_VEC=1` | patch 39 kill switch: scalar stores and one super block per block for the Q4_K/IQ4_XS dequant |
 | `GGML_CUDA_NORM_CACHE_LEGACY=1` | patch 40/42 kill switch: `rms_norm` register cache limited to 4096 columns (patch 17) |
+| `GGML_CUDA_PRE_ADD_SCALAR=1` | patch 19b kill switch: 19's pre-add back on the scalar kernel (b12212 numerics, not bit-identical to stock) |
 | `GGML_A16K_CHECK=1` | patch 41 debug: sync after every HFMA2 K-quant matvec and print the first launches with a non-finite output |
 | `GGML_CUDA_CUBLAS_CHUNK_MB=N` (default 256, 0 = off) | patch 44 kill switch and threshold: convert and multiply a src0 copy above N MiB in row chunks |
 | `GGML_CUDA_CUBLAS_CHUNK_ROWS=N`, `GGML_CUDA_CUBLAS_CHUNK_LOG=1` | patch 44 test knobs: force N rows per chunk; one stderr line per split call |

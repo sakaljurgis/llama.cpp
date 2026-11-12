@@ -1,9 +1,9 @@
 # P100 quick reference (2x Tesla P100 on krk-lab)
 
 Branch `p100-b12212` = upstream master at d78f4255d (tag b12212) + the shinbunbun P100 patch set
-(01-30, four dropped as superseded) + the philpax meta-backend gist + local patches `p100x` 31-48.
-Measured on the box against a stock build of the same base: Qwen3.8-27B UD-Q4_K_M tg 32.90 vs 22.94 t/s
-(1.43x), pp2048 470 vs 462 t/s at `-ub 2048`; Gemma 4 31B UD-Q4_K_XL tg 29.6 vs 18.9 t/s (1.57x); MTP
+(01-30, four dropped as superseded) + the philpax meta-backend gist + local patches `p100x` 31-48 and 19b.
+Measured on the box against a stock build of the same base: Qwen3.8-27B UD-Q4_K_M tg 33.30 vs 22.94 t/s
+(1.45x, with 19b), pp2048 470 vs 462 t/s at `-ub 2048`; Gemma 4 31B UD-Q4_K_XL tg 29.6 vs 18.9 t/s (1.57x); MTP
 chat on the production line 44-55 t/s. The previous branch `p100-b11682` is kept unchanged as the
 fallback.
 
@@ -40,7 +40,7 @@ GGML_A16K_CHECK=1 ./build/bin/llama-completion -m $M -p "Hello, who are you?" -n
     -ngl 99 -sm tensor -fa on -c 4096 --temp 0 -s 1
 ```
 
-Expected: tg64 about 32.7 t/s and pp512 about 262 t/s (the production build on 2026-11-11: 32.71 and 262.56), sensible text, and no `a16k_check:` line on stderr (that line means a
+Expected: tg64 about 33.0 t/s and pp512 about 262 t/s (the production build with 19b on 2026-11-12: 33.04 and 262.69; 32.71 and 262.56 before), sensible text, and no `a16k_check:` line on stderr (that line means a
 non-finite matvec output). `llama-completion` needs `-c 4096` or it takes the 262k training context
 and runs out of memory. The pp512 number here is at `-ub 512` and is not the production pp figure.
 `NCCL_P2P_LEVEL=SYS` matters here: on 2026-10-06 the production build gave pp512 256.6 t/s with it and
@@ -57,8 +57,8 @@ step 1, so nothing in it has to change for the update. As read on 2026-10-15 (ed
 validated on this branch on 2026-10-15 (plan item C9):
 
 - It works: a 139k-token chat plus near-exact prefix-hit follow-ups, no crash; greedy output matches
-  stock with the stock-math switches of section 4 (checked again on b12212); perplexity is 0.26% below
-  stock on b12212 because of patch 19's summation order (6.0782 vs 6.0940), equal to stock with it off.
+  stock with the stock-math switches of section 4 (checked again on b12212); perplexity equals stock
+  since 19b (2026-11-12: 6.0940, logits byte-identical; before that patch 19's summation order gave 6.0782).
   `-sm tensor` does take quantized KV (upstream #23792); older notes here said otherwise.
 - It is at the memory wall: 16187 of 16269 MiB per card at peak (b12212; 16181 on b11682). Do not raise `-c`: 147500 still runs,
   150000 loads and then kills the server on its first request. Keep MTP width 3 (width 1 is slower).
@@ -111,7 +111,7 @@ governor and C-states. Do not set compute mode EXCLUSIVE_PROCESS: the router run
 Before serving a GGUF the branch has not run (plan gotcha 31): run the `GGML_A16K_CHECK=1` sample from
 step 2 with that model (`--jinja` instead of `-no-cnv` for chat models with a strict template), then
 compare a greedy chat reply against the same command with `GGML_CUDA_DISABLE_MMVQ_F16_K=1
-GGML_CUDA_FATTN_TILE_LEGACY=1 GGML_CUDA_GDN_COLS_PER_WARP=4 GGML_CUDA_DISABLE_FUSE_PRE_ADD=1` (stock math). The two replies should read the same; byte-identical is not required (F16 accumulation). If
+GGML_CUDA_FATTN_TILE_LEGACY=1 GGML_CUDA_GDN_COLS_PER_WARP=4` (stock math; since 19b without `GGML_CUDA_DISABLE_FUSE_PRE_ADD=1`). The two replies should read the same; byte-identical is not required (F16 accumulation). If
 anything looks off, serve with that variable set (costs ~8% tg) and note it.
 
 ## 5. Kill switches worth knowing (full table in P100-PATCHES.md, "Runtime knobs")
@@ -122,7 +122,7 @@ anything looks off, serve with that variable set (costs ~8% tg) and note it.
 | attention wrong at long context | `GGML_CUDA_FATTN_TILE_LEGACY=1` (patches 36/38 off) |
 | follow-up requests misbehave | `LLAMA_SERVER_CKPT_LEGACY=1`, `LLAMA_SERVER_CKPT_SAVE_LEGACY=1` (patches 31/37 off), `LLAMA_STATE_THP=0 LLAMA_STATE_PREFAULT=1` (patch 48 off, back to 47), `LLAMA_STATE_PREFAULT=0` (no prefault at all) |
 | abort inside cuBLAS on a wide batch | `GGML_CUDA_CUBLAS_CHUNK_MB=0` (patch 44 off) or a smaller value |
-| norm or delta-net (qwen35) suspicion at decode | `GGML_CUDA_NORM_GRID_LOOP=1`, `GGML_CUDA_GDN_COLS_PER_WARP=4` (patch 46 off) |
+| norm or delta-net (qwen35) suspicion at decode | `GGML_CUDA_PRE_ADD_SCALAR=1` (19b off), `GGML_CUDA_NORM_GRID_LOOP=1`, `GGML_CUDA_GDN_COLS_PER_WARP=4` (patch 46 off) |
 | sampler oddities with grammars or tools | `LLAMA_SAMPLER_PREFILTER=0` |
 | any fusion suspicion | `GGML_CUDA_DISABLE_FUSION=1` (all CUDA fusion rules, upstream and patched) |
 | the meta-backend assert returns | `LLAMA_GRAPH_REUSE_DISABLE=1` (escape hatch only: -27% tg) |
@@ -130,7 +130,7 @@ anything looks off, serve with that variable set (costs ~8% tg) and note it.
 ## 6. Updating to a newer upstream
 
 `P100-PATCHES.md`, "Updating to a new upstream": the branch is a linear series, so it is one
-`git rebase` onto the new master, then the test checklist there. Rebase patches 17/19/40/42 as a
+`git rebase` onto the new master, then the test checklist there. Fold 19b into 19 there (`fixup`). Rebase patches 17/19/40/42 as a
 group (one kernel); 23/24 sit in `ggml_cuda_try_fuse`, which upstream reworks now and then. After
 every rebase check the `launch_fattn` call of patch 36 against upstream's parameter list (b11436 added
 `use_sparse` in front of `warp_size` and a clean merge compiled into a wrong call), and run
@@ -148,7 +148,7 @@ Next: the next upstream rebase, when it is worth one. Parked: QL1 (plan
 it decides between the options of plan section 7.
 
 Plan roadmap "Deferred code items": E2 (0.4% tg), D4 (0.4%), the delta-net conv chain (0.8%), F9
-(unverified), and from b12212 a float4 pre-add for patch 19, the MTP conv-snapshot index chain (0.3% MTP),
+(unverified), and from b12212 the MTP conv-snapshot index chain (0.3% MTP),
 the Q3_K matvec at 2-8 columns and a background prefault of the next checkpoint buffer (THP3, ~23 ms per
 fresh checkpoint on top of patch 48), and the Tier 3 research items (C7 is now quantized-KV attention speed only). Everything above 1% that remains sits inside the matvec
 kernels and NCCL. Rejected with numbers so nobody repeats them: B2, E7, E8, G2/G3, F5, C3, C4.

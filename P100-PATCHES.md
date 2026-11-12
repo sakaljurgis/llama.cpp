@@ -25,6 +25,8 @@ Every patch also carries its reasoning in the comments it adds to the source.
   written for this machine with subject `p100x: NN-name`, numbered from 31 so they never collide
   with the upstream patch repo's 01-30 (see "Local patches" below). 09, 22 and 28 are not on the
   branch (deferred, see below); 03, 06 and 08 were dropped (superseded upstream, see below).
+- `p100x: 19b-pre-add-float4` (2026-11-12, after 48) is a follow-up to patch 19 (section 19b), kept as
+  its own commit so the published branch was not rewritten. Fold it into 19 at the next rebase.
 - One branch per upstream base, named `p100-b<build>` (`p100-b10133`, `p100-b10630`,
   `p100-b10758`, `p100-b11436`, `p100-b11682`, `p100-b12212`). A rebase starts a new branch and leaves
   the old one untouched, so every build stays available for recovery. This document describes
@@ -51,9 +53,9 @@ models listed above; inert patches are kept to stay close to the upstream patch 
 | 14 | getrows-narrow-rows | CUDA | clean | with 15 |
 | 15 | mtp-draft-vocab | model | moved (b11682, #29600) | off unless `LLAMA_MTP_DRAFT_VOCAB` is set |
 | 16 | cpy-fastdiv | CUDA | clean | yes |
-| 17 | norm-register-cache | CUDA | moved (b11436, #29393); rewritten (b11682, #28175); rewritten (b12212, #29720: the cache is now in the scalar path only) | yes (rows the #29720 float4 path refuses, and 19's pre-add norms) |
+| 17 | norm-register-cache | CUDA | moved (b11436, #29393); rewritten (b11682, #28175); rewritten (b12212, #29720: the cache is now in the scalar path only) | since 19b only on rows the #29720 float4 path refuses (Qwen3.8-27B: no scalar norm launch at decode or pp); 19's pre-add norms with `GGML_CUDA_PRE_ADD_SCALAR=1` |
 | 18 | fuse-sibling-nodes | CUDA | moved (b11682, #29807); fused L2_NORM refuses ne2/ne3 > 65535 | practically no: the CPY part does not fire at tg, and with MTP it merged the conv-snapshot CPYs that #30878/#31660 replaced on b12212 (0 per verify step, b11682: 48); the L2_NORM part is dead on qwen35 since #28068 |
-| 19 | fuse-pre-add-rms-norm | CUDA | moved (b11436, #29393); rewritten (b11682, #28175); rewritten (b12212, #29720), since then not bit-identical to stock (rebase section) | yes |
+| 19 | fuse-pre-add-rms-norm | CUDA | moved (b11436, #29393); rewritten (b11682, #28175); rewritten (b12212, #29720), then not bit-identical to stock (rebase section) until 19b (2026-11-12, `p100x: 19b-pre-add-float4`: float4 pre-add, bit-identical to stock again) | yes |
 | 20 | fuse-add-unary-mul | CUDA (delta-net) | clean | qwen35 |
 | 21 | sched-reset-lazy | host | clean | yes |
 | 22 | decode-sched-slots | host | **deferred** (see below) | speculative decoding only |
@@ -197,7 +199,7 @@ to it.
     7.42 vs 7.18 us per launch, 240 launches per token). Neither pp nor Qwen (one float4 launch per token)
     gained from it, so it was taken back on 2026-11-10 before the branch was published. The scalar part
     stays justified: forcing the loop there costs Qwen 0.24-0.38% tg (pre-add 9.85 vs 9.11 us).
-  - Numerics, new on this base: stock b12212 runs the ADD, then RMS_NORM+MUL on the float4 path (the
+  - Numerics, new on this base (fixed by 19b on 2026-11-12): stock b12212 runs the ADD, then RMS_NORM+MUL on the float4 path (the
     5120- and 5376-wide rows qualify). The float4 path adds the squares in a different order from the
     scalar loop, and 19 still uses the scalar order. So with 19 on, the branch is no longer
     bit-identical to stock at the per-token norms; on b11682 both ran the same scalar loop. Greedy
@@ -210,7 +212,8 @@ to it.
     per token per card. Greedy output is identical either way (4/4). Perplexity: Q4_K_M F16 equal to four
     decimals; Q6_K q8_0 6.0782 with 19, 6.0940 without, the latter equal to stock in every chunk, so 19
     is the only numerical difference left in prompt processing. A float4 pre-add in upstream's summation
-    order would make 19 bit-identical to stock again and is probably faster (plan, deferred code items).
+    order was the plan's item 19b. Done on 2026-11-12 (section 19b): bit-identical to stock, 6.75 us per
+    pre-add, tg +1.27%.
 - Gist (`ggml-backend-meta.cpp`): #30499 (GLM-5.3 next) added `ggml_backend_meta_inner_extent` and
   `ggml_backend_meta_view_slab_dim` where the gist adds `ggml_backend_meta_simple_tensor_ensure` and the
   scratch pools. Both are kept, upstream's first. #31447 raised the buffer-owned compute containers to
@@ -450,15 +453,16 @@ for the numbers). Same rules as the upstream set: one commit each, a kill switch
 | 37 | server-ckpt-save | host (server) | yes (hybrid/recurrent models, every context checkpoint save on a follow-up) |
 | 38 | fattn-pb-tiebreak | sm_60 (CUDA) | yes (every one-Q-column flash-attention launch; GQA 6 packing now from n_kv 2560) |
 | 39 | convert-vec | CUDA (all archs, measured on sm_60) | yes (every Q4_K / IQ4_XS dequant before a cuBLAS matmul: pp at every ubatch; the convert half was dropped on b11436) |
-| 40 | norm-cache-5120 | CUDA | yes (every `rms_norm` of a 4097-5120 wide row: all 129 per-token norms of Qwen3.8-27B) |
+| 40 | norm-cache-5120 | CUDA | scalar path only since b12212: every scalar `rms_norm` of a 4097-5120 wide row, which since 19b leaves none on Qwen3.8-27B (all 129 per-token norms take the float4 path) |
 | 41 | mmvq-k-f16-range | sm_60 (CUDA) | yes (every Q6_K matvec at widths 1-8 and IQ4_XS at 4-8; bug fix for 32/33, found on Gemma 4 31B) |
-| 42 | norm-cache-5376 | CUDA | yes (every `rms_norm` of a 5121-6144 wide row: Gemma 4 31B's n_embd 5376) |
+| 42 | norm-cache-5376 | CUDA | scalar path only since b12212: every scalar `rms_norm` of a 5121-6144 wide row (Gemma 4 31B's n_embd 5376, whose norms and, since 19b, pre-add take the float4 path) |
 | 43 | sampler-prefilter-grammar | host (sampling) | yes (every request that carries `tools` with `tool_choice` auto, the coding-harness shape, where patch 13 was off; the MTP verify step doubles the gain) |
 | 44 | cublas-src0-chunk | CUDA (all archs, measured on sm_60) | only above 256 MiB of converted src0, which on these models is exactly the LM head: `ngram-mod` verify batches (default 48-64), never for MTP in a configuration that runs (it would need `--spec-draft-n-max 32`, and J5 measured that widths above 10 do not survive a decode at `-c 160000`), every all-logits pass, and Gemma 4 31B, whose tied LM head is not row-split |
 | 45 | meta-scratch-free-gen | host (meta backend, `-sm tensor`) | yes (bug fix for the gist: every graph-external set/get/memset of a tensor after a meta buffer was freed) |
-| 46 | norm-gdn-decode | CUDA (norm: all archs; GDN: pre-Volta) | yes (every scalar 1024-thread `rms_norm` launch of every model, i.e. 19's pre-add norms; the qwen35 GDN kernel at 1-8 tokens per sequence: tg and MTP verify) |
+| 46 | norm-gdn-decode | CUDA (norm: all archs; GDN: pre-Volta) | yes (every scalar 1024-thread `rms_norm` launch of every model, i.e. 19's pre-add norms until 19b, and since 19b the float4 1024-thread pre-add; the qwen35 GDN kernel at 1-8 tokens per sequence: tg and MTP verify) |
 | 47 | state-prefault | host (common, server) | yes (hybrid/recurrent models: every context checkpoint created into a fresh buffer, i.e. every follow-up until the checkpoint list is full; every prompt-cache save). Measurable only without MTP: -15% per follow-up there, -0.5% on the MTP production line |
 | 48 | state-thp | host (common; Linux) | yes (every state buffer of 32 MiB or more: hybrid/recurrent checkpoints and prompt-cache entries; huge pages only while the kernel has free 2 MiB blocks, i.e. on the production line with `--load-mode dio`). Fresh checkpoint 105 -> 53 ms with MTP |
+| 19b | pre-add-float4 (follow-up to 19, folded into 19 at the next rebase) | CUDA | yes (every fused ADD + RMS_NORM + MUL on a row the float4 path takes: 128 per token per card on Qwen3.8-27B at decode, 128 per ubatch at pp). Bit-identical to stock's ADD + RMS_NORM+MUL; 9.12 -> 6.75 us per decode pre-add, tg +1.27% |
 
 ### 31 server-ckpt-adopt
 
@@ -1398,6 +1402,74 @@ Switches (read once): `LLAMA_STATE_THP=0` keeps `std::allocator`. With `LLAMA_ST
 well, that is exactly patch 47; this was checked (run X0 = base). `LLAMA_STATE_THP=2` madvises without
 the guard and is for measurements only.
 
+### 19b pre-add-float4 (follow-up to 19)
+
+`ggml/src/ggml-cuda/norm.cu` (+45/-34), `tests/test-backend-ops.cpp` (+65). Plan item 19b, written and
+measured on 2026-11-12 (`~/p100-opt/19b/REPORT.md` on krk-lab). Its own commit after 48; fold it into 19
+at the next rebase. It ends the numerical difference that 19 had on b12212 (rebase section) and makes
+the fused kernel faster than both the scalar pre-add and stock's pair.
+
+- Kernel: the float4 branch (`do_vec`) of `rms_norm_f32` gets 19's prologue. Each thread loads its
+  float4 of `pre_a` and `pre_b` and adds them component by component (the ADD kernel's single float add).
+  It writes the sum to `pre_dst` (the residual the next layer reads) and keeps it in `xs[k]`. Upstream's
+  sum of squares, block reduction, `rsqrtf` and multiply then run unchanged. A thread reads and writes
+  only its own elements, so an in-place ADD is safe. `static_assert(!do_pre_add || !do_vec)` is gone.
+- Routing: the pre-add branch of `rms_norm_mul_f32_cuda` calls `rms_norm_f32_dispatch<true, false,
+  false, true>` instead of launching the scalar kernel itself. The dispatcher also requires `pre_a`,
+  `pre_b` and `pre_dst` to be 16-byte aligned. A pre-add row so gets the block size and `vpt` that stock
+  picks for the same RMS_NORM+MUL row (5120 and 5376 wide: `<1024, 4, true>`). Rows the float4 path
+  refuses (ncols % 4 != 0, an unaligned operand, more than 16384 columns) keep b12212's scalar pre-add
+  launches (`<256>` / `<1024>` with the cache, the same instantiations).
+- Grid loop: the float4 1024-thread pre-add runs without the grid-stride loop unless grid y/z were
+  clamped or `GGML_CUDA_NORM_GRID_LOOP=1` is set. That gives 40 instead of 48 registers and 6.75 instead
+  of 7.00 us, and the loop arm was 0.1-0.3% behind in all six Qwen tests. The other float4
+  instantiations loop, as upstream.
+- Numerics: on float4 rows the fused launch is bit-identical to stock's ADD followed by the float4
+  RMS_NORM+MUL. The SASS of the square sum, reduction, scale and multiply equals stock's kernel. The one
+  difference left needs an ADD operand that is not 16-byte aligned while the norm's input is, which only
+  a hand-made view produces. Stock's norm goes float4 there and the pre-add falls back to scalar.
+- With 19b, Qwen3.8-27B runs no scalar `rms_norm` launch at decode or pp (nsys census). The scalar path,
+  and with it 17, 40, 42 and the norm half of 46, only acts on rows the float4 path refuses, or with
+  `GGML_CUDA_PRE_ADD_SCALAR=1`.
+
+Checks on krk-lab. base = the b12212 build (CUDA code identical to `fd4af3665`); stock = base with the
+four stock-math switches, byte-identical to stock b12212 (2026-11-10). Logits are the
+`--kl-divergence-base` files of llama-perplexity on wikitext-2, `-c 2048 -b/-ub 2048`, 20 chunks:
+
+| check | result |
+|---|---|
+| logits, Q4_K_M F16 | 19b and stock math with three switches: md5 = stock, all 20 chunks equal, ppl 6.0663; `GGML_CUDA_PRE_ADD_SCALAR=1`: differs from stock (2 of 20 chunks equal) and equals base |
+| logits, Q6_K q8_0 | 19b: md5 = stock, ppl **6.0940** = stock in every chunk (base and the scalar switch: 6.0782) |
+| KLD 19b vs stock | mean -0.000011, the uint16 quantization floor, as for stock against itself; max 0.000004; same top token 100% |
+| greedy, 4 prompts (t5 protocol) | 19b = stock = base 4/4; stock math with three switches = stock 4/4 |
+| kernel level (norm-shape harness, output and residual hashed) | 19b = stock ADD + float4 RMS_NORM+MUL in every float4 shape, in-place, 2048 rows, clamped grids (66000 and 70000 channels) |
+| test-backend-ops | 19709/19709 on CUDA0 and CUDA1 (19680 + 29 new `ADD_RMS_NORM_MUL` cases; those also pass with the scalar switch and with 19 off) |
+| test-llama-archs | 3/3 runs, 570/570 |
+
+llama-bench, t/s, median of 10 over two alternated passes (`-sm tensor -fa on`, `-ub 2048` unless listed):
+
+| test | base | 19b | change | 19 off |
+|---|---:|---:|---:|---:|
+| Qwen Q4_K_M tg128 | 32.88 | 33.30 | +1.27% | 32.89 |
+| Qwen Q4_K_M tg128 at depth 16384 | 31.61 | 31.99 | +1.23% | 31.65 |
+| Qwen Q6_K q8_0 tg128 | 24.71 | 24.89 | +0.75% | 24.71 |
+| Qwen Q4_K_M pp512 (`-ub 512`) | 262.71 | 262.63 | -0.03% | 261.68 |
+| Qwen Q4_K_M pp2048 | 470.22 | 470.16 | -0.01% | 467.60 |
+| Qwen Q6_K q8_0 pp2048 | 466.71 | 466.89 | +0.04% | 463.86 |
+| Gemma 4 31B tg128 | 29.62 | 29.62 | 0.00% | 29.63 |
+
+- Per pre-add at decode: 6.75 us (scalar 9.12; stock's ADD + float4 RMS_NORM+MUL 3.14 + 5.55). At pp2048
+  316.5 against 328.1 us. 128 per token per card at decode and 128 per ubatch at pp2048.
+- The tg ranges do not overlap; the pp differences are inside the spread. With the scalar switch every
+  test equals base (largest difference -0.17%). Turning 19 off now costs tg as well as pp.
+- MTP production line (Q6_K, q8_0 KV, `--load-mode dio`, 4 requests, runs ordered 19b/base/base/19b):
+  same texts and acceptance, +0.65% t/s (43.54 -> 43.82, 48.86 -> 49.18, 55.08 -> 55.44), 15791 MiB per
+  card in both.
+
+Switch (read once): `GGML_CUDA_PRE_ADD_SCALAR=1` restores b12212's scalar pre-add (logits md5, ppl,
+greedy and bench equal base). `GGML_CUDA_DISABLE_FUSE_PRE_ADD=1` still turns 19 off. Stock math for
+greedy comparisons now needs three switches (test checklist).
+
 ### Meta backend gist
 
 Only used with `-sm tensor` (`ggml/src/ggml-backend-meta.cpp`). Replaces the buffer-global
@@ -1457,6 +1529,7 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_DISABLE_FUSE_CPY`, `GGML_CUDA_DISABLE_FUSE_L2_NORM` | 18 | kill switches |
 | `GGML_CUDA_FUSE_LOG=1|2` | 18 | log which fusion rules fired / why not |
 | `GGML_CUDA_DISABLE_FUSE_PRE_ADD` | 19 | kill switch |
+| `GGML_CUDA_PRE_ADD_SCALAR=1` | 19b | kill switch (19's pre-add back on the scalar kernel of b12212: its summation order, not bit-identical to stock) |
 | `GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL` | 20 | kill switch |
 | `GGML_CUDA_DISABLE_FUSE_GDN_BETA`, `GGML_CUDA_DISABLE_FUSE_GDN_GATHER` | 23, 24 | kill switches |
 | `GGML_CUDA_DISABLE_CPY_ROWS` | 26 | kill switch |
@@ -1482,11 +1555,11 @@ list only its definition and the call inside `ggml_backend_meta_simple_tensor_en
 | `GGML_CUDA_FATTN_PB_TIEBREAK=0` | 38 | kill switch (b10758 `parallel_blocks` search; `GGML_CUDA_FATTN_TILE_LEGACY=1` implies it) |
 | `GGML_CUDA_FATTN_GQA6_MIN_KV=<n>` | 38 | smallest n_kv for the GQA 6 packing: default 2560 (7680 at 2 Q columns), 16384 = patch 36, 0 = always, also with one kv head |
 | `GGML_CUDA_DISABLE_DEQUANT_VEC=1` | 39 | kill switch (Q4_K and IQ4_XS dequant back to per-element stores and one super block per CUDA block) |
-| `GGML_CUDA_NORM_CACHE_LEGACY=1` | 40, 42 | kill switch (`rms_norm_f32` register cache limited to 4 values per thread, `ncols <= 4096`, as in patch 17). Since b12212 it only affects the scalar path: 19's pre-add norms and rows the #29720 float4 path refuses (ncols % 4 != 0, unaligned, mul/add broadcast along the row) |
+| `GGML_CUDA_NORM_CACHE_LEGACY=1` | 40, 42 | kill switch (`rms_norm_f32` register cache limited to 4 values per thread, `ncols <= 4096`, as in patch 17). Since b12212 it only affects the scalar path: rows the #29720 float4 path refuses (ncols % 4 != 0, unaligned, mul/add broadcast along the row), and since 19b 19's pre-add only on such rows or with `GGML_CUDA_PRE_ADD_SCALAR=1` |
 | `GGML_A16K_CHECK=1` | 41 | debug: sync after every HFMA2 K-quant launch and print the first 8 calls with a non-finite dst (tensor, type, shape, block count, first bad value, non-finite count of src1, per-block amax stats) |
 | `GGML_CUDA_CUBLAS_CHUNK_MB=N` (default 256, 0 = off) | 44 | kill switch and threshold: a converted src0 copy above N MiB is converted and multiplied in row chunks of N MiB; 0 restores the single whole-matrix copy. Values below the largest ffn weight cost pp (64 MiB -3.3%, 32 MiB -10.9% on pp2048) |
 | `GGML_CUDA_CUBLAS_CHUNK_ROWS=N`, `GGML_CUDA_CUBLAS_CHUNK_LOG=1` | 44 | test knobs: force N rows per chunk whatever the size of src0 (N=1 makes cuBLAS pick another kernel and moves results past the test tolerance); one stderr line per split call |
-| `GGML_CUDA_NORM_GRID_LOOP=1` | 46 | kill switch for the norm part (upstream's channel/sample grid-stride loop in every scalar 1024-thread `rms_norm_f32` launch; the float4 kernels of #29720 always loop, as upstream) |
+| `GGML_CUDA_NORM_GRID_LOOP=1` | 46, 19b | kill switch for the norm part (upstream's channel/sample grid-stride loop in every scalar 1024-thread `rms_norm_f32` launch and, since 19b, in the float4 1024-thread pre-add; the other float4 kernels of #29720 always loop, as upstream) |
 | `GGML_CUDA_GDN_COLS_PER_WARP=1|4` | 46 | GDN state columns per warp for every launch; unset = 1 at `n_tokens <= 8` on pre-Volta, else 4 (upstream). 4 = kill switch and the stock reduction order |
 | `LLAMA_STATE_PREFAULT=0|1|2` | 47, 48 | prefault of grown state buffers: 0 = none (upstream since #30137), 1 = memset (patch 47), 2 = `MADV_POPULATE_WRITE` (default since 48) |
 | `LLAMA_STATE_THP=0|1|2` | 48 | state buffers of 32 MiB or more: 0 = `std::allocator` (kill switch; with `LLAMA_STATE_PREFAULT=1` = patch 47), 1 = 2 MiB-aligned mapping, `MADV_HUGEPAGE` while `/proc/buddyinfo` has free 2 MiB blocks (default), 2 = without that guard (measurement only: compaction stalls) |
@@ -1560,6 +1633,10 @@ For each conflicting commit decide:
 2. **Moved** - resolve, keep the commit, note anything non-obvious in the patch section above.
 3. **Rewritten upstream** (like 09) - reimplement on the new structure or drop.
 
+Folding a follow-up into its patch (19b into 19 on the next rebase): `git rebase -i` on the new branch,
+move the follow-up commit right after its patch and mark it `fixup`, then check that every commit of
+the norm group still compiles on its own.
+
 Then update the "Base:" line and the status table, and run the test checklist. Also check
 whether upstream retuned values a patch overrides (02, 05, 07, 08 change constants that
 upstream tunes for newer hardware).
@@ -1575,7 +1652,7 @@ git format-patch --no-numbered --zero-commit -o patches/ <base>..p100-b<build>
 ```sh
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=60 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/bin/test-backend-ops                       # b12212: 19680 tests per card, 0 failures (b11682: 18535)
+./build/bin/test-backend-ops                       # b12212: 19709 tests per card with 19b (19680 before), 0 failures (b11682: 18535)
 ./build/bin/test-llama-archs                       # every arch through -sm tensor on the GPUs (meta backend); b12212: 570 cases, Gemma 4 included
 ./build/bin/llama-bench -m <model> -ngl 99 -sm tensor -p 512 -n 64   # compare with stock master
 ~/p100-opt/c2/check6.sh                            # GQA 6 tile path of 36/38 (no test-backend-ops case)
@@ -1598,15 +1675,15 @@ assert and for the router respawning the child; `GGML_META_DEBUG=1` logs the met
 rebuilds if that needs pinning down.
 
 Output vs. stock: the patches that change numbers are 12 (Q4_1 weights, n >= 2), 15 (off
-unless `LLAMA_MTP_DRAFT_VOCAB` is set), 19 (since b12212: the pre-add norms keep the scalar
-summation order where stock's ADD + RMS_NORM+MUL runs #29720's float4 path), 32/33 (every Q4_K, Q5_K,
+unless `LLAMA_MTP_DRAFT_VOCAB` is set), 19 (on b12212 only until 19b: the pre-add norms kept the scalar
+summation order where stock's ADD + RMS_NORM+MUL runs #29720's float4 path; bit-identical since 19b), 32/33 (every Q4_K, Q5_K,
 Q6_K matvec at decode widths 1-8, on by default), 36 (flash-attention summation order on long
 prompts, seen on b11436 after ~75 tokens of a 22k-token prompt; on b11682 the branch defaults equal
 stock on that prompt) and 46 (GDN reduction order at 1-8 tokens on Pascal). Run the greedy comparison
 (`--temp 0 --seed 1`, same prompt, this build vs a stock build of the same base commit) with
-`GGML_CUDA_DISABLE_MMVQ_F16_K=1 GGML_CUDA_FATTN_TILE_LEGACY=1 GGML_CUDA_GDN_COLS_PER_WARP=4
-GGML_CUDA_DISABLE_FUSE_PRE_ADD=1` (the third one since patch 46, the fourth since b12212): with the
-switches set the output is expected to be identical to the last token, not just similar, and any
+`GGML_CUDA_DISABLE_MMVQ_F16_K=1 GGML_CUDA_FATTN_TILE_LEGACY=1 GGML_CUDA_GDN_COLS_PER_WARP=4` (the third
+one since patch 46; from b12212 until 19b also `GGML_CUDA_DISABLE_FUSE_PRE_ADD=1`): with the switches
+set the output is expected to be identical to the last token, not just similar, and any
 divergence is a bug; bisect at runtime with the kill switches above (start with `GGML_CUDA_DISABLE_FUSION=1`,
 then `LLAMA_SAMPLER_PREFILTER=0`) before rebuilding anything. Without the switch the Q4_K path
 of 32 may take a different token at a near-tied position (2026-09-03: identical for the first
@@ -1969,3 +2046,18 @@ on `qwen35` that the kill switches above do not explain points here first.
   0.13-0.19%. On the dio production line the tunable ran with 0 compaction stalls and 0 fallbacks in 6
   runs (prompt-cache scenario included, MemFree >= 22 GB), +98..+108 MiB RSS; documented as an optional
   knob in P100-README section 3, not added to `~/llama-serve.sh`. No code or binary change.
+- 2026-11-12: 19b, commit `p100x: 19b-pre-add-float4` (section 19b; report `~/p100-opt/19b/REPORT.md`,
+  Opus agent on krk-lab, build of `fd4af3665` + the change). Patch 19's pre-add now runs on #29720's
+  float4 path in upstream's summation order: logits byte-identical to stock on Q4_K_M F16 and Q6_K q8_0
+  (ppl 6.0663 / 6.0940 in all 20 chunks), greedy = stock 4/4, pre-add 9.12 -> 6.75 us per decode call,
+  tg128 +1.27% (Q4_K_M) / +1.23% (depth 16384) / +0.75% (Q6_K q8_0), MTP production line +0.65%, pp
+  and Gemma 4 unchanged. test-backend-ops 19709/19709 on both cards (29 new `ADD_RMS_NORM_MUL` cases),
+  test-llama-archs 3/3. Kill switch `GGML_CUDA_PRE_ADD_SCALAR=1`; the stock-math set drops
+  `GGML_CUDA_DISABLE_FUSE_PRE_ADD=1`. Found on the way: with 19's scalar order Q4_K_M F16 already
+  differed from stock in 18 of 20 chunks (chunk 1 5.1907 vs 5.2150); only the final ppl matched to four
+  decimals (plan gotcha 49). Kept as its own commit (no history rewrite of the published branch); fold
+  into 19 at the next rebase.
+  On the user's go, production `/home/krk/llama.cpp` was fast-forwarded to `8b86aab05` and rebuilt
+  incrementally (56 s, 0 warnings; no new fallback directory: `GGML_CUDA_PRE_ADD_SCALAR=1` is the old
+  binary's behaviour). Smoke: pp512 262.69, tg64 33.04 t/s (before: 262.68 / 32.72), sensible text, no
+  `a16k_check`. Not started serving.
