@@ -1927,7 +1927,8 @@ on `qwen35` that the kill switches above do not explain points here first.
   2908 stalls and checkpoints up to 599 ms; under a memory balloon, follow-ups reached 1359 ms median and
   2.2 s max. Hence the `/proc/buddyinfo` guard. The glibc tunable gives the same huge pages without
   code, but has no guard (pc1 run C1: 495 stalls, saves up to 332 ms) and +70-88 MiB RSS. It also made
-  generation 0.4-0.9% faster, additive to 48; plan deferred item THP2 is to find which host buffer that is.
+  generation 0.4-0.9% faster, additive to 48; plan deferred item THP2 is to find which host buffer that is
+  (closed 2026-11-12, see below).
   `--load-mode dio` (no async upload with `-sm tensor`: synchronous after O_DIRECT reads):
 
       cold Q6_K start      to /health   MemFree after load   page cache   free in 2 MiB blocks (Normal)
@@ -1946,3 +1947,25 @@ on `qwen35` that the kill switches above do not explain points here first.
   262.56 / 32.71), no `a16k_check`. Production line with dio: up in 87 s; 2-turn chat with the same
   text, t/s and acceptance as before; checkpoints took 55.7 / 53.8 ms; 460 MiB in huge pages, 0
   fallbacks, 0 compaction stalls; 16015 MiB per card.
+- 2026-11-12: plan item THP2 closed without a patch (report `~/p100-opt/thp2/REPORT.md`, Opus agent on
+  krk-lab, build of `fd4af3665`). `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` on top of patch 48, greedy
+  512-token replies, identical texts and MTP acceptance in every run:
+
+      ms per token                         base      tunable   difference
+      Q4 MTP line, short prompts (4+4)     20.302    20.282    -0.10% (ranges overlap)
+      Q4 MTP line, ~20k-token prompts      20.801    20.774    -0.13%
+      llama-bench tg128 (no server/MTP)    30.436    30.411    -0.08%
+      production line, dio (2+2)           23.448    23.404    -0.19%
+      16-token replies, Q4 / production                        -0.54..-0.66% / -0.88%
+
+  THP1's -0.9% was the per-request part (~1.5-2.5 ms per reply start). An LD_PRELOAD allocation spy
+  found no owner: 0.35 allocations >= 64 KiB per generated token (one reused 80 KiB vector in
+  `llama_batch_allocr::ubatch_add`), 0.2-0.8 minor faults per token, the sampler's `cur` holds only the
+  prefiltered candidates, the output buffer is pinned `CUDA_Host`. Huge pages for every allocation
+  >= 64 KiB (2.7 GB) gave +0.01%; the tunable with those allocations moved back to 4 KiB pages kept its
+  gain (-0.16%); `MADV_HUGEPAGE` + `MADV_COLLAPSE` of the main heap alone after warm-up reproduced it
+  (-0.13% / 16-token -0.53%, +22 MiB RSS against the tunable's +73). So it is the heap's small objects
+  (~900-1500 mallocs per token). Not built: a guarded heap collapse (Linux >= 6.1, ~40 lines) for
+  0.13-0.19%. On the dio production line the tunable ran with 0 compaction stalls and 0 fallbacks in 6
+  runs (prompt-cache scenario included, MemFree >= 22 GB), +98..+108 MiB RSS; documented as an optional
+  knob in P100-README section 3, not added to `~/llama-serve.sh`. No code or binary change.

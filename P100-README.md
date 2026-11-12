@@ -94,6 +94,14 @@ behaviour); context checkpoints are kept until the list is full, so a long chat 
 `--no-mmap`, `--mlock` and `-dio` no longer exist (`-lm/--load-mode`); the script uses `--load-mode dio`
 (added 2026-11-11 for patch 48).
 
+Optional, measured on 2026-11-12 and not in the script: `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` in
+front of the command (the router child inherits it) puts glibc's heap in huge pages. On this line with
+dio: 23.448 -> 23.404 ms per token (-0.19%, 42.65 -> 42.73 t/s) and ~2.5 ms less per reply start, same
+outputs and acceptance, 0 compaction stalls in 6 runs; it costs ~100 MiB host RAM and ~730 MiB of free
+2 MiB blocks at load. It has no guard: if the RAM ever fills up (for example a return to mmap loading)
+it compacts synchronously like unguarded huge pages do, and 1 of 8 runs got no gain at all because of
+where glibc placed its chunks. Too small to notice; leave it out unless every 0.2% counts.
+
 No GPU or host state changes are needed or useful: no power limit (tg draws ~155 W per card and is
 flat down to a 175 W cap; only pp is clipped), persistence mode is a no-op on this host, stock
 governor and C-states. Do not set compute mode EXCLUSIVE_PROCESS: the router runs one child per model.
@@ -141,6 +149,6 @@ it decides between the options of plan section 7.
 
 Plan roadmap "Deferred code items": E2 (0.4% tg), D4 (0.4%), the delta-net conv chain (0.8%), F9
 (unverified), and from b12212 a float4 pre-add for patch 19, the MTP conv-snapshot index chain (0.3% MTP),
-the Q3_K matvec at 2-8 columns and huge pages for the state buffers (THP1, ~45 ms per fresh checkpoint
-on the production line), and the Tier 3 research items (C7 is now quantized-KV attention speed only). Everything above 1% that remains sits inside the matvec
+the Q3_K matvec at 2-8 columns and a background prefault of the next checkpoint buffer (THP3, ~23 ms per
+fresh checkpoint on top of patch 48), and the Tier 3 research items (C7 is now quantized-KV attention speed only). Everything above 1% that remains sits inside the matvec
 kernels and NCCL. Rejected with numbers so nobody repeats them: B2, E7, E8, G2/G3, F5, C3, C4.

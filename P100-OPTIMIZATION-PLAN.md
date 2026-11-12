@@ -1329,7 +1329,7 @@ table). Nothing in this list is killed; the numbers say what each is worth if it
 | 19b (b12212) | patch 19's pre-add prologue on #29720's float4 path, in upstream's summation order (today it bypasses the dispatcher and runs the scalar kernel) | bit-identical to stock again (19 is the only prompt-processing difference: Q6_K q8_0 ppl 6.0782 vs 6.0940); validation agent's estimate ~6.5 vs 9.11 us per pre-add, ~0.3 ms per token per card (~1% tg), unmeasured | `norm.cu`, `static_assert(!do_pre_add \|\| !do_vec)` marks the spot; measured 2026-11-10: 19 on vs off pp +0.3-0.44%, tg -0.16% to +0.03% |
 | M31660 (b12212) | the MTP conv-snapshot index chain of #30878/#31660 (ARANGE + SCALE_BIAS + CAST + SET_ROWS per GDN layer, 192 launches per verify step per card; the index is the same for all 48 layers): build it once per step, or fuse it | MTP -0.3% against `p100-b11682` (+343 us launches per step per card at equal kernel time) | upstream graph code (`build_conv_state` side), rebase cost; patch 18's CPY merge went dead with it |
 | THP1 (b12212) | DONE 2026-11-11 as `p100x: 48-state-thp` (P100-PATCHES.md section 48; `~/p100-opt/thp1/REPORT.md`). Guarded huge pages plus `MADV_POPULATE_WRITE`; production needs `--load-mode dio` so that the page cache leaves free 2 MiB blocks | fresh checkpoint 105 -> 53 ms, production follow-up 936 -> 884 ms, prompt-cache save 285 -> 171 ms | without the guard: synchronous compaction stalls of up to 2 s once the page cache fills the RAM |
-| THP2 (b12212) | `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` made MTP generation 0.4-0.9% faster, additive to patch 48 (16 tokens: 338.1-338.6 vs 340.5-340.8 ms). Some host buffer allocated through malloc benefits from huge pages. Find it and give it a guarded allocation like 48's; the tunable itself has no guard (495 compaction stalls in one run) and adds +70-88 MiB RSS | ~0.5% tg | `~/p100-opt/thp1/log/t9-summary.txt`, `t4-summary.txt` |
+| THP2 (b12212) | CLOSED 2026-11-12, no patch (`~/p100-opt/thp2/REPORT.md`). `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` speeds up generation by 0.1-0.2% per token (Q4 MTP line 20.30 -> 20.28 ms/token, -0.10..-0.15%; ~20k-token prompts -0.13%; llama-bench tg128 -0.08%; production line with dio 23.448 -> 23.404 ms/token, -0.19%) plus ~1.5-2.5 ms per reply start. THP1's -0.9% was measured on 16-token replies, where that per-request part dominates (now -0.54..-0.88%). The owner is the main sbrk heap's small objects (graph build, scheduler, `-sm tensor` split, ~900-1500 mallocs per token): huge pages for every allocation >= 64 KiB give nothing, a one-time `MADV_COLLAPSE` of the heap alone gives all of it. Dropped suspects: per-token churn (0.35 allocations >= 64 KiB per token, reused; 0.2-0.8 faults per token), sampler arrays (`cur` holds the prefiltered candidates, never n_vocab), output buffer (`CUDA_Host`, pinned) | 0.1-0.2% tg | a heap collapse after load behind 48's guard was measured (same gain, +22 MiB instead of ~100) but not built: Linux >= 6.1, ~40 lines, not worth 0.13-0.19%. The tunable is documented as an optional knob in P100-README section 3 (safe with dio, no guard) |
 | THP3 (b12212) | prefault the next checkpoint buffer in the background while tokens are generated (a per-slot future next to patch 37's spare) | ~23 ms per fresh checkpoint on top of 48 (53 -> ~30 ms) | ~40-60 lines in `server-context.cpp`, a second thread on slot state, one idle 150 MiB buffer per slot; report task 9 |
 | Q3K (b12212) | Q3_K int8 MMVQ at 2-8 columns after #30517 (VDR 2): 4-13% slower than stock at 2-4 columns, 13-33% slower than `p100-b11682` and stock at 5-8 (patch 02's 4 rows per block, patch 35's column threshold measured on the old kernel) | only Qwen Q4_K_M (7 Q3_K, 4 IQ3_S tensors); none in the production Q6_K | `~/p100-opt/b12212/log/mmvq-summary.txt`; retune 02/35 for Q2_K/Q3_K |
 | E2 | MRoPE variant of the fused `RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)` kernel; the node order already matches, one mode check blocks it | 0.12 ms per token, 0.4% tg | ggml-cuda.cu ~2811, `ggml_cuda_op_rms_norm_mul_rope_fused` |
@@ -1747,6 +1747,11 @@ llama.cpp behavior on this hardware:
     150 MiB buffer in THP1). A CPU probe that frees each buffer before the next does not show it;
     measure with a server that keeps adding buffers, after a cold model load or under a balloon.
     Patch 48 guards on `/proc/buddyinfo`; `--load-mode dio` keeps the model out of the page cache.
+48. An `LD_PRELOAD` malloc shim that resolves `malloc` with `dlsym(RTLD_NEXT)` from inside the first
+    malloc call silently switches off `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` (glibc 2.35, THP2). Call
+    `__libc_malloc` and friends directly, and check `AnonHugePages` under the shim before trusting a
+    huge-page arm. The tunable's gain also depends on where glibc's chunks land against 2 MiB
+    boundaries: 1 of 8 runs got none, so give it 4+ alternated runs.
 
 ## 6. Open questions for the user (answered 2026-09-03 where marked)
 
@@ -1799,6 +1804,8 @@ llama serve --host 0.0.0.0 --port 8080 --models-dir /mnt/hdd/gguf --split-mode t
 `--load-mode dio` was added on 2026-11-11 for patch 48 (THP1). It keeps the GGUF out of the page cache, so
 the state buffers get huge pages. The cost is 3 s per cold start, and a same-day restart or router
 model switch is a disk read (~85 s) instead of a page-cache hit (~8 s).
+Optional and not set: `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` in front of the command (THP2, P100-README section 3):
+-0.19% per token and ~2.5 ms per reply on this line for ~100 MiB host RAM, without a guard.
 
 Three options were measured on the branch build (C9; MTP width 3, server t/s on the same request,
 ms per verify step in brackets; perplexity at `-c 2048`, 20 chunks):
