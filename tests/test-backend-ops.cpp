@@ -4283,6 +4283,62 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL: a residual add feeding the next norm. The CUDA backend folds the ADD
+// into the norm (and still writes its result), so the last ADD reads it back the way the next layer does
+struct test_add_rms_norm_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool inplace; // the residual add writes into its first operand
+    const int64_t offs; // first operand starts this many elements into its buffer (unaligned unless a multiple of 4)
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne, eps, inplace, offs);
+    }
+
+    test_add_rms_norm_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            float eps = 1e-6f, bool inplace = false, int64_t offs = 0)
+        : type(type), ne(ne), eps(eps), inplace(inplace), offs(offs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = nullptr;
+        if (offs == 0) {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+        } else {
+            const size_t ts = ggml_type_size(type);
+            ggml_tensor * buf = ggml_new_tensor_1d(ctx, type, ne[0]*ne[1]*ne[2]*ne[3] + offs);
+            a = ggml_view_4d(ctx, buf, ne[0], ne[1], ne[2], ne[3], ne[0]*ts, ne[0]*ne[1]*ts, ne[0]*ne[1]*ne[2]*ts, offs*ts);
+        }
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(b, "b");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, type, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * res = inplace ? ggml_add_inplace(ctx, a, b) : ggml_add(ctx, a, b);
+        ggml_set_name(res, "res");
+
+        ggml_tensor * out = ggml_add(ctx, res, ggml_mul(ctx, ggml_rms_norm(ctx, res, eps), w));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -11399,6 +11455,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
+    // CUDA: the float4 widths (4096, 5120, 5376 and narrow ones) and what the float4 path refuses (odd width,
+    // unaligned operand, wider than 16384), in-place, and a grid over the gridDim.y limit
+    for (int64_t n : {4, 1000, 4096, 5120, 5376, 5122, 20480}) {
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {n, 1, 1, 1}));
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {n, 5, 2, 1}));
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {n, 5, 2, 1}, 1e-6f, true));
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {n, 5, 2, 1}, 1e-6f, false, 1));
+    }
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {4, 1, 65536, 1}));
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));

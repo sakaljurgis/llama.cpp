@@ -122,7 +122,6 @@ static __global__ void rms_norm_f32(const float * x,
 
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
-    static_assert(!do_pre_add || !do_vec, "the pre-add prologue is only implemented in the scalar path");
 
     extern __shared__ float s_sum[];
 
@@ -188,7 +187,17 @@ static __global__ void rms_norm_f32(const float * x,
                 for (int k = 0; k < vpt; k++) {
                     const int i = tid + k*block_size;
                     if (i < ncols4) {
-                        xs[k] = x4[i];
+                        if constexpr (do_pre_add) {
+                            // the ADD kernel's float add, then upstream's squares unchanged: the sum (and so the
+                            // whole fused launch) is bit-identical to ADD followed by this kernel without pre-add.
+                            // Each thread reads and writes only its own element, so an in-place ADD is safe
+                            const float4 a = ((const float4 *) pre_ac)[i];
+                            const float4 b = ((const float4 *) pre_bc)[i];
+                            xs[k] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+                            ((float4 *) pre_dstc)[i] = xs[k]; // always written: the next layer reads it as its residual
+                        } else {
+                            xs[k] = x4[i];
+                        }
                         tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
                     }
                 }
@@ -632,7 +641,8 @@ static void group_norm_f32_cuda(
 // the grid-stride loop over channels/samples (#28175) only runs in the scalar 1024-thread kernels when grid.y/z were
 // clamped: its state raises them above 32 registers (one block per SM instead of two) and costs ~0.5 us per single-row
 // call. The float4 kernels (#29720) keep upstream's loop: without it they measured slower on sm_60 (Gemma 4, 5376-wide
-// rows: RMS_NORM+MUL 5.56 vs 5.36 us, tg -0.14%)
+// rows: RMS_NORM+MUL 5.56 vs 5.36 us, tg -0.14%), except the float4 1024-thread pre-add, which is faster without it
+// (5120-wide decode rows on Qwen3.8: 6.75 vs 7.00 us, tg +0.1-0.3%, pp2048 +0.2%)
 template <int block_size, int vpt, bool do_vec, bool do_multiply, bool do_add, bool do_scale, bool do_pre_add, typename... Args>
 static void rms_norm_f32_launch(const ggml_cuda_kernel_launch_params & launch_params, const float * x, float * dst,
         const int ncols, const int nchannels, const int nsamples, Args &&... args) {
@@ -655,6 +665,14 @@ static void rms_norm_f32_launch(const ggml_cuda_kernel_launch_params & launch_pa
                 ggml_cuda_kernel_launch(rms_norm_f32<block_size, vpt, do_vec, do_multiply, do_add, do_scale, do_pre_add, 6, false>, launch_params, x, dst, ncols, nchannels, nsamples, std::forward<Args>(args)...);
             }
         }
+    } else if constexpr (block_size >= 1024 && do_pre_add) {
+        static bool force_loop = getenv("GGML_CUDA_NORM_GRID_LOOP") != nullptr &&
+                                 std::atoi(getenv("GGML_CUDA_NORM_GRID_LOOP"));
+        if (force_loop || nchannels > UINT16_MAX || nsamples > UINT16_MAX) {
+            ggml_cuda_kernel_launch(rms_norm_f32<block_size, vpt, do_vec, do_multiply, do_add, do_scale, do_pre_add, 6, true>, launch_params, x, dst, ncols, nchannels, nsamples, std::forward<Args>(args)...);
+        } else {
+            ggml_cuda_kernel_launch(rms_norm_f32<block_size, vpt, do_vec, do_multiply, do_add, do_scale, do_pre_add, 6, false>, launch_params, x, dst, ncols, nchannels, nsamples, std::forward<Args>(args)...);
+        }
     } else {
         ggml_cuda_kernel_launch(rms_norm_f32<block_size, vpt, do_vec, do_multiply, do_add, do_scale, do_pre_add>, launch_params, x, dst, ncols, nchannels, nsamples, std::forward<Args>(args)...);
     }
@@ -664,16 +682,16 @@ static void rms_norm_f32_launch(const ggml_cuda_kernel_launch_params & launch_pa
     do { \
         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
         const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
-        rms_norm_f32_launch<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, false>(launch_params, \
+        rms_norm_f32_launch<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, do_pre_add>(launch_params, \
             x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
             mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
             add, add_stride_row, add_stride_channel, add_stride_sample, \
             add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, \
-            nullptr, nullptr, nullptr); \
+            pre_a, pre_b, pre_dst); \
     } while (0)
 
-template <bool do_multiply, bool do_add, bool do_scale>
+template <bool do_multiply, bool do_add, bool do_scale, bool do_pre_add = false>
 static void rms_norm_f32_dispatch(
         const dim3     blocks_num,
         const ggml_tensor * x_t,   float * dst,   const int ncols, const int nchannels, const int nsamples,
@@ -682,7 +700,8 @@ static void rms_norm_f32_dispatch(
         const uint3    mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
         const ggml_tensor * add_t, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
         const uint3    add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed,
-        cudaStream_t   stream, const float scale_out = 1.0f) {
+        cudaStream_t   stream, const float scale_out = 1.0f,
+        const float *  pre_a = nullptr, const float * pre_b = nullptr, float * pre_dst = nullptr) {
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
 
@@ -700,6 +719,15 @@ static void rms_norm_f32_dispatch(
     if constexpr (do_add) {
         vec = vec && add_ncols_packed.z == (uint32_t) ncols
             && ggml_cuda_is_aligned(add_t, 16);
+    }
+    if constexpr (do_pre_add) {
+        // the ADD's tensors are contiguous with x's shape (fusion predicate), so their bases are all to check.
+        // GGML_CUDA_PRE_ADD_SCALAR=1 keeps the scalar pre-add (b11682's kernel), whose sum of squares is in a
+        // different order from upstream's float4 one: not bit-identical to stock's ADD + RMS_NORM+MUL
+        static bool force_scalar = getenv("GGML_CUDA_PRE_ADD_SCALAR") != nullptr &&
+                                   std::atoi(getenv("GGML_CUDA_PRE_ADD_SCALAR"));
+        vec = vec && !force_scalar && ((uintptr_t) pre_a & 15) == 0 && ((uintptr_t) pre_b & 15) == 0
+            && ((uintptr_t) pre_dst & 15) == 0;
     }
 
     const int n4 = ncols / 4;
@@ -773,33 +801,16 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
                                   float *        pre_dst = nullptr) {
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
     if (mul_t != nullptr && add_t == nullptr && pre_a != nullptr) {
-        // The pre-add prologue exists only in the scalar kernel (written before the float4 path of
-        // #29720), so these launches bypass rms_norm_f32_dispatch and keep the scalar kernel with its
-        // register cache.
-        const float * x   = (const float *) x_t->data;
-        const float * mul = (const float *) mul_t->data;
-        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
-        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
-        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
-        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
-        const dim3 block_dims(ncols < 1024 ? 256 : 1024, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params =
-            ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};
-        if (ncols < 1024) {
-            ggml_cuda_kernel_launch(rms_norm_f32<256, 1, false, true, false, false, true>, launch_params,
-                x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row,
-                mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed,
-                mul_nchannels_packed, mul_nsamples_packed,
-                nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), 1.0f,
-                pre_a, pre_b, pre_dst);
-        } else {
-            rms_norm_f32_launch<1024, 1, false, true, false, false, true>(launch_params,
-                x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row,
-                mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed,
-                mul_nchannels_packed, mul_nsamples_packed,
-                nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), 1.0f,
-                pre_a, pre_b, pre_dst);
-        }
+        // Through the dispatcher, so the pre-add takes the float4 kernel wherever stock's RMS_NORM+MUL would
+        // (bit-identical to stock's ADD + RMS_NORM+MUL there); what it refuses runs the scalar pre-add.
+        const uint3 zero_packed = make_uint3(0, 0, 0);
+        rms_norm_f32_dispatch</*do_multiply*/true, /*do_add*/false, /*do_scale*/false, /*do_pre_add*/true>(
+            blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
+            mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
+            init_fastdiv_values(mul_ncols), init_fastdiv_values(mul_nrows), init_fastdiv_values(mul_nchannels),
+            init_fastdiv_values(mul_nsamples),
+            nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed, stream, 1.0f,
+            pre_a, pre_b, pre_dst);
         return;
     }
     if (mul_t == nullptr) {
